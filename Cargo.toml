@@ -1,0 +1,8 @@
+[package]
+name = "oxid"
+version = "0.1.0"
+edition = "2024"
+description = "Ephemeral environments that breathe. Ferrous performance, invisible footprint."
+publish = false
+
+[dependencies]
