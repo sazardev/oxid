@@ -97,6 +97,23 @@ impl SqliteStore {
             u64::try_from(row.0).map_err(|_| storage("environment id overflowed u64"))?,
         ))
     }
+
+    /// Lists every environment across all projects, regardless of state.
+    ///
+    /// Used by the garbage-collection sweep, which needs to evaluate idle
+    /// environments independently of which project they belong to.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn list_all_environments(&self) -> Result<Vec<Environment>, RepositoryError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ENV_COLUMNS} FROM environments ORDER BY id"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(env_from_row).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

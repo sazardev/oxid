@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
@@ -39,6 +40,19 @@ pub enum CpError {
     /// A requested record does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+}
+
+/// Outcome of one [`ControlPlane::sweep`] pass across all environments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcSummary {
+    /// Environments suspended via `docker pause` (idle past `pause_after`).
+    pub paused: u64,
+    /// Environments stopped for deep sleep (idle past the hibernate threshold).
+    pub hibernated: u64,
+    /// Environments torn down (idle past `destroy_after`).
+    pub destroyed: u64,
+    /// Per-environment failures; the sweep continues past these.
+    pub errors: Vec<(EnvironmentId, String)>,
 }
 
 /// Orchestrates registration, deployment and lifecycle of environments.
@@ -244,6 +258,91 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .oci
             .logs(&container_name(&project, &env.branch.name))
             .await?)
+    }
+
+    /// Runs one garbage-collection pass over every environment: evaluates
+    /// each against its project's idle/TTL policy (SPEC.md §3.2) and applies
+    /// the resulting pause/hibernate/destroy action.
+    ///
+    /// A failure on one environment (e.g. a stuck `Building` environment
+    /// that cannot legally transition yet) is recorded in
+    /// [`GcSummary::errors`] rather than aborting the whole sweep.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] only if listing environments or projects fails.
+    pub async fn sweep(&self, now: OffsetDateTime) -> Result<GcSummary, CpError> {
+        let mut summary = GcSummary::default();
+        let mut projects: std::collections::HashMap<ProjectId, Project> =
+            std::collections::HashMap::new();
+
+        for env in self.store.list_all_environments().await? {
+            let project = match projects.get(&env.project_id) {
+                Some(project) => project.clone(),
+                None => match ProjectStore::get(&self.store, env.project_id).await? {
+                    Some(project) => {
+                        projects.insert(env.project_id, project.clone());
+                        project
+                    }
+                    // Orphaned environment (project deleted underneath it); skip.
+                    None => continue,
+                },
+            };
+
+            let action = gc::evaluate(&env, &project, now);
+            if action == GcAction::Keep {
+                continue;
+            }
+
+            match self
+                .apply_gc_action(env.clone(), &project, action, now)
+                .await
+            {
+                Ok(()) => match action {
+                    GcAction::Pause => summary.paused += 1,
+                    GcAction::Hibernate => summary.hibernated += 1,
+                    GcAction::Destroy => summary.destroyed += 1,
+                    GcAction::Keep => unreachable!("Keep is filtered out above"),
+                },
+                Err(err) => summary.errors.push((env.id, err.to_string())),
+            }
+        }
+
+        Ok(summary)
+    }
+
+    async fn apply_gc_action(
+        &self,
+        mut env: Environment,
+        project: &Project,
+        action: GcAction,
+        now: OffsetDateTime,
+    ) -> Result<(), CpError> {
+        let transition = action
+            .transition()
+            .expect("Keep is filtered out before calling apply_gc_action");
+        let name = container_name(project, &env.branch.name);
+
+        match action {
+            GcAction::Pause => self.oci.pause(&name).await?,
+            GcAction::Hibernate | GcAction::Destroy => self.oci.stop(&name).await?,
+            GcAction::Keep => unreachable!("Keep is filtered out before calling apply_gc_action"),
+        }
+        if action == GcAction::Destroy {
+            self.oci.remove(&name).await?;
+        }
+
+        env.transition(transition, now).map_err(|e| state_err(&e))?;
+        self.store.update(&env).await?;
+        self.store
+            .record(&AuditEvent::new(
+                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                env.id,
+                transition,
+                None,
+                now,
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn find_project_by_repo(
@@ -479,5 +578,127 @@ port = 8080
             .await
             .unwrap_err();
         assert!(matches!(err, CpError::NotFound(_)));
+    }
+
+    async fn touch_env(
+        cp: &ControlPlane<FakeGit, FakeOci>,
+        mut env: Environment,
+        at: OffsetDateTime,
+    ) {
+        env.touch(at).unwrap();
+        EnvironmentStore::update(&cp.store, &env).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_recently_active_environment() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::seconds(60)).await;
+
+        let summary = cp.sweep(now).await.unwrap();
+        assert_eq!(summary, GcSummary::default());
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Running);
+    }
+
+    #[tokio::test]
+    async fn sweep_pauses_idle_environment() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // pause_after defaults to 30m.
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::minutes(31)).await;
+
+        let summary = cp.sweep(now).await.unwrap();
+        assert_eq!(summary.paused, 1);
+        assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Paused);
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("pause:")),
+            "{:?}",
+            oci.calls
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_hibernates_deeply_idle_paused_environment() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // First pass: 31m idle suspends it (Running -> Paused).
+        let t1 = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), t1 - time::Duration::minutes(31)).await;
+        cp.sweep(t1).await.unwrap();
+
+        // Second pass: 3h idle (> 4 * pause_after) hibernates it from Paused.
+        let t2 = t1 + time::Duration::hours(3);
+        let summary = cp.sweep(t2).await.unwrap();
+        assert_eq!(summary.hibernated, 1, "{:?}", summary.errors);
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Hibernating);
+    }
+
+    #[tokio::test]
+    async fn sweep_destroys_expired_environment() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // destroy_after defaults to 7d.
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::days(8)).await;
+
+        let summary = cp.sweep(now).await.unwrap();
+        assert_eq!(summary.destroyed, 1, "{:?}", summary.errors);
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Destroyed);
+        let calls = oci.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.starts_with("stop:")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
     }
 }
