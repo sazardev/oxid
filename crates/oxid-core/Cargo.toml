@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+trait-variant.workspace = true
 serde.workspace = true
 time.workspace = true
 

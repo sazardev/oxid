@@ -69,6 +69,34 @@ impl SqliteStore {
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
     }
+
+    /// Allocates the next free project id (`MAX(id) + 1`).
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn next_project_id(&self) -> Result<ProjectId, RepositoryError> {
+        let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) + 1 FROM projects")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(ProjectId(
+            u64::try_from(row.0).map_err(|_| storage("project id overflowed u64"))?,
+        ))
+    }
+
+    /// Allocates the next free environment id (`MAX(id) + 1`).
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn next_environment_id(&self) -> Result<EnvironmentId, RepositoryError> {
+        let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) + 1 FROM environments")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(EnvironmentId(
+            u64::try_from(row.0).map_err(|_| storage("environment id overflowed u64"))?,
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

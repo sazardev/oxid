@@ -5,6 +5,10 @@ edition.workspace = true
 description.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "oxidd"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -16,3 +20,13 @@ serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
+bollard.workspace = true
+tar.workspace = true
+bytes.workspace = true
+git2.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+tempfile = "3"

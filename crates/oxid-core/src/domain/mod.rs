@@ -17,7 +17,10 @@ pub use audit::AuditEvent;
 pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
-pub use ports::{AuditStore, EnvironmentStore, ProjectStore, RepositoryError};
+pub use ports::{
+    AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, EnvironmentStore, GitError,
+    GitPort, OciError, ProjectStore, RepositoryError,
+};
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};
 pub use resource_pool::{PoolKind, ResourcePool};

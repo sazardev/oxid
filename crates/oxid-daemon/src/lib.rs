@@ -4,11 +4,13 @@
 //! [`oxid_core`]:
 //! - `adapter::config` — parses `oxid.toml` into domain configuration.
 //! - `adapter::store` — `SQLite` persistence implementing the domain ports.
+//! - `adapter::git` — `Git` versioning (`git2`) implementing the git port.
+//! - `adapter::oci` — Docker orchestration (`bollard`) implementing the OCI port.
+//! - `service` — application layer (`ControlPlane`) wiring ports together.
+//! - `api` — `HTTP`/webhook surface (`axum`).
 
 pub mod adapter;
+pub mod api;
+pub mod service;
 
-/// Reserved for future `HTTP`/webhook adapters.
-pub mod api {
-    /// No-op marker; will become the `axum` router in a later phase.
-    pub const READY: bool = false;
-}
+pub use service::control_plane::{ControlPlane, CpError};
