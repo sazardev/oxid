@@ -1,0 +1,17 @@
+[package]
+name = "oxid-core"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+serde_json = "1.0"
