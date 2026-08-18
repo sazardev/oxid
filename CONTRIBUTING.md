@@ -11,6 +11,14 @@ help (code, docs, bug reports, design feedback) matters.
 - Check [`ROADMAP.md`](ROADMAP.md) for a prioritized, granular list of gaps
   between the vision docs (`IDEA.md`, `SPEC.md`, `DESIGN.md`) and what's
   actually implemented — it's the best place to find something to work on.
+  Issues labeled [`good first
+  issue`](https://github.com/sazardev/oxid/labels/good%20first%20issue) are a
+  good place to start if you're new to the codebase.
+- Not sure your idea is fully baked yet? Open an
+  [Idea](.github/ISSUE_TEMPLATE/idea.md) issue instead of a feature request —
+  it's meant for rougher, discussion-stage proposals.
+- Found a security vulnerability? Do **not** open a public issue — follow
+  [`SECURITY.md`](SECURITY.md) instead.
 
 ## Development setup
 

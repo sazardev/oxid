@@ -1,3 +1,14 @@
+## Type of change
+
+<!-- Check the ones that apply. -->
+
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Refactor / cleanup (no behavior change)
+- [ ] Documentation
+- [ ] Security fix (see [`SECURITY.md`](../SECURITY.md) — if this fixes an
+      unreported vulnerability, please report it privately first)
+
 ## What does this change?
 
 <!-- One or two sentences. What problem does it solve, or what does it add? -->

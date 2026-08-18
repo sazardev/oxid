@@ -96,6 +96,11 @@ how to get set up, and [`ROADMAP.md`](ROADMAP.md) for a prioritized list of
 what's missing. Open an issue before starting on something large so we can
 align on approach first.
 
+## Security
+
+Found a vulnerability? Please don't open a public issue — see
+[`SECURITY.md`](SECURITY.md) for how to report it privately.
+
 ## License
 
 Oxid is released under the [0BSD license](LICENSE) — do whatever you want
