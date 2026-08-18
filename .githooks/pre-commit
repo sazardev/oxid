@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Fast, local guardrails — runs on every `git commit`. Kept deliberately
+# cheap (no clippy, no test suite) so it doesn't get in the way; the
+# thorough checks live in .githooks/pre-push and CI. See CONTRIBUTING.md#guardrails.
+set -uo pipefail
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=.githooks/_lib.sh
+source "$HOOK_DIR/_lib.sh"
+
+ROOT="$(repo_root)"
+cd "$ROOT" || exit 1
+
+status=0
+
+echo "[>] pre-commit checks"
+
+# 1. Formatting — fast, deterministic.
+if command -v cargo >/dev/null 2>&1; then
+    if ! cargo fmt --all -- --check >/tmp/oxid-fmt-check.log 2>&1; then
+        fail "not formatted — run: cargo fmt"
+        sed 's/^/    /' /tmp/oxid-fmt-check.log
+        status=1
+    else
+        ok "cargo fmt --check"
+    fi
+fi
+
+# 2. Merge conflict markers left behind.
+if ! check_merge_conflict_markers; then status=1; else ok "no merge conflict markers"; fi
+
+# 3. Secrets / credential files should never be staged.
+if ! check_forbidden_paths; then status=1; else ok "no credential-shaped files staged"; fi
+
+# 4. Secret scan of the staged diff — gitleaks if available, else a small
+#    built-in pattern scan as a floor for contributors without it installed.
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks protect --staged --redact --no-banner >/tmp/oxid-gitleaks.log 2>&1; then
+        fail "gitleaks found a likely secret in the staged diff:"
+        sed 's/^/    /' /tmp/oxid-gitleaks.log
+        status=1
+    else
+        ok "gitleaks protect --staged"
+    fi
+else
+    if ! git diff --cached | scan_diff_for_secrets; then
+        status=1
+    else
+        ok "secret pattern scan (install gitleaks for stronger coverage)"
+    fi
+fi
+
+# 5. Hexagonal architecture boundary: oxid-core stays I/O-free.
+if git diff --cached --name-only | grep -q 'crates/oxid-core/Cargo.toml'; then
+    if ! check_hexagonal_boundary "$ROOT"; then status=1; else ok "oxid-core dependency boundary"; fi
+fi
+
+# 6. Large files.
+if ! check_large_files; then status=1; else ok "no oversized files staged"; fi
+
+# 7. Compile check — only if Rust sources/manifests are part of this commit.
+if [ -n "$(rust_files_changed)" ] && command -v cargo >/dev/null 2>&1; then
+    info "cargo check --workspace (staged Rust files changed)..."
+    if ! cargo check --workspace --all-targets --quiet; then
+        fail "cargo check --workspace failed"
+        status=1
+    else
+        ok "cargo check --workspace"
+    fi
+fi
+
+if [ "$status" -ne 0 ]; then
+    echo
+    die "pre-commit checks failed"
+fi
+
+ok "pre-commit checks passed"
+exit 0

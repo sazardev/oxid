@@ -6,11 +6,14 @@
   <p><strong>Ephemeral environments that breathe. Ferrous performance, invisible footprint.</strong></p>
 
   <p>
+    <a href="https://github.com/sazardev/oxid/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sazardev/oxid/actions/workflows/ci.yml/badge.svg"></a>
     <a href="LICENSE"><img alt="License: 0BSD" src="https://img.shields.io/badge/license-0BSD-DE5236.svg"></a>
     <img alt="Rust edition 2024" src="https://img.shields.io/badge/rust-edition%202024-DE5236.svg">
     <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-262626.svg">
     <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-4A9E79.svg"></a>
   </p>
+
+  <p><a href="https://sazardev.github.io/oxid/"><strong>Website →</strong></a></p>
 </div>
 
 ---
@@ -87,12 +90,21 @@ cargo clippy --workspace --all-targets
 cargo fmt --check
 ```
 
+Building the workspace also wires up git hooks that run these (plus a
+security/dependency audit) automatically on commit/push — see
+[Guardrails](CONTRIBUTING.md#guardrails) in `CONTRIBUTING.md`.
+
 ## Contributing
 
 Contributions are very welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for
 how to get set up, and [`ROADMAP.md`](ROADMAP.md) for a prioritized list of
 what's missing. Open an issue before starting on something large so we can
 align on approach first.
+
+## Security
+
+Found a vulnerability? Please don't open a public issue — see
+[`SECURITY.md`](SECURITY.md) for how to report it privately.
 
 ## License
 
