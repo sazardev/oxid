@@ -66,12 +66,13 @@ fn sync_remote_url(repo_dir: &Path) -> Result<RepoUrl, GitError> {
     let remote = repo.find_remote("origin").map_err(|_| {
         GitError::Failure(format!("no `origin` remote in `{}`", repo_dir.display()))
     })?;
-    let url = remote.url().ok_or_else(|| {
-        GitError::Failure(format!(
+    let url = remote.url().map_err(map_err)?;
+    if url.is_empty() {
+        return Err(GitError::Failure(format!(
             "`origin` remote has no URL in `{}`",
             repo_dir.display()
-        ))
-    })?;
+        )));
+    }
     RepoUrl::parse(url).map_err(map_err)
 }
 

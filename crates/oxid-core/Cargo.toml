@@ -3,6 +3,7 @@ name = "oxid-core"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [lints]
