@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
-use oxid_core::services::var_resolution::{set_secret, VarSources};
+use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
     DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore,
@@ -169,8 +169,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // 4. Resolve the effective environment: Global -> Project -> Branch
         //    secrets plus orchestrator runtime variables (SPEC.md §2.1/§4.4).
         let mut sources = VarSources::default();
-        let secrets = SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch))
-            .await?;
+        let secrets =
+            SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch)).await?;
         for (name, scope, value) in secrets.iter() {
             set_secret(&mut sources, name, scope, value.as_str());
         }

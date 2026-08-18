@@ -47,7 +47,10 @@ pub fn router<
         )
         .route("/api/v1/projects/{id}/environments", get(list_environments))
         .route("/api/v1/projects/{id}/deploy", post(deploy))
-        .route("/api/v1/secrets", get(list_global_secrets).post(set_global_secret))
+        .route(
+            "/api/v1/secrets",
+            get(list_global_secrets).post(set_global_secret),
+        )
         .route("/api/v1/secrets/{name}", delete(delete_global_secret))
         .route(
             "/api/v1/projects/{id}/secrets",
@@ -417,11 +420,7 @@ fn parse_scope(raw: &str) -> ApiResult<EnvVarScope> {
 }
 
 fn validate_secret_name(name: &str) -> ApiResult<&str> {
-    if name.trim().is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.trim().is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(ApiError::from_validation(format!(
             "invalid secret name `{name}`; use alphanumeric characters and underscores"
         )));
@@ -454,7 +453,10 @@ async fn github_webhook<
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            ApiError::new(StatusCode::UNAUTHORIZED, "missing `X-Hub-Signature-256` header")
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "missing `X-Hub-Signature-256` header",
+            )
         })?;
     verify_hmac(secret, &body, signature)?;
 
@@ -490,14 +492,14 @@ async fn github_webhook<
 
 /// Verifies `X-Hub-Signature-256` (`sha256=<hex hmac>`) against the raw body.
 fn verify_hmac(secret: &str, body: &[u8], signature: &str) -> ApiResult<()> {
-    let provided = signature
-        .strip_prefix("sha256=")
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::UNAUTHORIZED, "signature must be prefixed with `sha256=`")
-        })?;
-    let provided_bytes = hex::decode(provided).map_err(|_| {
-        ApiError::new(StatusCode::UNAUTHORIZED, "signature is not valid hex")
+    let provided = signature.strip_prefix("sha256=").ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "signature must be prefixed with `sha256=`",
+        )
     })?;
+    let provided_bytes = hex::decode(provided)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "signature is not valid hex"))?;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid secret"))?;
     mac.update(body);
@@ -671,8 +673,7 @@ port = 8080
     /// Sends a GitHub webhook with a valid `X-Hub-Signature-256` header.
     async fn signed_webhook(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
         let raw = payload.to_string();
-        let mut mac =
-            hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
         mac.update(raw.as_bytes());
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
@@ -921,19 +922,13 @@ port = 8080
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (status, body) =
-            json_request(&app, "GET", "/api/v1/secrets", json!({})).await;
+        let (status, body) = json_request(&app, "GET", "/api/v1/secrets", json!({})).await;
         assert_eq!(status, StatusCode::OK);
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
 
-        let (status, _) = json_request(
-            &app,
-            "DELETE",
-            "/api/v1/secrets/GLOBAL_FLAG",
-            json!({}),
-        )
-        .await;
+        let (status, _) =
+            json_request(&app, "DELETE", "/api/v1/secrets/GLOBAL_FLAG", json!({})).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 

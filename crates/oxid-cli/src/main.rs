@@ -136,7 +136,17 @@ async fn main() {
                 scope,
                 project,
                 branch,
-            } => cmd_env_set(&client, &base, &assignment, &scope, project, branch.as_deref()).await,
+            } => {
+                cmd_env_set(
+                    &client,
+                    &base,
+                    &assignment,
+                    &scope,
+                    project,
+                    branch.as_deref(),
+                )
+                .await
+            }
             EnvAction::List {
                 scope,
                 project,
@@ -167,8 +177,7 @@ async fn main() {
 /// Idempotent on the daemon side: repeated registrations return the existing
 /// project.
 async fn register_project(client: &Client, base: &str) -> Result<Value, String> {
-    let repo_dir =
-        std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
+    let repo_dir = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
     let response = client
         .post(format!("{base}/api/v1/projects"))
         .json(&json!({ "repo_dir": repo_dir.display().to_string() }))
@@ -283,8 +292,14 @@ fn scope_context(
     }
 }
 
-async fn ensure_project_id(client: &Client, base: &str, project: Option<u64>) -> Result<u64, String> {
-    if let Some(id) = project { Ok(id) } else {
+async fn ensure_project_id(
+    client: &Client,
+    base: &str,
+    project: Option<u64>,
+) -> Result<u64, String> {
+    if let Some(id) = project {
+        Ok(id)
+    } else {
         let project = register_project(client, base).await?;
         project["id"]
             .as_u64()
@@ -364,7 +379,9 @@ async fn cmd_env_list(
     let (project_id, branch) = scope_context(scope, project, branch)?;
     let project_id = ensure_project_id(client, base, project_id).await?;
 
-    let url = if scope == "global" { format!("{base}/api/v1/secrets") } else {
+    let url = if scope == "global" {
+        format!("{base}/api/v1/secrets")
+    } else {
         let branch_qs = branch
             .as_ref()
             .map(|b| format!("?branch={b}"))
@@ -385,7 +402,8 @@ async fn cmd_env_list(
         report_error(&body, status);
         return Err("listing secrets failed".to_owned());
     }
-    let value: Value = serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     let secrets = value["secrets"].as_array().cloned().unwrap_or_default();
     if secrets.is_empty() {
         bg("No secrets in this scope.");
@@ -478,10 +496,17 @@ mod tests {
     #[test]
     fn parses_env_set() {
         let cli =
-            Cli::try_parse_from(["oxid", "env", "set", "DB_PASSWORD=x", "--scope", "project"]).unwrap();
+            Cli::try_parse_from(["oxid", "env", "set", "DB_PASSWORD=x", "--scope", "project"])
+                .unwrap();
         match cli.command {
             Command::Env {
-                action: EnvAction::Set { assignment, scope, project, branch },
+                action:
+                    EnvAction::Set {
+                        assignment,
+                        scope,
+                        project,
+                        branch,
+                    },
             } => {
                 assert_eq!(assignment, "DB_PASSWORD=x");
                 assert_eq!(scope, "project");
@@ -495,12 +520,26 @@ mod tests {
     #[test]
     fn parses_env_list_with_branch_scope() {
         let cli = Cli::try_parse_from([
-            "oxid", "env", "list", "--scope", "branch", "--branch", "feat-a", "--project", "3",
+            "oxid",
+            "env",
+            "list",
+            "--scope",
+            "branch",
+            "--branch",
+            "feat-a",
+            "--project",
+            "3",
         ])
         .unwrap();
         match cli.command {
             Command::Env {
-                action: EnvAction::List { scope, branch, project, .. },
+                action:
+                    EnvAction::List {
+                        scope,
+                        branch,
+                        project,
+                        ..
+                    },
             } => {
                 assert_eq!(scope, "branch");
                 assert_eq!(branch.as_deref(), Some("feat-a"));
