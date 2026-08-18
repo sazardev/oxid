@@ -1,0 +1,6 @@
+# Convenience aliases — the canonical checks are documented in
+# CONTRIBUTING.md#guardrails and enforced by .githooks/ + CI.
+
+[alias]
+lint = "clippy --workspace --all-targets -- -D warnings"
+check-all = "check --workspace --all-targets"
