@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::error::invalid;
 
+/// Errors surfaced while provisioning a shared Postgres database
+/// (SPEC.md §3.1). Redis needs no equivalent: assigning an index is pure
+/// `SQLite` bookkeeping (see `control_plane.rs`), not a live call.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PoolError {
+    /// The daemon has no admin connection configured for this dependency
+    /// kind (`OXID_POSTGRES_URL` unset).
+    #[error("{0}")]
+    NotConfigured(String),
+    /// The Postgres operation itself failed.
+    #[error("resource pool failure: {0}")]
+    Failure(String),
+}
+
 /// Kind of shared dependency multiplexed across branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

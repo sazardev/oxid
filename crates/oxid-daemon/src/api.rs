@@ -3,15 +3,16 @@
 //! The CLI, TUI, dashboard and desktop app all consume this router.
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use oxid_core::{
-    BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId, GitPort, Project,
-    ProjectId, RepositoryError,
+    BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId, EnvironmentState, GitPort,
+    PoolError, Project, ProjectId, RepositoryError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,23 +31,32 @@ pub struct ApiState<
     /// Shared secret verifying GitHub webhook signatures (`OXID_WEBHOOK_SECRET`).
     /// Webhooks are rejected while unset.
     pub webhook_secret: Option<String>,
+    /// Bearer token every `/api/v1/*` control-plane request must present
+    /// (`Authorization: Bearer <token>`), except `/health`, `/webhooks/*`
+    /// and the Traefik-facing `/wake`/`/heartbeat` endpoints. `None` (the
+    /// default) leaves the control API open — appropriate for a daemon only
+    /// reachable on localhost/a private network, not for one exposed
+    /// beyond that.
+    pub api_token: Option<String>,
 }
 
-/// Builds the API router.
+/// Builds the API router. Every route except `/health`, `/webhooks/github`,
+/// `/wake` and `/heartbeat` requires `state.api_token` when it's configured
+/// (see [`require_bearer_token`]).
 pub fn router<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     state: ApiState<G, O>,
 ) -> Router {
-    Router::new()
-        .route("/api/v1/health", get(health))
+    let protected = Router::new()
         .route(
             "/api/v1/projects",
             post(register_project).get(list_projects),
         )
         .route("/api/v1/projects/{id}/environments", get(list_environments))
         .route("/api/v1/projects/{id}/deploy", post(deploy))
+        .route("/api/v1/projects/{id}", delete(delete_project))
         .route("/api/v1/environments/{env_id}", delete(destroy))
         .route(
             "/api/v1/secrets",
@@ -64,13 +74,58 @@ pub fn router<
         .route("/api/v1/environments/{env_id}/pause", post(pause))
         .route("/api/v1/environments/{env_id}/wake", post(wake))
         .route("/api/v1/environments/{env_id}/logs", get(logs))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_token::<G, O>,
+        ));
+
+    Router::new()
+        .route("/api/v1/health", get(health))
         .route("/api/v1/wake", post(wake_by_host))
         .route(
             "/api/v1/heartbeat",
             get(heartbeat_by_host).post(heartbeat_by_host),
         )
         .route("/api/v1/webhooks/github", post(github_webhook))
+        .merge(protected)
         .with_state(state)
+}
+
+/// Rejects requests missing a valid `Authorization: Bearer <token>` header
+/// when `state.api_token` is configured; passes everything through
+/// unchanged otherwise (open by default, see [`ApiState::api_token`]).
+async fn require_bearer_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.api_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+            next.run(request).await
+        }
+        _ => ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+            .into_response(),
+    }
+}
+
+/// Constant-time byte comparison — a plain `==` on the token would let an
+/// attacker learn how many leading bytes matched from response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +149,8 @@ pub struct DeployBody {
 /// Query for `GET /api/v1/projects/{id}/environments`.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListEnvironmentsQuery {
-    /// When set, only the environment for this branch is returned.
+    /// When set, only the most recent environment for this branch is
+    /// returned (0 or 1 elements), not its full deploy history.
     pub branch: Option<String>,
 }
 
@@ -155,12 +211,14 @@ impl From<CpError> for ApiError {
             CpError::NotFound(m) | CpError::Store(RepositoryError::NotFound(m)) => {
                 Self::not_found(m)
             }
-            CpError::Config(_) | CpError::Domain(_) => Self::from_validation(err.to_string()),
+            CpError::Config(_)
+            | CpError::Domain(_)
+            | CpError::Pool(PoolError::NotConfigured(_)) => Self::from_validation(err.to_string()),
             CpError::Store(RepositoryError::Conflict(m)) => Self::new(StatusCode::CONFLICT, m),
             CpError::Store(RepositoryError::Storage(m)) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, m)
             }
-            CpError::Git(_) | CpError::Oci(_) => {
+            CpError::Git(_) | CpError::Oci(_) | CpError::Pool(PoolError::Failure(_)) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
             }
         }
@@ -216,10 +274,17 @@ async fn list_environments<
 ) -> ApiResult<Json<Vec<Environment>>> {
     let envs = state.cp.list_environments(ProjectId(id)).await?;
     let envs = match query.branch {
+        // The daemon keeps one row per historical deploy of a branch (audit
+        // trail); only the most recent (highest id) one is "the" current
+        // environment. Returning every historical row here would let CLI
+        // callers such as `oxid down`/`pause`/`wake` act on a stale,
+        // already-`Destroyed` deployment instead of the live one.
         Some(raw) => {
             let branch = parse_branch(&raw)?;
             envs.into_iter()
                 .filter(|e| e.branch.name == branch)
+                .max_by_key(|e| e.id.0)
+                .into_iter()
                 .collect()
         }
         None => envs,
@@ -238,6 +303,17 @@ async fn deploy<
     let branch = parse_branch(&body.branch)?;
     let env = state.cp.deploy(ProjectId(id), branch).await?;
     Ok((StatusCode::CREATED, Json(env)))
+}
+
+async fn delete_project<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(id): Path<u64>,
+) -> ApiResult<StatusCode> {
+    state.cp.delete_project(ProjectId(id)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn pause<
@@ -273,14 +349,28 @@ async fn logs<
     Ok(Json(json!({ "logs": logs })))
 }
 
+/// Query for `DELETE /api/v1/environments/{env_id}`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DestroyQuery {
+    /// When `true`, also deletes this branch's `branch`-scoped secrets.
+    /// Left `false` by default so a recurring feature branch's config
+    /// survives a routine TTL-based destroy/redeploy cycle.
+    #[serde(default)]
+    pub purge_secrets: bool,
+}
+
 async fn destroy<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    Query(query): Query<DestroyQuery>,
 ) -> ApiResult<StatusCode> {
-    state.cp.destroy(EnvironmentId(env_id)).await?;
+    state
+        .cp
+        .destroy(EnvironmentId(env_id), query.purge_secrets)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -562,6 +652,20 @@ async fn github_webhook<
         })?;
     verify_hmac(secret, &body, signature)?;
 
+    // GitHub sends more than `push` to a webhook URL once it's configured —
+    // most commonly a `ping` event on setup, which has no `ref` at all and
+    // used to fail here with a confusing "missing `ref`" error instead of
+    // just being acknowledged. Only `push` (or an unset header, for callers
+    // that don't set it, e.g. the existing tests) is actually processed.
+    if let Some(event) = headers.get("x-github-event").and_then(|v| v.to_str().ok())
+        && event != "push"
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "status": "ignored", "event": event })),
+        ));
+    }
+
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| ApiError::from_validation(format!("invalid JSON payload: {e}")))?;
     let branch = payload
@@ -584,8 +688,30 @@ async fn github_webhook<
         .into_iter()
         .find(|p| p.repo_url.as_str().contains(full_name))
         .ok_or_else(|| ApiError::not_found(format!("no project registered for `{full_name}`")))?;
+    let branch = parse_branch(branch)?;
 
-    let env = state.cp.deploy(project.id, parse_branch(branch)?).await?;
+    // A push with `"deleted": true` means the branch itself was deleted on
+    // GitHub, not that new commits landed on it. Deploying it would just
+    // fail with a confusing git error ("branch not found") once the cache
+    // is refreshed; destroy its environment instead, if it has one.
+    if payload.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return match state
+            .cp
+            .find_environment_by_branch(project.id, &branch)
+            .await?
+        {
+            Some(env) if env.state != EnvironmentState::Destroyed => {
+                state.cp.destroy(env.id, false).await?;
+                Ok((
+                    StatusCode::OK,
+                    Json(json!({ "status": "destroyed", "environment_id": env.id.0 })),
+                ))
+            }
+            _ => Ok((StatusCode::OK, Json(json!({ "status": "ignored" })))),
+        };
+    }
+
+    let env = state.cp.deploy(project.id, branch).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "status": "deployed", "environment_id": env.id.0 })),
@@ -707,6 +833,13 @@ mod tests {
             self.calls.lock().unwrap().push(format!("remove:{name}"));
             Ok(())
         }
+        async fn remove_image(&self, image: &str) -> Result<(), OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("remove_image:{image}"));
+            Ok(())
+        }
         async fn logs(&self, name: &str) -> Result<String, OciError> {
             self.calls.lock().unwrap().push(format!("logs:{name}"));
             Ok("build log".to_owned())
@@ -729,9 +862,21 @@ mod tests {
             router(ApiState {
                 cp,
                 webhook_secret: Some("test-secret".to_owned()),
+                api_token: None,
             }),
             oci,
         )
+    }
+
+    async fn test_app_with_token(token: &str) -> Router {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: Some(token.to_owned()),
+        })
     }
 
     fn repo_dir_with_config() -> tempfile::TempDir {
@@ -757,16 +902,26 @@ port = 8080
         uri: &str,
         body: Value,
     ) -> (StatusCode, Vec<u8>) {
+        json_request_with_auth(app, method, uri, body, None).await
+    }
+
+    async fn json_request_with_auth(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Value,
+        bearer: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -778,22 +933,30 @@ port = 8080
 
     /// Sends a GitHub webhook with a valid `X-Hub-Signature-256` header.
     async fn signed_webhook(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
+        signed_webhook_with_event(app, payload, None).await
+    }
+
+    async fn signed_webhook_with_event(
+        app: &Router,
+        payload: Value,
+        event: Option<&str>,
+    ) -> (StatusCode, Vec<u8>) {
         let raw = payload.to_string();
         let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
         mac.update(raw.as_bytes());
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/v1/webhooks/github")
+            .header("content-type", "application/json")
+            .header("x-hub-signature-256", signature);
+        if let Some(event) = event {
+            builder = builder.header("x-github-event", event);
+        }
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/v1/webhooks/github")
-                    .header("content-type", "application/json")
-                    .header("x-hub-signature-256", signature)
-                    .body(Body::from(raw))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(raw)).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -807,6 +970,56 @@ port = 8080
     async fn health_ok() {
         let (app, _) = test_app().await;
         let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_is_open_when_no_token_is_configured() {
+        let (app, _) = test_app().await;
+        let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protected_routes_reject_missing_or_wrong_token() {
+        let app = test_app_with_token("s3cr3t").await;
+
+        let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, _) = json_request_with_auth(
+            &app,
+            "GET",
+            "/api/v1/projects",
+            json!({}),
+            Some("wrong-token"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_routes_accept_the_correct_token() {
+        let app = test_app_with_token("s3cr3t").await;
+        let (status, _) =
+            json_request_with_auth(&app, "GET", "/api/v1/projects", json!({}), Some("s3cr3t"))
+                .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// `/health` and the Traefik-facing `/wake`/`/heartbeat` endpoints must
+    /// stay reachable without a token even when one is configured — Traefik
+    /// has no way to attach it, and health checks shouldn't need auth.
+    #[tokio::test]
+    async fn public_routes_stay_open_even_with_a_token_configured() {
+        let app = test_app_with_token("s3cr3t").await;
+        let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody").await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -882,6 +1095,99 @@ port = 8080
         assert_eq!(status, StatusCode::ACCEPTED);
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["status"], "deployed");
+    }
+
+    /// Regression test: GitHub sends a `ping` event (no `ref` at all) the
+    /// moment a webhook is configured. This used to fail with "webhook
+    /// payload is missing `ref`" instead of just being acknowledged.
+    #[tokio::test]
+    async fn webhook_ignores_non_push_events() {
+        let (app, _) = test_app().await;
+        let (status, body) = signed_webhook_with_event(
+            &app,
+            json!({ "zen": "Anything added dilutes everything else." }),
+            Some("ping"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "ignored");
+    }
+
+    /// Regression test: a push with `"deleted": true` (branch deletion on
+    /// GitHub) used to be treated like a normal push and attempt to deploy
+    /// a branch that no longer exists in the remote, failing with a
+    /// confusing git error. It should destroy the branch's environment
+    /// instead.
+    #[tokio::test]
+    async fn webhook_destroys_environment_on_branch_deletion() {
+        let repo = repo_dir_with_config();
+        let (app, oci) = test_app().await;
+        json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        signed_webhook(
+            &app,
+            json!({
+                "ref": "refs/heads/feature-hook",
+                "repository": { "full_name": "org/app" }
+            }),
+        )
+        .await;
+
+        let (status, body) = signed_webhook(
+            &app,
+            json!({
+                "ref": "refs/heads/feature-hook",
+                "deleted": true,
+                "repository": { "full_name": "org/app" }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "destroyed");
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("remove:")),
+            "{:?}",
+            oci.calls
+        );
+    }
+
+    /// A deletion push for a branch Oxid never deployed must be a no-op,
+    /// not an error.
+    #[tokio::test]
+    async fn webhook_branch_deletion_for_unknown_branch_is_a_noop() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+
+        let (status, body) = signed_webhook(
+            &app,
+            json!({
+                "ref": "refs/heads/never-deployed",
+                "deleted": true,
+                "repository": { "full_name": "org/app" }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "ignored");
     }
 
     #[tokio::test]
@@ -985,10 +1291,30 @@ port = 8080
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
+        // Without a `branch` filter, only global+project-scope secrets are
+        // visible — a `branch`-scoped secret is meaningless without a branch
+        // context and must not leak into this listing.
         let (status, body) = json_request(
             &app,
             "GET",
             format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+
+        // With `?branch=feature-login`, its branch-scoped secret joins the
+        // project-scope one.
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!(
+                "/api/v1/projects/{}/secrets?branch=feature-login",
+                project.id.0
+            )
+            .as_str(),
             json!({}),
         )
         .await;
@@ -1014,6 +1340,73 @@ port = 8080
         assert!(run.contains("\"DB_PASSWORD\": \"hunter2\""), "{run}");
         assert!(run.contains("\"API_TOKEN\": \"tok-123\""), "{run}");
         assert!(run.contains("\"OXID_BRANCH\": \"feature-login\""), "{run}");
+    }
+
+    /// Regression test for a real secret-leakage bug found by deploying two
+    /// real branches with same-named branch-scoped secrets: the SQL filter
+    /// resolving "secrets visible to this deploy" matched every row for the
+    /// project regardless of branch, so branch A's value could shadow branch
+    /// B's when both defined the same key.
+    #[tokio::test]
+    async fn branch_secrets_do_not_cross_over_on_deploy() {
+        let repo = repo_dir_with_config();
+        let (app, oci) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+            json!({
+                "name": "DB_PASSWORD", "scope": "branch",
+                "branch": "feature-a", "value": "secret-a"
+            }),
+        )
+        .await;
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+            json!({
+                "name": "DB_PASSWORD", "scope": "branch",
+                "branch": "feature-b", "value": "secret-b"
+            }),
+        )
+        .await;
+
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-a" }),
+        )
+        .await;
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-b" }),
+        )
+        .await;
+
+        let calls = oci.calls.lock().unwrap();
+        let run_a = calls
+            .iter()
+            .find(|c| c.starts_with("run:oxid-app-feature-a:"))
+            .expect("feature-a container was started");
+        let run_b = calls
+            .iter()
+            .find(|c| c.starts_with("run:oxid-app-feature-b:"))
+            .expect("feature-b container was started");
+        assert!(run_a.contains("\"DB_PASSWORD\": \"secret-a\""), "{run_a}");
+        assert!(run_b.contains("\"DB_PASSWORD\": \"secret-b\""), "{run_b}");
     }
 
     #[tokio::test]
@@ -1127,6 +1520,116 @@ port = 8080
             "{:?}",
             oci.calls
         );
+    }
+
+    #[tokio::test]
+    async fn destroy_with_purge_secrets_query_param_deletes_branch_secrets() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+            json!({
+                "name": "API_KEY", "scope": "branch",
+                "branch": "feature-login", "value": "x"
+            }),
+        )
+        .await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, _) = json_request(
+            &app,
+            "DELETE",
+            format!("/api/v1/environments/{}?purge_secrets=true", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, body) = json_request(
+            &app,
+            "GET",
+            format!(
+                "/api/v1/projects/{}/secrets?branch=feature-login",
+                project.id.0
+            )
+            .as_str(),
+            json!({}),
+        )
+        .await;
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["secrets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["name"] != "API_KEY"),
+            "{value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_endpoint_removes_project_and_environments() {
+        let repo = repo_dir_with_config();
+        let (app, oci) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+
+        let (status, _) = json_request(
+            &app,
+            "DELETE",
+            format!("/api/v1/projects/{}", project.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("remove_image:")),
+            "{:?}",
+            oci.calls
+        );
+
+        let (status, _) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/projects/{}/environments", project.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

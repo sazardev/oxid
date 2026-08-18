@@ -9,14 +9,14 @@
 
 use std::path::Path;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError, EnvVarScope,
-    Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime, Project,
-    ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext, SecretStore,
-    SecretValue, StateTransition, Ttl,
+    Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime, PoolKind,
+    Project, ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext,
+    SecretStore, SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::crypto::{Cipher, CryptoError};
@@ -46,6 +46,13 @@ impl SqliteStore {
     /// Opens (creating if needed) the database at `path` with `WAL` journaling
     /// and foreign keys enabled, then runs the embedded migrations.
     ///
+    /// `synchronous = NORMAL` is paired with WAL deliberately, not left at
+    /// `SQLite`'s `FULL` default: with WAL, `NORMAL` is the combination
+    /// `SQLite`'s own documentation calls safe from corruption (a
+    /// power-loss can lose the last commit, never corrupt the file) while
+    /// skipping an `fsync` per transaction — the right trade for an audit
+    /// trail of ephemeral dev environments, not a system of record.
+    ///
     /// # Errors
     /// Returns [`StoreError`] on connection or migration failure.
     pub async fn open(path: impl AsRef<Path>, cipher: Cipher) -> Result<Self, StoreError> {
@@ -53,6 +60,7 @@ impl SqliteStore {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true);
         Self::open_with(opts, cipher).await
     }
@@ -94,22 +102,138 @@ impl SqliteStore {
         rows.iter().map(env_from_row).collect()
     }
 
-    /// Finds the environment routed at `url`, if any.
+    /// Finds the most recent environment routed at `url`, if any.
     ///
     /// Backs the wake-on-request and heartbeat endpoints, which only know
-    /// the `Host` header Traefik forwards, not an environment id.
+    /// the `Host` header Traefik forwards, not an environment id. A branch
+    /// redeployed after `oxid down` produces a new row reusing the same
+    /// `url`, so this must pick the highest id, not an arbitrary row, or a
+    /// stale `Destroyed` deployment could shadow the live one.
     ///
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
     pub async fn find_by_url(&self, url: &str) -> Result<Option<Environment>, RepositoryError> {
         let row = sqlx::query(&format!(
-            "SELECT {ENV_COLUMNS} FROM environments WHERE url = ?"
+            "SELECT {ENV_COLUMNS} FROM environments WHERE url = ? ORDER BY id DESC LIMIT 1"
         ))
         .bind(url)
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
         row.as_ref().map(env_from_row).transpose()
+    }
+
+    /// Looks up an existing resource lease for (project, branch, kind,
+    /// `shared_instance`), if any — leases are reused across redeploys of
+    /// the same branch rather than re-provisioned every time.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn find_resource_lease(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+        kind: PoolKind,
+        shared_instance: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT resource_name FROM resource_leases \
+             WHERE project_id = ? AND branch = ? AND kind = ? AND shared_instance = ?",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch.as_str())
+        .bind(kind.to_string())
+        .bind(shared_instance)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(|r| r.try_get::<String, _>("resource_name").map_err(storage))
+            .transpose()
+    }
+
+    /// Every `resource_name` already leased under `shared_instance`+`kind`,
+    /// across all branches — used to pick a free Redis index (there's no
+    /// `CREATE DATABASE`-equivalent pre-check for Redis, so this is the only
+    /// source of truth for "is this slot free").
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn used_resource_names(
+        &self,
+        kind: PoolKind,
+        shared_instance: &str,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT resource_name FROM resource_leases WHERE kind = ? AND shared_instance = ?",
+        )
+        .bind(kind.to_string())
+        .bind(shared_instance)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| r.try_get::<String, _>("resource_name").map_err(storage))
+            .collect()
+    }
+
+    /// Records a new resource lease.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn create_resource_lease(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+        kind: PoolKind,
+        shared_instance: &str,
+        resource_name: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO resource_leases \
+             (project_id, branch, kind, shared_instance, resource_name, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch.as_str())
+        .bind(kind.to_string())
+        .bind(shared_instance)
+        .bind(resource_name)
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Deletes and returns every resource lease held by (project, branch) —
+    /// used when the branch is destroyed, so its Postgres database can be
+    /// dropped and its Redis index freed. Returns `(kind, resource_name)`
+    /// pairs.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn take_resource_leases(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+    ) -> Result<Vec<(PoolKind, String)>, RepositoryError> {
+        let rows = sqlx::query(
+            "DELETE FROM resource_leases WHERE project_id = ? AND branch = ? \
+             RETURNING kind, resource_name",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                let kind: String = r.try_get("kind").map_err(storage)?;
+                let kind = kind.parse::<PoolKind>().map_err(storage)?;
+                let resource_name: String = r.try_get("resource_name").map_err(storage)?;
+                Ok((kind, resource_name))
+            })
+            .collect()
     }
 }
 
@@ -592,6 +716,13 @@ impl SecretStore for SqliteStore {
         .await
         .map_err(map_sqlx)?;
 
+        // `SecretContext::set` is a raw, precedence-blind upsert (by design,
+        // callers like tests build single-scope contexts with it). Rows here
+        // come back in an incidental SQL order, not scope-priority order, so
+        // folding them in directly with `set` would let whichever row SQLite
+        // happens to return last for a name win — not necessarily the most
+        // specific scope. `merge` applies the actual
+        // Global -> Project -> Branch precedence rule per key.
         let mut ctx = SecretContext::new();
         for row in rows {
             let name: String = row.try_get("name").map_err(storage)?;
@@ -599,7 +730,9 @@ impl SecretStore for SqliteStore {
             let scope = scope.parse::<EnvVarScope>().map_err(storage)?;
             let value_enc: String = row.try_get("value_enc").map_err(storage)?;
             let value = self.cipher.decrypt(&value_enc).map_err(storage)?;
-            ctx.set(name, scope, SecretValue::new(value));
+            let mut single = SecretContext::new();
+            single.set(name, scope, SecretValue::new(value));
+            ctx = ctx.merge([single]);
         }
         Ok(ctx)
     }
@@ -656,10 +789,20 @@ impl SecretStore for SqliteStore {
     }
 }
 
-/// Filter matching global (`project_id IS NULL`), project and branch secrets
-/// for a context. `?1` = project id (used twice), `?2` = branch name.
-const SECRET_CONTEXT_FILTER: &str = "project_id IS NULL OR project_id = ? OR \
-     (project_id = ? AND (branch IS NULL OR branch = ?))";
+/// Filter matching global (`project_id IS NULL`), project-scope (`branch IS
+/// NULL`) and this-branch-only secrets for a context. Binds: project id
+/// (twice), then branch name.
+///
+/// This used to be `project_id IS NULL OR project_id = ? OR (project_id = ?
+/// AND (branch IS NULL OR branch = ?))`: the middle `project_id = ?` matched
+/// *every* row for the project on its own, branch-scoped or not, making the
+/// trailing `branch = ?` check dead code. In practice this leaked another
+/// branch's branch-scoped secret into every other branch's deploy of the
+/// same project whenever both defined a secret with the same name — found by
+/// deploying two branches with same-named branch-scoped secrets and seeing
+/// one branch's container receive the other's value.
+const SECRET_CONTEXT_FILTER: &str = "project_id IS NULL OR \
+     (project_id = ? AND branch IS NULL) OR (project_id = ? AND branch = ?)";
 
 const SECRET_COLUMNS: &str = "name, scope, value_enc";
 
@@ -868,5 +1011,159 @@ mod tests {
 
     fn ts_from(secs: i64) -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(secs).unwrap()
+    }
+
+    /// Regression test for a real secret-leakage bug: the old
+    /// `SECRET_CONTEXT_FILTER` matched every row for a project regardless of
+    /// branch, so branch A's `branch`-scoped secret was visible from branch
+    /// B's deploy whenever both defined a secret with the same name. Found
+    /// by deploying two real branches with same-named branch secrets and
+    /// observing one branch's container receive the other's value.
+    #[tokio::test]
+    async fn branch_scoped_secrets_do_not_leak_across_branches() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        ProjectStore::create(&store, &project(1)).await.unwrap();
+
+        let branch_a = BranchName::parse("feature-a").unwrap();
+        let branch_b = BranchName::parse("feature-b").unwrap();
+
+        SecretStore::set_secret(
+            &store,
+            Some(ProjectId(1)),
+            None,
+            "DB_PASS",
+            EnvVarScope::Project,
+            &SecretValue::new("project-level"),
+        )
+        .await
+        .unwrap();
+        SecretStore::set_secret(
+            &store,
+            Some(ProjectId(1)),
+            Some(&branch_a),
+            "DB_PASS",
+            EnvVarScope::Branch,
+            &SecretValue::new("only-for-branch-a"),
+        )
+        .await
+        .unwrap();
+
+        // Branch A sees its own override.
+        let ctx_a = SecretStore::secrets_for(&store, Some(ProjectId(1)), Some(&branch_a))
+            .await
+            .unwrap();
+        assert_eq!(
+            ctx_a.resolve("DB_PASS").unwrap().as_str(),
+            "only-for-branch-a"
+        );
+
+        // Branch B must fall back to the project-level value, never see A's.
+        let ctx_b = SecretStore::secrets_for(&store, Some(ProjectId(1)), Some(&branch_b))
+            .await
+            .unwrap();
+        assert_eq!(ctx_b.resolve("DB_PASS").unwrap().as_str(), "project-level");
+
+        // Listing branch B's visible secrets must not include a `branch`
+        // scope entry at all (that row belongs to branch A).
+        let listed_b = SecretStore::list_secrets(&store, Some(ProjectId(1)), Some(&branch_b))
+            .await
+            .unwrap();
+        assert!(
+            listed_b
+                .iter()
+                .all(|(_, scope)| *scope != EnvVarScope::Branch),
+            "{listed_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_lease_lifecycle() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        ProjectStore::create(&store, &project(1)).await.unwrap();
+        let branch = BranchName::parse("feature-a").unwrap();
+
+        assert!(
+            store
+                .find_resource_lease(ProjectId(1), &branch, PoolKind::Redis, "local-redis")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        store
+            .create_resource_lease(ProjectId(1), &branch, PoolKind::Redis, "local-redis", "3")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .find_resource_lease(ProjectId(1), &branch, PoolKind::Redis, "local-redis")
+                .await
+                .unwrap(),
+            Some("3".to_owned())
+        );
+        assert_eq!(
+            store
+                .used_resource_names(PoolKind::Redis, "local-redis")
+                .await
+                .unwrap(),
+            vec!["3".to_owned()]
+        );
+
+        let taken = store
+            .take_resource_leases(ProjectId(1), &branch)
+            .await
+            .unwrap();
+        assert_eq!(taken, vec![(PoolKind::Redis, "3".to_owned())]);
+        assert!(
+            store
+                .find_resource_lease(ProjectId(1), &branch, PoolKind::Redis, "local-redis")
+                .await
+                .unwrap()
+                .is_none(),
+            "take_resource_leases must remove the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_leases_are_isolated_per_project() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let mut second = project(2);
+        second.repo_url = RepoUrl::parse("https://github.com/org/other.git").unwrap();
+        let id1 = ProjectStore::create(&store, &project(1)).await.unwrap();
+        let id2 = ProjectStore::create(&store, &second).await.unwrap();
+        let branch = BranchName::parse("feature-a").unwrap();
+
+        store
+            .create_resource_lease(id1, &branch, PoolKind::Postgres, "pg", "db_1")
+            .await
+            .unwrap();
+        store
+            .create_resource_lease(id2, &branch, PoolKind::Postgres, "pg", "db_2")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .find_resource_lease(id1, &branch, PoolKind::Postgres, "pg")
+                .await
+                .unwrap(),
+            Some("db_1".to_owned())
+        );
+        let mut used = store
+            .used_resource_names(PoolKind::Postgres, "pg")
+            .await
+            .unwrap();
+        used.sort();
+        assert_eq!(used, vec!["db_1".to_owned(), "db_2".to_owned()]);
+
+        store.take_resource_leases(id1, &branch).await.unwrap();
+        assert_eq!(
+            store
+                .find_resource_lease(id2, &branch, PoolKind::Postgres, "pg")
+                .await
+                .unwrap(),
+            Some("db_2".to_owned()),
+            "deleting project 1's lease must not touch project 2's"
+        );
     }
 }

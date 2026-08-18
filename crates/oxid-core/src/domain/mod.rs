@@ -23,7 +23,7 @@ pub use ports::{
 };
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};
-pub use resource_pool::{PoolKind, ResourcePool};
+pub use resource_pool::{PoolError, PoolKind, ResourcePool};
 pub use secret_context::{EnvVarScope, SecretContext, SecretValue};
 pub use state::{EnvironmentState, EnvironmentStateError, StateTransition, TransitionTable};
 pub use value_objects::{RepoUrl, Ttl};

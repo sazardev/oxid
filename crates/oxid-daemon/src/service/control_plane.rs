@@ -6,18 +6,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
-    DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore,
-    GitError, GitPort, OciError, OffsetDateTime, Project, ProjectId, ProjectStore, RepoUrl,
-    RepositoryError, SecretStore, SecretValue, StateTransition,
+    Dependency, DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState,
+    EnvironmentStore, GitError, GitPort, OciError, OffsetDateTime, PoolError, PoolKind, Project,
+    ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore, SecretValue, StateTransition,
 };
 
 use crate::adapter::config::{self, ConfigError};
+use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::SqliteStore;
 
 /// Errors surfaced by the control plane.
@@ -38,6 +40,9 @@ pub enum CpError {
     /// A domain rule was violated.
     #[error(transparent)]
     Domain(#[from] DomainError),
+    /// A resource-pool (Postgres/Redis) operation failed.
+    #[error(transparent)]
+    Pool(#[from] PoolError),
     /// A requested record does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -71,14 +76,54 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// used to build the Traefik `errors`/`forwardAuth` middleware labels
     /// (e.g. `http://oxid-daemon:8080`).
     daemon_url: String,
+    /// Serializes every state-mutating lifecycle operation on environments —
+    /// `deploy`, `pause`, `wake`, `destroy`, and each action a GC `sweep`
+    /// applies — across every project. `Arc`-wrapped because `ControlPlane`
+    /// is cloned per request (axum extracts a fresh clone from `State` for
+    /// every handler).
+    ///
+    /// Originally added just around `deploy()`: without it, concurrent
+    /// deploys raced on the shared git-cache checkout —
+    /// `checkout_commit` force-rewrites the *same* on-disk working directory
+    /// two deploys read from concurrently, so one could see files
+    /// mid-rewrite (`tar_context` failing with "No such file or directory")
+    /// or silently tar the wrong branch's tree. Concurrent deploys of the
+    /// *same* branch had a second failure mode: each raced to create its own
+    /// `Environment` row before finding out only one could win the
+    /// container name, so the highest-id row — not necessarily the one
+    /// whose `docker run` actually succeeded — could be the failed one,
+    /// leaving `status`/`down`/`pause`/`wake` resolution pointed at a
+    /// `Destroyed` row while the real container kept running. Found by
+    /// firing ten concurrent `oxid up` at the same new branch.
+    ///
+    /// Widened to cover `pause`/`wake`/`destroy`/`sweep` too: a GC tick and
+    /// a manual action on the same environment both do a read-modify-write
+    /// (fetch, apply a `StateTransition`, persist) with no atomicity between
+    /// the read and the write, so they could interleave and have one
+    /// overwrite the other's transition with stale data.
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Admin connection string for the shared Postgres instance
+    /// (`OXID_POSTGRES_URL`). `None` means projects declaring a `postgres`
+    /// dependency will fail to deploy with a clear error instead of
+    /// silently skipping provisioning.
+    postgres_url: Option<String>,
+    /// Base URL for the shared Redis instance, without a database index
+    /// (`OXID_REDIS_URL`, e.g. `redis://host:6379`). Same "clear error, not
+    /// silent skip" behavior as `postgres_url` when a project needs it.
+    redis_url: Option<String>,
+    /// Number of logical Redis databases available to lease from
+    /// (`OXID_REDIS_POOL_SIZE`, default matches Redis's own default of 16).
+    redis_pool_size: u32,
 }
 
 const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
+const DEFAULT_REDIS_POOL_SIZE: u32 = 16;
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Creates a control plane bound to a store, git client and docker
-    /// client. Traefik integration is disabled until
-    /// [`ControlPlane::with_traefik`] is called.
+    /// client. Traefik integration and resource pooling are disabled until
+    /// [`ControlPlane::with_traefik`] / [`ControlPlane::with_resource_pools`]
+    /// are called.
     #[must_use]
     pub fn new(store: SqliteStore, git: G, oci: O, cache_dir: PathBuf) -> Self {
         Self {
@@ -88,6 +133,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             cache_dir,
             docker_network: None,
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
+            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            postgres_url: None,
+            redis_url: None,
+            redis_pool_size: DEFAULT_REDIS_POOL_SIZE,
         }
     }
 
@@ -105,6 +154,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self
     }
 
+    /// Enables resource pooling (SPEC.md §3.1): projects declaring
+    /// `[dependencies.*]` of kind `postgres`/`redis` get a per-branch
+    /// logical database / Redis index carved out of these shared instances
+    /// instead of failing to deploy.
+    #[must_use]
+    pub fn with_resource_pools(
+        mut self,
+        postgres_url: Option<String>,
+        redis_url: Option<String>,
+        redis_pool_size: u32,
+    ) -> Self {
+        self.postgres_url = postgres_url;
+        self.redis_url = redis_url;
+        self.redis_pool_size = redis_pool_size;
+        self
+    }
+
     /// Registers the project declared by `oxid.toml` in `repo_dir`.
     ///
     /// Idempotent: if a project with the same `origin` URL already exists, the
@@ -119,11 +185,28 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Ok(existing);
         }
 
-        let parsed = config::parse_file(repo_dir.join("oxid.toml"))?;
-        let mut project = Project::new(ProjectId(0), parsed.name, repo_url, parsed.config)?;
-        let id = ProjectStore::create(&self.store, &project).await?;
-        project.id = id;
-        Ok(project)
+        let parsed = config::parse_project(repo_dir)?;
+        let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?;
+        match ProjectStore::create(&self.store, &project).await {
+            Ok(id) => {
+                project.id = id;
+                Ok(project)
+            }
+            // Lost a race with another concurrent first-time registration of
+            // the same repo (e.g. two branches of a brand-new project
+            // pushed at once, each triggering its own webhook-driven
+            // registration): the `find_project_by_repo` check above and
+            // this `create` are not atomic, so both can pass the check
+            // before either commits. Found by firing ten concurrent `oxid
+            // up` at a never-before-registered project. Falling back to a
+            // re-read here is what actually makes this idempotent under
+            // concurrency, not just on repeated sequential calls.
+            Err(RepositoryError::Conflict(_)) => self
+                .find_project_by_repo(&repo_url)
+                .await?
+                .ok_or_else(|| CpError::NotFound(format!("project for `{repo_url}`"))),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Lists all registered projects.
@@ -146,6 +229,45 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(self.store.list_by_project(project_id).await?)
     }
 
+    /// Permanently deletes a project: destroys every environment that isn't
+    /// already `Destroyed` (tearing down its container, image and any leased
+    /// resource-pool slots), removes the project's git-cache clone, then
+    /// deletes the project row — which cascades to its `secrets` and
+    /// `environments` rows at the database level (`ON DELETE CASCADE`).
+    ///
+    /// Before this existed, a registered project was permanent: there was no
+    /// way to remove it, so its git-cache clone and any leftover
+    /// `Environment`/`secrets` rows accumulated forever.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), CpError> {
+        let project = self.ensure_project(project_id).await?;
+
+        for env in self.store.list_by_project(project_id).await? {
+            if env.state != EnvironmentState::Destroyed {
+                // No need to purge secrets per-branch here: the project
+                // delete below cascades and removes every secret row anyway.
+                self.destroy(env.id, false).await?;
+            }
+        }
+
+        let cache_path = self
+            .cache_dir
+            .join(crate::adapter::git::cache_dir_name(&project.repo_url));
+        if let Err(e) = tokio::fs::remove_dir_all(&cache_path).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(RepositoryError::Storage(format!(
+                "could not remove git cache `{}`: {e}",
+                cache_path.display()
+            ))
+            .into());
+        }
+
+        Ok(ProjectStore::delete(&self.store, project_id).await?)
+    }
+
     /// Deploys `branch` for a project: clone, build, run, then transition to
     /// `Running`.
     ///
@@ -156,7 +278,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         project_id: ProjectId,
         branch: BranchName,
     ) -> Result<Environment, CpError> {
+        // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
+        // comment for the two race conditions this closes).
+        let _guard = self.lifecycle_lock.lock().await;
+
         let project = self.ensure_project(project_id).await?;
+
+        // 0. A redeploy of an already-live branch (a webhook firing on a
+        // new push, or a second `oxid up`) reuses the same container name,
+        // so the previous container has to go first or Docker rejects the
+        // new one with a 409 name conflict. Mark its Environment row
+        // Destroyed too, so `status`/branch-resolution don't keep pointing
+        // at a container that no longer exists.
+        self.replace_previous_deployment(&project, project_id, &branch)
+            .await?;
 
         // 1. Clone cache + resolve + checkout the branch.
         let repo_dir = self
@@ -167,9 +302,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self.git.checkout_commit(&repo_dir, &commit.sha).await?;
 
         // 2. Build the image.
-        let image = format!("oxid/{}/{}", project.name, sanitize_label(&branch));
+        //
+        // `[build].context` (e.g. a monorepo subdirectory like `backend/`)
+        // was parsed from `oxid.toml` and persisted, but never actually
+        // consulted here — every build used the whole repo checkout as its
+        // context regardless. Found while wiring `docker-compose.yml`
+        // support, whose `build.context`/`build.dockerfile` pair only makes
+        // sense if `dockerfile` really is resolved relative to `context`.
+        let image = image_name(&project, &branch);
         let build = BuildSpec {
-            context: repo_dir.clone(),
+            context: repo_dir.join(&project.config.build.context),
             dockerfile: project
                 .config
                 .build
@@ -194,14 +336,74 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let env_id = EnvironmentStore::create(&self.store, &env).await?;
         env.id = env_id;
 
-        // 4. Resolve the effective environment: Global -> Project -> Branch
-        //    secrets plus orchestrator runtime variables (SPEC.md §2.1/§4.4).
+        // 4-7: resolve secrets, run the container, run `on_start` hooks,
+        // then activate. Everything from here on can fail (a bad secret, a
+        // Docker error, a failing hook) *after* the row above was already
+        // persisted as `Building`. Leaving it there on error would brick the
+        // branch permanently: `Building` cannot transition to `Destroy`, so
+        // `replace_previous_deployment` could never clear it on a retry (see
+        // regression test `failed_deploy_does_not_permanently_block_branch`).
+        if let Err(err) = self
+            .run_and_activate(&project, &branch, image, url, &mut env)
+            .await
+        {
+            let now = OffsetDateTime::now_utc();
+            if env.transition(StateTransition::BuildFailed, now).is_ok() {
+                let _ = self.store.update(&env).await;
+                let _ = self
+                    .store
+                    .record(&AuditEvent::new(
+                        u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                        env.id,
+                        StateTransition::BuildFailed,
+                        None,
+                        now,
+                    ))
+                    .await;
+            }
+            return Err(err);
+        }
+
+        Ok(env)
+    }
+
+    /// Resolves secrets, runs the container, runs `[build].on_start` hooks,
+    /// then transitions `env` to `Running` and records the deployment. Split
+    /// out of [`Self::deploy`] so its errors can be caught there and turned
+    /// into a `BuildFailed` transition instead of leaving `env` stuck.
+    async fn run_and_activate(
+        &self,
+        project: &Project,
+        branch: &BranchName,
+        image: String,
+        url: String,
+        env: &mut Environment,
+    ) -> Result<(), CpError> {
+        // Global -> Project -> Branch secrets plus orchestrator runtime
+        // variables (SPEC.md §2.1/§4.4).
         let mut sources = VarSources::default();
-        let secrets =
-            SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch)).await?;
+        let secrets = SecretStore::secrets_for(&self.store, Some(project.id), Some(branch)).await?;
         for (name, scope, value) in secrets.iter() {
             set_secret(&mut sources, name, scope, value.as_str());
         }
+        // Resource pooling (SPEC.md §3.1): one shared Postgres/Redis
+        // instance instead of a container per branch. Each declared
+        // dependency's connection string is injected as a Runtime
+        // variable, same as the other orchestrator-owned values below —
+        // Runtime always wins the inheritance precedence, so a project
+        // can't accidentally shadow it with a same-named secret.
+        for dependency in &project.config.dependencies {
+            let url = self
+                .provision_dependency(project, branch, dependency)
+                .await?;
+            set_secret(
+                &mut sources,
+                &dependency.inject_url_as,
+                EnvVarScope::Runtime,
+                url,
+            );
+        }
+
         set_secret(
             &mut sources,
             "OXID_BRANCH",
@@ -220,8 +422,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map(|(k, v)| (k, v.as_str().to_owned()))
             .collect::<BTreeMap<_, _>>();
 
-        // 5. Run the container.
-        let name = container_name(&project, &branch);
+        let name = container_name(project, branch);
+        // Defensive: remove any leftover container under this name even if
+        // no DB row referenced it (e.g. the daemon crashed mid-deploy, or
+        // its database was reset independently of Docker). Without this, a
+        // stale container blocks every future deploy of this branch with a
+        // 409 name conflict that `replace_previous_deployment` alone cannot
+        // see or fix.
+        match self.oci.remove(&name).await {
+            Ok(()) | Err(OciError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+
         let mut labels = BTreeMap::from([
             ("oxid.project".to_owned(), project.name.clone()),
             ("oxid.branch".to_owned(), branch.to_string()),
@@ -239,15 +451,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         };
         self.oci.run(&spec).await?;
 
-        // 6. Run the `[build].on_start` hooks (migrations, seeds).
         for command in &project.config.build.on_start {
             self.oci.exec(&name, command).await?;
         }
 
-        // 7. Transition to Running and record the deployment.
+        let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::BuildSucceeded, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(&env).await?;
+        self.store.update(env).await?;
         self.store
             .record(&AuditEvent::new(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
@@ -257,8 +468,138 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 now,
             ))
             .await?;
+        Ok(())
+    }
 
-        Ok(env)
+    /// Resolves the connection string a branch should inject for
+    /// `dependency` (SPEC.md §3.1), leasing a resource on first deploy and
+    /// reusing the same one on every redeploy of the same branch.
+    async fn provision_dependency(
+        &self,
+        project: &Project,
+        branch: &BranchName,
+        dependency: &Dependency,
+    ) -> Result<String, CpError> {
+        if let Some(existing) = self
+            .store
+            .find_resource_lease(
+                project.id,
+                branch,
+                dependency.kind,
+                &dependency.shared_instance,
+            )
+            .await?
+        {
+            return self.resource_url(dependency, &existing);
+        }
+
+        let resource_name = match dependency.kind {
+            PoolKind::Postgres => {
+                let db_name = format!(
+                    "db_{}_{}",
+                    sanitize_identifier(&project.name),
+                    sanitize_identifier(branch.as_str())
+                );
+                let admin_url = self.postgres_url.as_deref().ok_or_else(|| {
+                    PoolError::NotConfigured(format!(
+                        "project `{}` declares a `postgres` dependency but OXID_POSTGRES_URL \
+                         is not configured on this daemon",
+                        project.name
+                    ))
+                })?;
+                PostgresPool.ensure_database(admin_url, &db_name).await?;
+                db_name
+            }
+            PoolKind::Redis => {
+                if self.redis_url.is_none() {
+                    return Err(PoolError::NotConfigured(format!(
+                        "project `{}` declares a `redis` dependency but OXID_REDIS_URL is not \
+                         configured on this daemon",
+                        project.name
+                    ))
+                    .into());
+                }
+                let used = self
+                    .store
+                    .used_resource_names(PoolKind::Redis, &dependency.shared_instance)
+                    .await?
+                    .into_iter()
+                    .filter_map(|n| n.parse::<u32>().ok())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let index = lowest_free_index(&used, self.redis_pool_size).ok_or_else(|| {
+                    PoolError::Failure(format!(
+                        "redis pool `{}` is exhausted (capacity {})",
+                        dependency.shared_instance, self.redis_pool_size
+                    ))
+                })?;
+                index.to_string()
+            }
+        };
+
+        self.store
+            .create_resource_lease(
+                project.id,
+                branch,
+                dependency.kind,
+                &dependency.shared_instance,
+                &resource_name,
+            )
+            .await?;
+        self.resource_url(dependency, &resource_name)
+    }
+
+    /// Builds the connection string injected into the container for an
+    /// already-resolved `resource_name` (a Postgres database name, or a
+    /// Redis index as a string).
+    fn resource_url(
+        &self,
+        dependency: &Dependency,
+        resource_name: &str,
+    ) -> Result<String, CpError> {
+        match dependency.kind {
+            PoolKind::Postgres => {
+                // Presence already checked in `provision_dependency`'s
+                // create path; on the reuse path (existing lease found) we
+                // still need it to rebuild the DSN.
+                let admin_url = self.postgres_url.as_deref().ok_or_else(|| {
+                    PoolError::NotConfigured(
+                        "OXID_POSTGRES_URL is not configured on this daemon".to_owned(),
+                    )
+                })?;
+                Ok(crate::adapter::postgres_pool::database_url(
+                    admin_url,
+                    resource_name,
+                )?)
+            }
+            PoolKind::Redis => {
+                let base = self.redis_url.as_deref().ok_or_else(|| {
+                    PoolError::NotConfigured(
+                        "OXID_REDIS_URL is not configured on this daemon".to_owned(),
+                    )
+                })?;
+                Ok(format!("{}/{resource_name}", base.trim_end_matches('/')))
+            }
+        }
+    }
+
+    /// Releases every resource this branch leased (drops the Postgres
+    /// database, frees the Redis index), called when its environment is
+    /// destroyed — manually or by the GC sweep.
+    async fn release_dependencies(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+    ) -> Result<(), CpError> {
+        for (kind, resource_name) in self.store.take_resource_leases(project_id, branch).await? {
+            if kind == PoolKind::Postgres
+                && let Some(admin_url) = self.postgres_url.as_deref()
+            {
+                PostgresPool
+                    .drop_database(admin_url, &resource_name)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Suspends an environment (scale-to-zero).
@@ -266,6 +607,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn pause(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+        let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
@@ -289,8 +631,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn wake(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
-        let env = self.ensure_environment(environment_id).await?;
-        self.wake_env(env).await
+        self.wake_env(environment_id).await
     }
 
     /// Wakes the environment routed at `url` (matched against the `Host`
@@ -304,9 +645,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let Some(env) = self.store.find_by_url(url).await? else {
             return Ok(None);
         };
-        let id = env.id;
-        self.wake_env(env).await?;
-        Ok(EnvironmentStore::get(&self.store, id).await?)
+        self.wake_env(env.id).await?;
+        Ok(EnvironmentStore::get(&self.store, env.id).await?)
     }
 
     /// Refreshes `last_accessed_at` for the environment routed at `url`
@@ -329,7 +669,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(())
     }
 
-    async fn wake_env(&self, mut env: Environment) -> Result<(), CpError> {
+    async fn wake_env(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+        let _guard = self.lifecycle_lock.lock().await;
+        let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
@@ -347,11 +689,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     }
 
     /// Permanently destroys an environment (`oxid down`): stops and removes
-    /// its container, then transitions it to `Destroyed`.
+    /// its container and image, then transitions it to `Destroyed`.
+    ///
+    /// Branch-scoped secrets survive by default — a recurring feature
+    /// branch's config (DB passwords, API keys) shouldn't vanish just
+    /// because the environment idled out and got TTL-destroyed. Pass
+    /// `purge_secrets = true` (`oxid down --purge-secrets`) to explicitly
+    /// clear them too.
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
-    pub async fn destroy(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+    pub async fn destroy(
+        &self,
+        environment_id: EnvironmentId,
+        purge_secrets: bool,
+    ) -> Result<(), CpError> {
+        let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
@@ -359,6 +712,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let name = container_name(&project, &env.branch.name);
         self.oci.stop(&name).await?;
         self.oci.remove(&name).await?;
+        // Best-effort: an image that never finished building (a deploy that
+        // failed at the `build` step) simply won't exist yet.
+        match self
+            .oci
+            .remove_image(&image_name(&project, &env.branch.name))
+            .await
+        {
+            Ok(()) | Err(OciError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        if purge_secrets {
+            self.purge_branch_secrets(env.project_id, &env.branch.name)
+                .await?;
+        }
+        self.release_dependencies(env.project_id, &env.branch.name)
+            .await?;
 
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Destroy, now)
@@ -376,7 +746,30 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(())
     }
 
-    /// Finds the environment for `branch` within a project, if any.
+    /// Deletes every `branch`-scoped secret for `branch` (used by
+    /// `destroy(.., purge_secrets: true)`). Global and project-scope
+    /// secrets are untouched — this only clears config specific to this
+    /// one branch.
+    async fn purge_branch_secrets(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+    ) -> Result<(), CpError> {
+        let secrets =
+            SecretStore::list_secrets(&self.store, Some(project_id), Some(branch)).await?;
+        for (name, scope) in secrets {
+            if scope == EnvVarScope::Branch {
+                SecretStore::delete_secret(&self.store, Some(project_id), Some(branch), &name)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finds the most recent environment for `branch` within a project, if
+    /// any. A branch can have multiple historical rows (each `deploy` call
+    /// creates a new one rather than reusing an old, possibly `Destroyed`
+    /// one), so this always resolves to the latest by id, never a stale one.
     ///
     /// # Errors
     /// Returns [`CpError::NotFound`] if the project does not exist.
@@ -391,7 +784,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .list_by_project(project_id)
             .await?
             .into_iter()
-            .find(|e| &e.branch.name == branch))
+            .filter(|e| &e.branch.name == branch)
+            .max_by_key(|e| e.id.0))
     }
 
     /// Returns the logs of an environment's container.
@@ -491,10 +885,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 continue;
             }
 
-            match self
-                .apply_gc_action(env.clone(), &project, action, now)
-                .await
-            {
+            match self.apply_gc_action(env.id, &project, action, now).await {
                 Ok(()) => match action {
                     GcAction::Pause => summary.paused += 1,
                     GcAction::Hibernate => summary.hibernated += 1,
@@ -510,11 +901,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
     async fn apply_gc_action(
         &self,
-        mut env: Environment,
+        env_id: EnvironmentId,
         project: &Project,
         action: GcAction,
         now: OffsetDateTime,
     ) -> Result<(), CpError> {
+        // Re-fetch under the lock rather than trusting the snapshot `sweep`
+        // read at the top of its loop: without this, a concurrent manual
+        // pause/wake/destroy on the same environment between that snapshot
+        // and this action being applied would have its change silently
+        // clobbered by `store.update` writing back the GC's stale copy.
+        let _guard = self.lifecycle_lock.lock().await;
+        let mut env = self.ensure_environment(env_id).await?;
         let transition = action
             .transition()
             .expect("Keep is filtered out before calling apply_gc_action");
@@ -527,6 +925,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
         if action == GcAction::Destroy {
             self.oci.remove(&name).await?;
+            match self
+                .oci
+                .remove_image(&image_name(project, &env.branch.name))
+                .await
+            {
+                Ok(()) | Err(OciError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.release_dependencies(env.project_id, &env.branch.name)
+                .await?;
         }
 
         env.transition(transition, now).map_err(|e| state_err(&e))?;
@@ -596,6 +1004,35 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         ])
     }
 
+    /// Tears down the previous live deployment of `branch`, if any, so a
+    /// redeploy doesn't collide on the reused container name and doesn't
+    /// leave a stale `Running`-looking row behind. See [`Self::deploy`].
+    async fn replace_previous_deployment(
+        &self,
+        project: &Project,
+        project_id: ProjectId,
+        branch: &BranchName,
+    ) -> Result<(), CpError> {
+        let Some(mut previous) = self.find_environment_by_branch(project_id, branch).await? else {
+            return Ok(());
+        };
+        if previous.state == EnvironmentState::Destroyed {
+            return Ok(());
+        }
+
+        let name = container_name(project, &previous.branch.name);
+        match self.oci.remove(&name).await {
+            Ok(()) | Err(OciError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let now = OffsetDateTime::now_utc();
+        previous
+            .transition(StateTransition::Destroy, now)
+            .map_err(|e| state_err(&e))?;
+        self.store.update(&previous).await?;
+        Ok(())
+    }
+
     async fn find_project_by_repo(
         &self,
         repo_url: &RepoUrl,
@@ -632,6 +1069,10 @@ fn container_name(project: &Project, branch: &BranchName) -> String {
     format!("oxid-{}-{}", project.name, sanitize_label(branch))
 }
 
+fn image_name(project: &Project, branch: &BranchName) -> String {
+    format!("oxid/{}/{}", project.name, sanitize_label(branch))
+}
+
 fn sanitize_label(branch: &BranchName) -> String {
     branch
         .to_string()
@@ -644,6 +1085,29 @@ fn sanitize_label(branch: &BranchName) -> String {
             }
         })
         .collect()
+}
+
+/// Sanitizes a project name or branch label into a valid Postgres
+/// identifier fragment: lowercase `[a-z0-9_]` only.
+fn sanitize_identifier(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The lowest value in `0..capacity` not present in `used`, or `None` if
+/// every slot is taken. Pure and separately tested since `ResourcePool`
+/// (oxid-core) tracks *how many* slices are leased, not *which* numeric
+/// slot each tenant holds — that assignment is specific to Redis indices,
+/// so it lives here instead of being bent onto that more general type.
+fn lowest_free_index(used: &std::collections::BTreeSet<u32>, capacity: u32) -> Option<u32> {
+    (0..capacity).find(|i| !used.contains(i))
 }
 
 #[cfg(test)]
@@ -683,14 +1147,18 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct FakeOci {
         calls: Arc<Mutex<Vec<String>>>,
+        /// When > 0, `run` fails and decrements this instead of succeeding.
+        fail_run_times: Arc<Mutex<u32>>,
     }
 
     impl ContainerPort for FakeOci {
         async fn build(&self, spec: &BuildSpec) -> Result<(), OciError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("build:{}", spec.image));
+            self.calls.lock().unwrap().push(format!(
+                "build:{}:context={}:dockerfile={}",
+                spec.image,
+                spec.context.display(),
+                spec.dockerfile
+            ));
             Ok(())
         }
         async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError> {
@@ -698,6 +1166,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("run:{}:env={:?}", spec.name, spec.env));
+            let mut remaining = self.fail_run_times.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(OciError::Failure("simulated transient failure".to_owned()));
+            }
             Ok(())
         }
         async fn start(&self, name: &str) -> Result<(), OciError> {
@@ -718,6 +1191,13 @@ mod tests {
         }
         async fn remove(&self, name: &str) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(format!("remove:{name}"));
+            Ok(())
+        }
+        async fn remove_image(&self, image: &str) -> Result<(), OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("remove_image:{image}"));
             Ok(())
         }
         async fn logs(&self, name: &str) -> Result<String, OciError> {
@@ -759,6 +1239,32 @@ port = 8080
         ControlPlane::new(store().await, FakeGit, oci, cache.path().to_owned())
     }
 
+    /// A project declaring one `redis` dependency — deliberately no
+    /// `postgres` one, so these tests never need a real Postgres instance;
+    /// that path is covered separately by `postgres_pool.rs`'s `#[ignore]`d
+    /// integration test.
+    fn repo_dir_with_redis_dependency() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oxid.toml"),
+            r#"
+[project]
+name = "app"
+
+[routing]
+base_domain = "app.local.dev"
+port = 8080
+
+[dependencies.cache]
+type = "redis"
+shared_instance = "local-redis"
+inject_url_as = "REDIS_URL"
+"#,
+        )
+        .unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn register_and_deploy_happy_path() {
         let repo = repo_dir_with_config();
@@ -782,6 +1288,34 @@ port = 8080
         assert_eq!(cp.list_environments(project.id).await.unwrap().len(), 1);
     }
 
+    /// Regression test for a real race found by firing ten concurrent `oxid
+    /// up` at a project that had never been registered before: the
+    /// check-then-act between `find_project_by_repo` and `ProjectStore::
+    /// create` isn't atomic, so every concurrent first-time caller could
+    /// pass the "does it exist?" check before any of them committed,
+    /// leaving all but one to blow up with a raw `UNIQUE constraint failed`
+    /// instead of the idempotent behavior `register_project` documents.
+    #[tokio::test]
+    async fn concurrent_first_registration_is_idempotent() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let cp = cp.clone();
+                let path = repo.path().to_owned();
+                tokio::spawn(async move { cp.register_project(&path).await })
+            })
+            .collect();
+
+        let mut ids = std::collections::HashSet::new();
+        for handle in handles {
+            ids.insert(handle.await.unwrap().unwrap().id);
+        }
+        assert_eq!(ids.len(), 1, "every call must resolve to the same project");
+        assert_eq!(cp.list_projects().await.unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn deploy_records_oci_operations() {
         let repo = repo_dir_with_config();
@@ -801,6 +1335,295 @@ port = 8080
                 .any(|c| c.starts_with("run:oxid-app-feature-b")),
             "{calls:?}"
         );
+    }
+
+    /// Regression test: `[build].context` was parsed from `oxid.toml` and
+    /// persisted, but never actually consulted when building the image —
+    /// every build used the whole repo checkout regardless, silently
+    /// ignoring a monorepo-style subdirectory context. Found while wiring
+    /// `docker-compose.yml` support, whose `build.context`/`build.dockerfile`
+    /// pair only makes sense if `dockerfile` is resolved relative to
+    /// `context`, not the repo root.
+    #[tokio::test]
+    async fn deploy_honors_a_non_default_build_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oxid.toml"),
+            r#"
+[project]
+name = "app"
+
+[build]
+context = "backend"
+dockerfile = "Dockerfile.prod"
+
+[routing]
+base_domain = "app.local.dev"
+port = 8080
+"#,
+        )
+        .unwrap();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(dir.path()).await.unwrap();
+
+        cp.deploy(project.id, BranchName::parse("main").unwrap())
+            .await
+            .unwrap();
+
+        let calls = oci.calls.lock().unwrap();
+        let build_call = calls
+            .iter()
+            .find(|c| c.starts_with("build:"))
+            .expect("a build call was made");
+        // `FakeGit::ensure_repo` always resolves to `<cache_dir>/app`; the
+        // context must be that path joined with the configured `backend`
+        // subdirectory, and the dockerfile must be resolved relative to it.
+        assert!(
+            build_call.ends_with("/app/backend:dockerfile=Dockerfile.prod"),
+            "{build_call}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_fails_clearly_when_dependency_is_unconfigured() {
+        let repo = repo_dir_with_redis_dependency();
+        let cp = cp(FakeOci::default()).await; // no `with_resource_pools` call
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let err = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CpError::Pool(PoolError::NotConfigured(m)) if m.contains("OXID_REDIS_URL")),
+            "{err:?}"
+        );
+    }
+
+    async fn redis_lease_for(
+        cp: &ControlPlane<FakeGit, FakeOci>,
+        project_id: ProjectId,
+        branch: &str,
+    ) -> Option<String> {
+        cp.store
+            .find_resource_lease(
+                project_id,
+                &BranchName::parse(branch).unwrap(),
+                PoolKind::Redis,
+                "local-redis",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deploy_injects_a_distinct_redis_index_per_branch_and_reuses_on_redeploy() {
+        let repo = repo_dir_with_redis_dependency();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            FakeGit,
+            FakeOci::default(),
+            cache.path().to_owned(),
+        )
+        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16);
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let env_a = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        let env_b = cp
+            .deploy(project.id, BranchName::parse("feature-b").unwrap())
+            .await
+            .unwrap();
+        assert_ne!(env_a.id, env_b.id);
+
+        let index_a = redis_lease_for(&cp, project.id, "feature-a").await.unwrap();
+        let index_b = redis_lease_for(&cp, project.id, "feature-b").await.unwrap();
+        assert_ne!(index_a, index_b, "each branch must get its own index");
+
+        // Redeploying feature-a must reuse the same index, not lease a new
+        // one (which would eventually exhaust the pool for no reason).
+        cp.deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            redis_lease_for(&cp, project.id, "feature-a").await,
+            Some(index_a)
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_releases_the_redis_index_for_reuse() {
+        let repo = repo_dir_with_redis_dependency();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            FakeGit,
+            FakeOci::default(),
+            cache.path().to_owned(),
+        )
+        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 1);
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let env_a = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // Pool capacity is 1: a second branch must fail while feature-a
+        // holds the only slot.
+        let err = cp
+            .deploy(project.id, BranchName::parse("feature-b").unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CpError::Pool(PoolError::Failure(_))),
+            "{err:?}"
+        );
+
+        cp.destroy(env_a.id, false).await.unwrap();
+
+        // Now that feature-a released its slot, feature-b can have it.
+        cp.deploy(project.id, BranchName::parse("feature-b").unwrap())
+            .await
+            .unwrap();
+    }
+
+    /// Regression test: redeploying a branch that's already live (e.g. a
+    /// webhook firing on a second push) must tear down the previous
+    /// container first instead of leaving Docker to reject a duplicate
+    /// container name, and must mark the old row Destroyed rather than
+    /// leaving two "live-looking" rows around.
+    #[tokio::test]
+    async fn redeploying_a_live_branch_replaces_the_previous_environment() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let first = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        let second = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.state, EnvironmentState::Running);
+
+        let old = EnvironmentStore::get(&cp.store, first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.state, EnvironmentState::Destroyed);
+
+        {
+            let calls = oci.calls.lock().unwrap();
+            assert!(
+                calls.iter().any(|c| c == "remove:oxid-app-feature-a"),
+                "expected the previous container to be removed before redeploying: {calls:?}"
+            );
+        }
+        // Exactly one live environment remains for the branch.
+        let envs = cp.list_environments(project.id).await.unwrap();
+        assert_eq!(
+            envs.iter()
+                .filter(|e| e.state != EnvironmentState::Destroyed)
+                .count(),
+            1
+        );
+    }
+
+    /// Regression test for a real bricking bug: a transient failure in
+    /// `run()` (Docker error, bad secret, failing `on_start` hook) happening
+    /// *after* the `Environment` row was persisted as `Building` used to
+    /// leave it there forever, since `Building` cannot transition to
+    /// `Destroy` — every subsequent `oxid up` of that branch failed with
+    /// "transition `Destroy` is not allowed from `Building`" instead of
+    /// retrying. Found by deploying, having a container-name conflict fail
+    /// the `run` step, then deploying again.
+    #[tokio::test]
+    async fn failed_deploy_does_not_permanently_block_branch() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.fail_run_times.lock().unwrap() = 1;
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let err = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CpError::Oci(_)), "{err:?}");
+
+        let envs = cp.list_environments(project.id).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].state, EnvironmentState::Destroyed);
+
+        // The retry must succeed instead of hitting "Destroy not allowed
+        // from Building".
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(env.state, EnvironmentState::Running);
+    }
+
+    /// Regression test for a real race found by firing ten concurrent `oxid
+    /// up` calls at the same brand-new branch: without serializing
+    /// `deploy()`, they raced to create their own `Environment` row before
+    /// any of them found out only one could win the container name, so the
+    /// row left standing (highest id) was not necessarily the one whose
+    /// container actually ended up running. `deploy_lock` forces them into a
+    /// sequence instead, so exactly one row should end up `Running` — and it
+    /// should be the *last* deploy to actually run, not an arbitrary loser.
+    #[tokio::test]
+    async fn concurrent_deploys_of_the_same_branch_leave_a_consistent_state() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let cp = cp.clone();
+                let project_id = project.id;
+                tokio::spawn(async move {
+                    cp.deploy(project_id, BranchName::parse("feature-a").unwrap())
+                        .await
+                })
+            })
+            .collect();
+
+        let mut successes = 0;
+        for handle in handles {
+            if handle.await.unwrap().is_ok() {
+                successes += 1;
+            }
+        }
+        assert_eq!(
+            successes, 10,
+            "the lock should let every deploy succeed in turn"
+        );
+
+        let envs = cp.list_environments(project.id).await.unwrap();
+        let running: Vec<_> = envs
+            .iter()
+            .filter(|e| e.state == EnvironmentState::Running)
+            .collect();
+        assert_eq!(
+            running.len(),
+            1,
+            "exactly one environment must be left Running: {envs:?}"
+        );
+        // It must be the most recent row — not a stale one left standing by
+        // a race — since each deploy tears down the previous live one.
+        let max_id = envs.iter().map(|e| e.id.0).max().unwrap();
+        assert_eq!(running[0].id.0, max_id);
     }
 
     #[tokio::test]
@@ -843,7 +1666,7 @@ port = 8080
             .await
             .unwrap();
 
-        cp.destroy(env.id).await.unwrap();
+        cp.destroy(env.id, false).await.unwrap();
         let destroyed = EnvironmentStore::get(&cp.store, env.id)
             .await
             .unwrap()
@@ -853,6 +1676,175 @@ port = 8080
         let calls = oci.calls.lock().unwrap();
         assert!(calls.iter().any(|c| c.starts_with("stop:")), "{calls:?}");
         assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("remove_image:")),
+            "destroy must also remove the branch's image, not just its container: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_keeps_branch_secrets_by_default() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch = BranchName::parse("feature-a").unwrap();
+        let env = cp.deploy(project.id, branch.clone()).await.unwrap();
+
+        cp.set_secret(
+            Some(project.id),
+            Some(&branch),
+            "DB_PASS",
+            EnvVarScope::Branch,
+            "keep-me",
+        )
+        .await
+        .unwrap();
+
+        cp.destroy(env.id, false).await.unwrap();
+
+        let secrets = cp
+            .list_secrets(Some(project.id), Some(&branch))
+            .await
+            .unwrap();
+        assert!(
+            secrets
+                .iter()
+                .any(|(n, s)| n == "DB_PASS" && *s == EnvVarScope::Branch),
+            "a plain `down` must not delete branch secrets: {secrets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_with_purge_secrets_deletes_only_that_branchs_branch_scope_secrets() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch_a = BranchName::parse("feature-a").unwrap();
+        let branch_b = BranchName::parse("feature-b").unwrap();
+        let env_a = cp.deploy(project.id, branch_a.clone()).await.unwrap();
+
+        cp.set_secret(
+            Some(project.id),
+            None,
+            "SHARED",
+            EnvVarScope::Project,
+            "project-level",
+        )
+        .await
+        .unwrap();
+        cp.set_secret(
+            Some(project.id),
+            Some(&branch_a),
+            "ONLY_A",
+            EnvVarScope::Branch,
+            "a-secret",
+        )
+        .await
+        .unwrap();
+        cp.set_secret(
+            Some(project.id),
+            Some(&branch_b),
+            "ONLY_B",
+            EnvVarScope::Branch,
+            "b-secret",
+        )
+        .await
+        .unwrap();
+
+        cp.destroy(env_a.id, true).await.unwrap();
+
+        let for_a = cp
+            .list_secrets(Some(project.id), Some(&branch_a))
+            .await
+            .unwrap();
+        assert!(
+            for_a.iter().all(|(n, _)| n != "ONLY_A"),
+            "purge_secrets must delete branch A's own secret: {for_a:?}"
+        );
+        assert!(
+            for_a.iter().any(|(n, _)| n == "SHARED"),
+            "purge_secrets must not touch project-scope secrets: {for_a:?}"
+        );
+        let for_b = cp
+            .list_secrets(Some(project.id), Some(&branch_b))
+            .await
+            .unwrap();
+        assert!(
+            for_b.iter().any(|(n, _)| n == "ONLY_B"),
+            "purge_secrets on branch A must not delete branch B's secret: {for_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_destroys_environments_removes_cache_and_row() {
+        let repo = repo_dir_with_config();
+        let cache = tempfile::tempdir().unwrap();
+        let oci = FakeOci::default();
+        let cp = ControlPlane::new(store().await, FakeGit, oci.clone(), cache.path().to_owned());
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        // Populate the cache dir the way `ensure_repo` would, so deletion has
+        // something real to remove.
+        let cache_path = cache
+            .path()
+            .join(crate::adapter::git::cache_dir_name(&project.repo_url));
+        std::fs::create_dir_all(&cache_path).unwrap();
+        std::fs::write(cache_path.join("marker"), "x").unwrap();
+
+        cp.delete_project(project.id).await.unwrap();
+
+        assert!(!cache_path.exists(), "git cache must be removed");
+        assert!(
+            ProjectStore::get(&cp.store, project.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EnvironmentStore::get(&cp.store, env.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "cascade must remove the environment row too"
+        );
+        let calls = oci.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("remove:")),
+            "project delete must tear down live containers: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_unknown_fails() {
+        let cp = cp(FakeOci::default()).await;
+        let err = cp.delete_project(ProjectId(999)).await.unwrap_err();
+        assert!(matches!(err, CpError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn gc_destroy_also_removes_the_image() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::days(8)).await;
+        let summary = cp.sweep(now).await.unwrap();
+        assert_eq!(summary.destroyed, 1, "{:?}", summary.errors);
+
+        let calls = oci.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("remove_image:")),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -1033,6 +2025,51 @@ port = 8080
             "{:?}",
             oci.calls
         );
+    }
+
+    /// Regression test for a real race: a GC `sweep` tick and a manual
+    /// action on the *same* environment both do read-modify-write (fetch,
+    /// apply a `StateTransition`, persist) with no atomicity between the
+    /// read and the write. Without `lifecycle_lock` covering both,
+    /// interleaving them could have one silently overwrite the other's
+    /// transition with a stale copy. This doesn't assert a specific winner
+    /// (either legitimately can win) — it asserts the lock actually
+    /// serializes them: no panic, and the persisted state is always a
+    /// state genuinely reachable by one of the two actions, never a
+    /// corrupted/impossible one.
+    #[tokio::test]
+    async fn concurrent_sweep_and_manual_destroy_do_not_corrupt_state() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // Idle well past every GC threshold, so `sweep` will try to act on
+        // it at the same time a manual `destroy` races in.
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::days(8)).await;
+
+        let cp_a = cp.clone();
+        let cp_b = cp.clone();
+        let env_id = env.id;
+        let (sweep_result, destroy_result) = tokio::join!(
+            tokio::spawn(async move { cp_a.sweep(now).await }),
+            tokio::spawn(async move { cp_b.destroy(env_id, false).await }),
+        );
+        sweep_result.unwrap().unwrap();
+        // Exactly one of the two "destroy" paths can win the state machine;
+        // the loser gets a clean `Forbidden`/`Noop` domain error, not a
+        // panic or a corrupted row — both are acceptable outcomes here.
+        let _ = destroy_result.unwrap();
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Destroyed);
     }
 
     #[tokio::test]

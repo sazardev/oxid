@@ -66,16 +66,20 @@ fn sync_remote_url(repo_dir: &Path) -> Result<RepoUrl, GitError> {
     let remote = repo.find_remote("origin").map_err(|_| {
         GitError::Failure(format!("no `origin` remote in `{}`", repo_dir.display()))
     })?;
-    let url = remote.url().ok_or_else(|| {
-        GitError::Failure(format!(
+    let url = remote.url().map_err(map_err)?;
+    if url.is_empty() {
+        return Err(GitError::Failure(format!(
             "`origin` remote has no URL in `{}`",
             repo_dir.display()
-        ))
-    })?;
+        )));
+    }
     RepoUrl::parse(url).map_err(map_err)
 }
 
-fn cache_dir_name(url: &RepoUrl) -> String {
+/// Derives the git-cache subdirectory name for `url`. `pub(crate)` so
+/// project deletion (`control_plane.rs::delete_project`) can locate and
+/// remove the same directory `ensure_repo` created.
+pub(crate) fn cache_dir_name(url: &RepoUrl) -> String {
     let raw = url.as_str();
     let trimmed = raw.trim_end_matches('/');
     let segment = trimmed.rsplit('/').next().unwrap_or("repo").to_owned();
@@ -97,6 +101,12 @@ fn sync_ensure_repo(url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError
     let dir = cache_dir.join(cache_dir_name(url));
 
     if dir.exists() {
+        // A cached clone can be arbitrarily stale: a webhook redeploying a
+        // branch that was pushed to *after* the first-ever deploy of this
+        // project must see the new commits, not the ones from whenever the
+        // cache was first populated.
+        let repo = Repository::open(&dir).map_err(map_err)?;
+        fetch_origin(&repo)?;
         return Ok(dir);
     }
 
@@ -105,10 +115,27 @@ fn sync_ensure_repo(url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError
     Ok(dir)
 }
 
+/// Fetches every remote branch from `origin` into `refs/remotes/origin/*`.
+fn fetch_origin(repo: &Repository) -> Result<(), GitError> {
+    let mut remote = repo.find_remote("origin").map_err(map_err)?;
+    remote
+        .fetch(&["+refs/heads/*:refs/remotes/origin/*"], None, None)
+        .map_err(map_err)
+}
+
 fn sync_resolve_branch_head(repo_dir: &Path, branch: &BranchName) -> Result<CommitRef, GitError> {
     let repo = Repository::open(repo_dir).map_err(map_err)?;
+    // Prefer the remote-tracking ref: `fetch_origin` (in `sync_ensure_repo`)
+    // only updates `refs/remotes/origin/*`, it never fast-forwards a local
+    // `refs/heads/<branch>`, so on a cache hit the local ref can be stale.
+    // `Repository::clone` also only ever materializes a local
+    // `refs/heads/<default>` for the branch it checks out — every other
+    // branch exists solely under `refs/remotes/origin/*` right after a
+    // fresh clone. Falling back to `refs/heads/{branch}` covers repos that
+    // were never cloned by Oxid (e.g. worked on directly in tests).
     let oid = repo
-        .refname_to_id(&format!("refs/heads/{branch}"))
+        .refname_to_id(&format!("refs/remotes/origin/{branch}"))
+        .or_else(|_| repo.refname_to_id(&format!("refs/heads/{branch}")))
         .map_err(|_| {
             GitError::Failure(format!(
                 "branch `{branch}` not found in `{}`",
@@ -246,5 +273,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, GitError::Failure(_)));
+    }
+
+    /// Regression test: a fresh clone only checks out the default branch
+    /// locally (`refs/heads/main`); every other branch lands in
+    /// `refs/remotes/origin/*`. `deploy()` always calls `ensure_repo` then
+    /// `resolve_branch_head` back to back, so resolving a non-default
+    /// branch right after the first-ever clone of a project must work.
+    #[tokio::test]
+    async fn resolves_non_default_branch_after_fresh_clone() {
+        let src = tempfile::tempdir().unwrap();
+        let origin = format!("file://{}", src.path().display());
+        let (repo, main_sha) = init_repo(src.path(), &origin);
+
+        let feature_sha = {
+            let head_commit = repo
+                .find_commit(git2::Oid::from_str(&main_sha).unwrap())
+                .unwrap();
+            fs::write(src.path().join("feature.txt"), "hi").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("feature.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = Signature::now("oxid test", "oxid@test.local").unwrap();
+            let commit_id = repo
+                .commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "feature",
+                    &tree,
+                    &[&head_commit],
+                )
+                .unwrap();
+            repo.branch("feature-one", &repo.find_commit(commit_id).unwrap(), true)
+                .unwrap();
+            commit_id.to_string()
+        };
+
+        let cache = tempfile::tempdir().unwrap();
+        let client = GitClient::new();
+        let url = RepoUrl::parse(&origin).unwrap();
+        let cloned = client.ensure_repo(&url, cache.path()).await.unwrap();
+
+        let branch = BranchName::parse("feature-one").unwrap();
+        let head = client.resolve_branch_head(&cloned, &branch).await.unwrap();
+        assert_eq!(head.sha, feature_sha);
+
+        client.checkout_commit(&cloned, &feature_sha).await.unwrap();
+        assert!(cloned.join("feature.txt").exists());
+    }
+
+    /// Regression test: redeploying an already-cached project must see
+    /// commits pushed to `origin` after the cache was first populated, not
+    /// a frozen snapshot from the first clone.
+    #[tokio::test]
+    async fn ensure_repo_fetches_new_commits_on_cache_hit() {
+        let src = tempfile::tempdir().unwrap();
+        let origin = format!("file://{}", src.path().display());
+        let (repo, _) = init_repo(src.path(), &origin);
+
+        let cache = tempfile::tempdir().unwrap();
+        let client = GitClient::new();
+        let url = RepoUrl::parse(&origin).unwrap();
+        client.ensure_repo(&url, cache.path()).await.unwrap();
+
+        // Push a new commit to `main` in the source repo after the cache
+        // already exists.
+        let new_sha = {
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            fs::write(src.path().join("new.txt"), "hi").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("new.txt")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = Signature::now("oxid test", "oxid@test.local").unwrap();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "second",
+                &tree,
+                &[&head],
+            )
+            .unwrap()
+            .to_string()
+        };
+
+        let cloned = client.ensure_repo(&url, cache.path()).await.unwrap();
+        let branch = BranchName::parse("main").unwrap();
+        let head = client.resolve_branch_head(&cloned, &branch).await.unwrap();
+        assert_eq!(head.sha, new_sha, "cache hit did not fetch the new commit");
     }
 }

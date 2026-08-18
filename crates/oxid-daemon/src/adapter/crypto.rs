@@ -59,6 +59,7 @@ impl Cipher {
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
             .map_err(|e| CryptoError::KeyFile(e.to_string()))?;
         std::fs::write(path, cipher.key).map_err(|e| CryptoError::KeyFile(e.to_string()))?;
+        restrict_to_owner(path).map_err(|e| CryptoError::KeyFile(e.to_string()))?;
         Ok(cipher)
     }
 
@@ -105,6 +106,24 @@ impl Cipher {
     }
 }
 
+/// Restricts `path` to owner-only read/write (`0600`).
+///
+/// `std::fs::write` creates files honoring the process umask, which is
+/// commonly `022` — leaving the AES-GCM master key that decrypts every
+/// secret in the database world-readable (`0644`) on a typical system.
+/// Found by inspecting a freshly-generated `secret.key`'s permissions
+/// during a security-focused pass over the daemon's data directory.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +165,20 @@ mod tests {
         let second = Cipher::load_or_create(&path).unwrap();
         let encoded = first.encrypt("value").unwrap();
         assert_eq!(second.decrypt(&encoded).unwrap(), "value");
+    }
+
+    /// Regression test for a real finding: a freshly generated `secret.key`
+    /// was world-readable (mode `0644` under a typical `022` umask), letting
+    /// any local user on a shared host read the master key that decrypts
+    /// every secret in the database.
+    #[cfg(unix)]
+    #[test]
+    fn key_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.key");
+        Cipher::load_or_create(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "secret.key must be owner-only, got {mode:o}");
     }
 }

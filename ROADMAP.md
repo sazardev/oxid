@@ -41,7 +41,7 @@
 | 2.2 | Secret configurable (`OXID_WEBHOOK_SECRET`) | **SPEC §4.1:** implícito en _"Se verifica el payload criptográficamente"_. HMAC requiere un shared secret. | `main.rs` lee `OXID_WEBHOOK_SECRET`; webhooks rechazados si no está configurado | ✅ Done (a0c064d) |
 | 2.3 | Soporte webhooks GitLab (formato distinto) | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab."_ Menciona ambos proveedores. | Solo parsea formato GitHub (`ref`, `repository.full_name`) | No existe |
 | 2.4 | Rate limiting en la API HTTP | **SPEC §1:** _"Ecosistema Unificado: No requiere herramientas de terceros."_ Implica protección integrada. | No existe | No existe |
-| 2.5 | Autenticación API (bearer token mínimo) | **SPEC §6:** La configuración incluye _"tokens"_ en `/data/config.toml`. | No existe | No existe |
+| 2.5 | Autenticación API (bearer token mínimo) | **SPEC §6:** La configuración incluye _"tokens"_ en `/data/config.toml`. | `OXID_API_TOKEN` + middleware `Authorization: Bearer` (comparación en tiempo constante) sobre todo `/api/v1/*` salvo `/health`, `/webhooks/*`, `/wake`, `/heartbeat`. CLI: `--token`/`OXID_TOKEN` | ✅ Done |
 
 ---
 
@@ -61,11 +61,11 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 4.1 | Adaptador `ResourcePoolPort` que ejecuta `CREATE DATABASE db_<branch>` en Postgres real | **SPEC §3.1:** _"El sistema mantiene un solo contenedor de base de datos encendido. Cuando se levanta la rama feature-A, el orquestador se conecta al contenedor raíz, crea un schema o base de datos lógica dedicada (db_feature_a)"_ | `resource_pool.rs` — dominio puro con `lease()`/`release()`, sin adaptador real | No existe |
-| 4.2 | Adaptador Redis que asigna `REDIS_DB=N` por branch | **SPEC §3.1:** _"Se comparte una única instancia de Redis. El orquestador inyecta una variable de entorno para que cada rama use un índice de base de datos distinto (REDIS_DB=1, REDIS_DB=2)"_ | No existe | No existe |
-| 4.3 | Conexión a instancia compartida de Postgres/Redis (configuración en `oxid.toml`) | **IDEA §6 (oxid.toml):** _"`[dependencies.database]` type = "postgres" shared_instance = "local-pg-cluster" inject_url_as = "DATABASE_URL""_ | `project_config.rs` parsea `dependencies` pero no hay adaptador que conecte | No existe |
-| 4.4 | Inyección automática de `DATABASE_URL` / `REDIS_URL` al contenedor | **IDEA §6:** _"inyecta esa URL de conexión específica al contenedor de la aplicación como DATABASE_URL"_ | `control_plane.rs` no construye estas variables | No existe |
-| 4.5 | Liberación de DB/schema cuando el entorno se destruye | **IDEA §6 (oxid.toml):** _"`destroy_after = "7d"` ... Oxid completamente destruye el contenedor y sus volúmenes efímeros."_ Implica limpieza de recursos. | No existe | No existe |
+| 4.1 | Adaptador `ResourcePoolPort` que ejecuta `CREATE DATABASE db_<branch>` en Postgres real | **SPEC §3.1:** _"El sistema mantiene un solo contenedor de base de datos encendido. Cuando se levanta la rama feature-A, el orquestador se conecta al contenedor raíz, crea un schema o base de datos lógica dedicada (db_feature_a)"_ | `adapter/postgres_pool.rs::PostgresPool` — `ensure_database`/`drop_database` reales vía `sqlx::PgPool`. Verificado en vivo contra `postgres:16-alpine`: cada rama obtiene su propia DB real, consultable desde el contenedor de la app | ✅ Done |
+| 4.2 | Adaptador Redis que asigna `REDIS_DB=N` por branch | **SPEC §3.1:** _"Se comparte una única instancia de Redis. El orquestador inyecta una variable de entorno para que cada rama use un índice de base de datos distinto (REDIS_DB=1, REDIS_DB=2)"_ | `control_plane.rs::provision_dependency` — asigna el índice libre más bajo (tabla `resource_leases`, sin necesitar un cliente Redis real ya que es pura contabilidad). Verificado en vivo: dos ramas obtienen `REDIS_DB=0` y `REDIS_DB=1` reales contra `redis:7-alpine` | ✅ Done |
+| 4.3 | Conexión a instancia compartida de Postgres/Redis (configuración en `oxid.toml`) | **IDEA §6 (oxid.toml):** _"`[dependencies.database]` type = "postgres" shared_instance = "local-pg-cluster" inject_url_as = "DATABASE_URL""_ | `OXID_POSTGRES_URL`/`OXID_REDIS_URL` (daemon) + `[dependencies.*]` de `oxid.toml` (ya parseado) conectados end-to-end vía `ControlPlane::with_resource_pools` | ✅ Done |
+| 4.4 | Inyección automática de `DATABASE_URL` / `REDIS_URL` al contenedor | **IDEA §6:** _"inyecta esa URL de conexión específica al contenedor de la aplicación como DATABASE_URL"_ | `control_plane.rs::run_and_activate` inyecta `dependency.inject_url_as` como variable `Runtime` (gana sobre cualquier secreto del mismo nombre) | ✅ Done |
+| 4.5 | Liberación de DB/schema cuando el entorno se destruye | **IDEA §6 (oxid.toml):** _"`destroy_after = "7d"` ... Oxid completamente destruye el contenedor y sus volúmenes efímeros."_ Implica limpieza de recursos. | `control_plane.rs::release_dependencies` — `DROP DATABASE` real (Postgres) + libera el índice (Redis), en `destroy()` manual y en el `Destroy` del GC. Verificado: `DROP DATABASE` confirmado con `\l` en Postgres real tras `oxid down` | ✅ Done |
 
 ---
 
@@ -99,7 +99,7 @@
 |---|---|---|---|---|
 | 7.1 | Reemplazar `MAX(id)+1` por IDs autoincrementales | **SPEC §1:** _"Eficiencia Absoluta ... Huella de memoria mínima."_ IDs inseguros bajo concurrencia contradicen este principio. | `store.rs` — `AUTOINCREMENT` + `RETURNING id`; `next_*_id` eliminados | ✅ Done (a0c064d) |
 | 7.2 | Tabla `secrets` para persistir variables de entorno | **SPEC §4.4:** _"secretos cacheados en disco"_ **IDEA §3:** _"guarda ... cada variable inyectada."_ | Tabla `secrets` en `0001_init.sql` con índice UNIQUE por scope | ✅ Done (a0c064d) |
-| 7.3 | Tabla `resource_pools` para trackear pools | **SPEC §3.1:** _"Resource Pools"_ — el dominio los modela pero no se persisten. | `resource_pool.rs` es solo lógica en memoria | No existe |
+| 7.3 | Tabla `resource_pools` para trackear pools | **SPEC §3.1:** _"Resource Pools"_ — el dominio los modela pero no se persisten. | Migración `0002_resource_leases.sql` — tabla `resource_leases` (project_id, branch, kind, shared_instance, resource_name), única por (proyecto, rama, kind, instancia), cascada al borrar el proyecto | ✅ Done |
 
 ---
 
@@ -158,15 +158,110 @@
 
 ## Priorización
 
-> **Última actualización:** P1 (UX CLI) y P2 (Scale-to-Zero real) entregados ✅ — pendiente de commit.
+> **Última actualización:** P1 (UX CLI) y P2 (Scale-to-Zero real) entregados ✅. Verificado con un
+> daemon y CLI reales (binarios compilados, Docker real, repo git real con ramas de verdad,
+> webhook firmado con HMAC real) en vez de solo `cargo test` — ver hallazgos abajo.
 >
-> De paso se corrigieron dos bugs latentes encontrados durante la implementación de P2:
+> **Segunda pasada de verificación agresiva (multi-proyecto, multi-rama, concurrencia,
+> seguridad, rendimiento) encontró y corrigió 9 bugs reales más:**
+> - **Fuga de secretos entre ramas (seguridad, crítico):** el filtro SQL que resuelve "secretos
+>   visibles para este deploy" (`SECRET_CONTEXT_FILTER`) tenía una condición redundante que hacía
+>   que coincidiera con *cualquier* fila del proyecto sin importar la rama. Dos ramas con un secreto
+>   `branch`-scoped del mismo nombre podían recibir el valor de la otra. Confirmado desplegando
+>   `main` y `feature-cart` con `DB_PASS` distinto por rama y viendo el valor cruzado. Corregido el
+>   filtro SQL además de un segundo bug de precedencia (`secrets_for` no aplicaba
+>   `Global→Project→Branch` correctamente, solo tomaba la última fila devuelta por SQLite).
+> - **Deploy fallido bloquea la rama para siempre (confiabilidad, crítico):** si `run()`/`exec()`
+>   fallaba después de crear la fila `Environment` (`Building`), esta quedaba atascada — `Building`
+>   no puede transicionar a `Destroy`, así que todo `oxid up` posterior de esa rama fallaba con
+>   `transition 'Destroy' is not allowed from 'Building'`. Corregido: un fallo ahí ahora transiciona
+>   a `BuildFailed`. De paso se hizo el deploy resiliente a contenedores huérfanos (sin fila en la
+>   DB) removiéndolos defensivamente antes de correr uno nuevo.
+> - **Hooks `on_start` fallidos se ignoraban silenciosamente (correctness, crítico):** `exec()`
+>   nunca revisaba el exit code del comando — una migración rota se reportaba como deploy exitoso.
+>   Corregido inspeccionando `ExecInspectResponse.exit_code` vía bollard; ahora un hook que falla
+>   aborta el deploy con el mensaje de error real (stdout/stderr capturado).
+> - **Condición de carrera en deploys concurrentes (crítico):** desplegar la misma rama (o incluso
+>   ramas distintas del mismo proyecto) en paralelo corrompía el checkout de git compartido
+>   (`tar_context` fallando a mitad de camino) y podía dejar `status`/`down`/`pause`/`wake`
+>   apuntando a la fila `Destroyed` de un deploy perdedor mientras el contenedor del ganador seguía
+>   vivo. Confirmado disparando 10 `oxid up` simultáneos a la misma rama nueva. Corregido con un
+>   lock async que serializa `deploy()` de punta a punta.
+> - **`register_project` no era realmente idempotente bajo concurrencia:** el
+>   check-then-act entre "¿existe ya?" y `INSERT` no es atómico; 10 registros concurrentes del
+>   mismo proyecto nuevo dejaban 9 con `409 UNIQUE constraint failed` en vez de devolver el
+>   proyecto ya creado. Corregido con fallback: ante conflicto, relee y devuelve el existente.
+> - **Clave maestra AES-GCM legible por cualquier usuario (seguridad):** `secret.key` se creaba con
+>   permisos `0644` (umask por defecto) en vez de `0600` — en una máquina compartida, cualquier
+>   usuario local podía leer la clave que desencripta todos los secretos. Corregido forzando `0600`.
+> - **`docker stop` con timeout de gracia de 10s por defecto** retrasaba cada `Hibernate`/`Destroy`
+>   del GC en hasta 10 segundos extra, en contra de la propuesta de "Scale-to-Zero" ágil. Reducido
+>   a un timeout de 2s (contenedores efímeros de desarrollo, no producción crítica).
+>
+> Todo verificado en vivo con Docker real, no solo con `cargo test`: fuga de secretos reproducida
+> y corregida con dos ramas reales, 10 deploys/10 registros concurrentes reales (100% éxito tras el
+> fix, antes fallaban en cascada), ciclo de vida GC completo (`Running→Paused→Hibernating→Destroyed`)
+> observado con timestamps reales, latencia real de `pause`/`wake` medida en 25-36ms (SPEC pedía
+> ~300ms), RSS del daemon 3.8-9MB con hasta 6 branches corriendo (cumple "<15MB en reposo").
+>
+> **Tercera ronda: cerrados todos los gaps identificados en la auditoría anterior + implementado
+> P3 (resource pooling) completo.** Nuevo, en esta ronda:
+> - **Auth de la API** (`OXID_API_TOKEN` + `Authorization: Bearer`, comparación en tiempo
+>   constante, abierta por defecto con warning al arrancar) — el hueco de seguridad más grande
+>   que quedaba (cualquiera con acceso de red podía desplegar/destruir/manipular secretos).
+> - **`oxid rm-project`** — borra proyecto completo (entornos, imágenes, git-cache, secretos vía
+>   cascada). Antes un proyecto registrado era permanente.
+> - **Limpieza de imágenes Docker** al destruir un entorno (manual o GC) — antes solo se limpiaba
+>   el contenedor, las imágenes `oxid/<project>/<branch>` se acumulaban para siempre.
+> - **`oxid down --purge-secrets`** — opt-in, ya que por defecto los secretos de una rama
+>   sobreviven a su destrucción/redeploy (conveniencia para ramas recurrentes).
+> - **Webhook:** ignora eventos no-`push` (`ping` ya no rompe con "missing ref") y una
+>   push con `"deleted": true` destruye el entorno en vez de intentar desplegar una rama que ya
+>   no existe.
+> - **`lifecycle_lock`** ampliado de solo-`deploy` a `pause`/`wake`/`destroy`/cada acción del GC —
+>   cerraba una carrera real entre un sweep automático y una acción manual sobre el mismo entorno.
+> - **P3 completo:** `PostgresPool` (adaptador real vía `sqlx`, `CREATE`/`DROP DATABASE`) +
+>   asignación de índice Redis (tabla `resource_leases`, sin necesitar cliente Redis ya que es
+>   pura contabilidad). Inyecta `DATABASE_URL`/`REDIS_URL` reales, reutiliza el lease entre
+>   redeploys, libera al destruir. **Verificado en vivo de punta a punta:** Traefik real (no
+>   simulado) enrutando a dos ramas con Postgres+Redis reales, cada una con su propia DB
+>   (`db_full_app_main`, `db_full_app_feature_x`) e índice Redis (`0`, `1`) confirmados desde
+>   dentro del contenedor de la app; `DROP DATABASE` confirmado tras `oxid down`.
+> - También verificado en vivo: `oxid down` sin `--force` respondiendo "n" (aborta
+>   correctamente), `--api`/`--token` con dos daemons reales corriendo simultáneamente
+>   (override correcto sobre `OXID_API`/`OXID_TOKEN`), `oxid logs -f` en 0.0% CPU en reposo
+>   (confirma que el poll duerme 2s, no hace busy-wait).
+>
+> **Bugs reales encontrados y corregidos en la primera pasada (no solo los dos de P2):**
 > - Cada branch publicaba el mismo `host_port`, así que dos ramas del mismo proyecto no podían
 >   correr a la vez. Se resuelve al unir el contenedor a `OXID_DOCKER_NETWORK` (Traefik) en vez de
->   publicar puerto de host.
+>   publicar puerto de host. **Confirmado en vivo:** `main` y `feature-one` del mismo proyecto
+>   corriendo simultáneamente sin colisión, alcanzables por nombre DNS en la red compartida.
 > - `wake()` siempre llamaba `docker unpause`, que no hace nada útil sobre un contenedor
 >   `Hibernating` (fue `stop`peado, no `pause`ado). Ahora se añadió `ContainerPort::start` y
 >   `wake` distingue `Paused` (`unpause`) de `Hibernating` (`start`).
+> - **Crítico:** desplegar una rama que no es la default (ej. `feature-login`) fallaba siempre en
+>   el primer deploy de un proyecto con `branch 'X' not found` — `git2` solo materializa
+>   `refs/heads/<default>` tras un clone, el resto queda en `refs/remotes/origin/*`. Rompía
+>   literalmente el caso de uso central del producto. Corregido en `adapter/git.rs`
+>   (`sync_resolve_branch_head` ahora resuelve contra `refs/remotes/origin/<branch>` primero) y de
+>   paso se agregó `fetch` en cada `ensure_repo` con caché ya existente (antes nunca se actualizaba
+>   tras el primer clone, así que un redeploy vía webhook desplegaba código congelado del primer
+>   clone, no el commit nuevo).
+> - **Crítico:** redeploy de una rama ya viva (ej. webhook en un segundo push) fallaba con
+>   `409 Conflict` de Docker por nombre de contenedor duplicado — `deploy()` nunca tiraba el
+>   contenedor anterior. Corregido en `control_plane.rs::deploy` (tira el contenedor previo y
+>   marca su fila `Destroyed` antes de crear el nuevo). Confirmado en vivo con un webhook real
+>   simulando un segundo push a la misma rama.
+> - Una rama redeployada tras `oxid down` dejaba dos filas de `Environment` con la misma URL/nombre
+>   de contenedor (una `Destroyed`, otra viva); toda resolución "rama → entorno" (CLI
+>   `down`/`pause`/`wake`/`logs`, y `find_by_url` para wake-on-request) tomaba la primera en vez de
+>   la más reciente. Causaba que `pause`/`wake` fallaran en la API pero igual actuaran sobre el
+>   contenedor real (mismo nombre), dejando el estado en SQLite inconsistente con Docker.
+>   Corregido: la API y `find_environment_by_branch`/`find_by_url` ahora resuelven siempre a la
+>   fila más reciente por rama/URL; `oxid status` deduplica mostrando solo la más reciente.
+> - Cosmético: `oxid up`/`status` imprimían el nombre del proyecto con comillas literales
+>   (`` `"e2e-app"` ``) por interpolar un `serde_json::Value` directo en vez de `.as_str()`.
 >
 > **Nota de wiring pendiente (fuera del alcance de este repo):** las labels de Traefik (5.1) y
 > los endpoints `/api/v1/wake` y `/api/v1/heartbeat` (5.2/5.4) están implementados y probados,
@@ -181,7 +276,7 @@
 | **P0 — Core funcional** | Control plane, Secretos, Webhook auth | 2.1, 2.2, 3.3, 3.4, 3.5, 6.1, 6.2, 7.1, 7.2 ✅ | Sin estos, el sistema no es seguro ni funcional |
 | **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.10 ✅ (1.3 parcial: polling, no SSE), 8.1 ✅ | Sin esto, la CLI es inutilizable para el usuario final |
 | **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 ✅ (requiere wiring de infraestructura, ver nota arriba) | La feature estrella del producto ahora emite lo necesario end-to-end |
-| **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.4 | Diferenciador competitivo vs levantar contenedores por branch |
+| **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.5, 7.3 ✅ | Diferenciador competitivo vs levantar contenedores por branch — verificado en vivo con Postgres+Redis reales |
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, config global | 12.x | Necesario para self-hosting real |
 

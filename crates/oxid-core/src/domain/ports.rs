@@ -327,6 +327,12 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::NotFound`] if the container does not exist.
     async fn remove(&self, name: &str) -> Result<(), OciError>;
+    /// Removes a built image. Used when an environment is destroyed, so
+    /// branch-specific images don't accumulate on disk forever.
+    ///
+    /// # Errors
+    /// [`OciError::NotFound`] if the image does not exist.
+    async fn remove_image(&self, image: &str) -> Result<(), OciError>;
     /// Streams the tail of a container's logs.
     ///
     /// # Errors

@@ -18,6 +18,10 @@ struct Cli {
     /// Daemon base URL. Overrides `OXID_API` when set.
     #[arg(long, global = true)]
     api: Option<String>,
+    /// Bearer token for daemons configured with `OXID_API_TOKEN`. Overrides
+    /// `OXID_TOKEN` when set.
+    #[arg(long, global = true)]
+    token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -35,6 +39,17 @@ enum Command {
     Down {
         /// Branch whose environment to destroy.
         branch: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+        /// Also delete this branch's secrets (kept by default, so a
+        /// recurring feature branch's config survives redeploy).
+        #[arg(long)]
+        purge_secrets: bool,
+    },
+    /// Permanently delete the project registered for the current directory,
+    /// destroying every environment and removing its git cache.
+    RmProject {
         /// Skip the confirmation prompt.
         #[arg(long)]
         force: bool,
@@ -156,6 +171,31 @@ fn api_base(cli_flag: Option<&str>) -> String {
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
 }
 
+fn api_token(cli_flag: Option<&str>) -> Option<String> {
+    cli_flag
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OXID_TOKEN").ok())
+}
+
+/// Builds the shared HTTP client, attaching `Authorization: Bearer <token>`
+/// to every outgoing request when one is configured — every `cmd_*`
+/// function reuses this one client, so this is the single place that needs
+/// to know about auth at all.
+fn build_client(token: Option<&str>) -> Result<Client, String> {
+    let mut builder = Client::builder();
+    if let Some(token) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| format!("invalid --token value: {e}"))?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))
+}
+
 fn report_error(body: &str, status: reqwest::StatusCode) {
     let message = serde_json::from_str::<Value>(body)
         .ok()
@@ -164,16 +204,32 @@ fn report_error(body: &str, status: reqwest::StatusCode) {
     error(format!("{status}: {message}"));
 }
 
-#[tokio::main]
+// The CLI is a short-lived process making a handful of sequential HTTP
+// calls — it never benefits from a multi-threaded work-stealing runtime,
+// which would otherwise spin up one OS thread per CPU core just to run
+// them one at a time. `current_thread` avoids that startup cost entirely.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
-    let client = Client::new();
     let base = api_base(cli.api.as_deref());
+    let token = api_token(cli.token.as_deref());
+    let client = match build_client(token.as_deref()) {
+        Ok(client) => client,
+        Err(message) => {
+            error(message);
+            std::process::exit(1);
+        }
+    };
 
     let result = match cli.command {
         Command::Up { branch } => cmd_up(&client, &base, &branch).await,
         Command::Status => cmd_status(&client, &base).await,
-        Command::Down { branch, force } => cmd_down(&client, &base, &branch, force).await,
+        Command::Down {
+            branch,
+            force,
+            purge_secrets,
+        } => cmd_down(&client, &base, &branch, force, purge_secrets).await,
+        Command::RmProject { force } => cmd_rm_project(&client, &base, force).await,
         Command::Pause { branch } => cmd_pause(&client, &base, &branch).await,
         Command::Wake { branch } => cmd_wake(&client, &base, &branch).await,
         Command::Ps => cmd_ps(&client, &base).await,
@@ -297,7 +353,7 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), String>
     ok("Parsed oxid.toml successfully");
     ok(format!(
         "Project `{}` registered (id {project_id})",
-        project["name"]
+        project["name"].as_str().unwrap_or("?")
     ));
 
     action(format!("Building image for {branch}..."));
@@ -339,21 +395,38 @@ async fn cmd_status(client: &Client, base: &str) -> Result<(), String> {
     if envs.is_empty() {
         bg(format!(
             "No environments for `{}` yet. Deploy one with `oxid up <branch>`.",
-            project["name"]
+            project["name"].as_str().unwrap_or("?")
         ));
         return Ok(());
     }
-    println!("{:<24} {:<24} URL", "BRANCH", "STATE");
+    // The daemon keeps one row per historical deploy (audit trail); only the
+    // most recent row per branch reflects what's actually live. `envs` is
+    // returned in ascending id order, so a later entry always overwrites an
+    // earlier one for the same branch here.
+    let mut latest: Vec<(&str, &str, &str)> = Vec::new();
     for env in envs {
         let branch = env["branch"]["name"].as_str().unwrap_or("?");
         let state = env["state"].as_str().unwrap_or("?");
         let url = env["url"].as_str().unwrap_or("?");
+        match latest.iter_mut().find(|(b, ..)| *b == branch) {
+            Some(entry) => *entry = (branch, state, url),
+            None => latest.push((branch, state, url)),
+        }
+    }
+    println!("{:<24} {:<24} URL", "BRANCH", "STATE");
+    for (branch, state, url) in latest {
         println!("{:<24} {:<33} {}", branch, colored_state(state), url);
     }
     Ok(())
 }
 
-async fn cmd_down(client: &Client, base: &str, branch: &str, force: bool) -> Result<(), String> {
+async fn cmd_down(
+    client: &Client,
+    base: &str,
+    branch: &str,
+    force: bool,
+    purge_secrets: bool,
+) -> Result<(), String> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     if !force
         && !confirm(&format!(
@@ -363,8 +436,13 @@ async fn cmd_down(client: &Client, base: &str, branch: &str, force: bool) -> Res
         bg("Aborted (re-run with --force to skip this prompt).");
         return Ok(());
     }
+    let url = if purge_secrets {
+        format!("{base}/api/v1/environments/{env_id}?purge_secrets=true")
+    } else {
+        format!("{base}/api/v1/environments/{env_id}")
+    };
     let response = client
-        .delete(format!("{base}/api/v1/environments/{env_id}"))
+        .delete(url)
         .send()
         .await
         .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
@@ -378,6 +456,9 @@ async fn cmd_down(client: &Client, base: &str, branch: &str, force: bool) -> Res
         return Err("destroying environment failed".to_owned());
     }
     ok(format!("Environment `{branch}` destroyed"));
+    if purge_secrets {
+        bg(format!("Branch `{branch}` secrets purged"));
+    }
     Ok(())
 }
 
@@ -390,6 +471,38 @@ fn confirm(prompt: &str) -> bool {
         return false;
     }
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), String> {
+    let project = register_project(client, base).await?;
+    let project_id = project["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing project id".to_owned())?;
+    let name = project["name"].as_str().unwrap_or("?");
+    if !force
+        && !confirm(&format!(
+            "This will permanently delete project `{name}` — every environment, secret and its git cache. Continue? [y/N] "
+        ))
+    {
+        bg("Aborted (re-run with --force to skip this prompt).");
+        return Ok(());
+    }
+    let response = client
+        .delete(format!("{base}/api/v1/projects/{project_id}"))
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        report_error(&body, status);
+        return Err("deleting project failed".to_owned());
+    }
+    ok(format!("Project `{name}` deleted"));
+    Ok(())
 }
 
 async fn cmd_pause(client: &Client, base: &str, branch: &str) -> Result<(), String> {
@@ -708,9 +821,14 @@ mod tests {
     fn parses_down_with_force() {
         let cli = Cli::try_parse_from(["oxid", "down", "feature-a", "--force"]).unwrap();
         match cli.command {
-            Command::Down { branch, force } => {
+            Command::Down {
+                branch,
+                force,
+                purge_secrets,
+            } => {
                 assert_eq!(branch, "feature-a");
                 assert!(force);
+                assert!(!purge_secrets);
             }
             other => panic!("expected Down, got {other:?}"),
         }
@@ -722,6 +840,25 @@ mod tests {
         match cli.command {
             Command::Down { force, .. } => assert!(!force),
             other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_down_with_purge_secrets() {
+        let cli = Cli::try_parse_from(["oxid", "down", "feature-a", "--force", "--purge-secrets"])
+            .unwrap();
+        match cli.command {
+            Command::Down { purge_secrets, .. } => assert!(purge_secrets),
+            other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rm_project() {
+        let cli = Cli::try_parse_from(["oxid", "rm-project", "--force"]).unwrap();
+        match cli.command {
+            Command::RmProject { force } => assert!(force),
+            other => panic!("expected RmProject, got {other:?}"),
         }
     }
 
@@ -745,6 +882,27 @@ mod tests {
     #[test]
     fn api_base_prefers_flag_over_env() {
         assert_eq!(api_base(Some("http://flag:1")), "http://flag:1".to_owned());
+    }
+
+    #[test]
+    fn api_token_prefers_flag_over_env() {
+        assert_eq!(api_token(Some("flag-token")), Some("flag-token".to_owned()));
+    }
+
+    #[test]
+    fn parses_global_token_flag() {
+        let cli = Cli::try_parse_from(["oxid", "--token", "s3cr3t", "ps"]).unwrap();
+        assert_eq!(cli.token.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn build_client_accepts_no_token() {
+        assert!(build_client(None).is_ok());
+    }
+
+    #[test]
+    fn build_client_accepts_a_token() {
+        assert!(build_client(Some("s3cr3t")).is_ok());
     }
 
     #[test]
