@@ -56,6 +56,41 @@ language. [`ROADMAP.md`](ROADMAP.md) tracks exactly what's implemented today
 versus what those documents describe — Oxid is early and evolving in the
 open.
 
+## Installation
+
+**Docker (recommended):**
+
+```bash
+docker run -d --name oxid-daemon \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v oxid-data:/data \
+  -p 8080:8080 \
+  -e OXID_WEBHOOK_SECRET=$(openssl rand -hex 32) \
+  -e OXID_API_TOKEN=$(openssl rand -hex 32) \
+  ghcr.io/sazardev/oxid:latest   # or `docker build -t oxid-daemon .` from source
+```
+
+See [`docker-compose.yml`](docker-compose.yml) for a fuller setup wired to
+Traefik (routing + scale-to-zero wake-on-request), matching `SPEC.md` §6.
+
+**Pre-built binaries:** every [tagged
+release](https://github.com/sazardev/oxid/releases) publishes `oxid` (CLI)
+and `oxidd` (daemon) for Linux (x86_64/aarch64, glibc and static musl), macOS
+(Intel and Apple Silicon), and Windows — see
+[`.github/workflows/release.yml`](.github/workflows/release.yml). The musl
+builds are static and run unmodified on any Linux distro (Debian, Arch,
+Alpine, NixOS, ...).
+
+**Nix / NixOS:**
+
+```bash
+nix run github:sazardev/oxid#oxid -- ps
+nix run github:sazardev/oxid#oxidd
+# or: nix develop  # dev shell with the full toolchain, cargo-audit, cargo-deny, gitleaks
+```
+
+**From source:** see [Getting started](#getting-started) below.
+
 ## Project layout
 
 This is a Cargo workspace with a hexagonal (ports & adapters) architecture:

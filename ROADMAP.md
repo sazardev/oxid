@@ -149,16 +149,16 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 12.1 | Dockerfile para Oxid (el daemon como contenedor) | **SPEC §6:** _"docker run -d --name control-plane -v /var/run/docker.sock:/var/run/docker.sock -v /opt/data:/data -p 8080:8080 ghcr.io/tu-usuario/orchestrator:latest"_ | No existe Dockerfile | No existe |
-| 12.2 | `docker run` con montaje de socket + `/data` | **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ _"Estructura del directorio /data: /data/config.toml, /data/audit.sqlite, /data/git-cache/"_ | No existe | No existe |
-| 12.3 | Configuración global `config.toml` | **SPEC §6:** _"/data/config.toml (Configuración de dominios, tokens, reglas de recolección de basura)."_ | Solo existe `oxid.toml` por proyecto, no hay config global del daemon | No existe |
-| 12.4 | Binario estático cross-compilado | **IDEA §6:** _"El usuario instala Oxid ejecutando un solo binario."_ **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ | `Cargo.toml` usa `edition = "2024"` pero no hay configuración de cross-compilation | No existe |
+| 12.1 | Dockerfile para Oxid (el daemon como contenedor) | **SPEC §6:** _"docker run -d --name control-plane -v /var/run/docker.sock:/var/run/docker.sock -v /opt/data:/data -p 8080:8080 ghcr.io/tu-usuario/orchestrator:latest"_ | `Dockerfile` — build musl estático + runtime `distroless/static` (~29MB), validado con `docker build`/`docker run` reales contra un daemon vivo | ✅ Done |
+| 12.2 | `docker run` con montaje de socket + `/data` | **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ _"Estructura del directorio /data: /data/config.toml, /data/audit.sqlite, /data/git-cache/"_ | `docker-compose.yml` — daemon + Traefik, socket + volumen `/data`, labels `oxid-wake` documentadas; ejemplo probado con `docker compose config` | ✅ Done |
+| 12.3 | Configuración global `config.toml` | **SPEC §6:** _"/data/config.toml (Configuración de dominios, tokens, reglas de recolección de basura)."_ | Superseded: dominios/tokens/GC ya se resuelven vía `OXID_*` env vars (`OXID_API_TOKEN`, `OXID_DOCKER_NETWORK`, `OXID_DAEMON_URL`, `OXID_GC_INTERVAL_SECS` — ver `main.rs`), consistente con el resto del diseño 12-factor del daemon. Un `config.toml` sería una segunda fuente de verdad redundante | Superseded por env vars |
+| 12.4 | Binario estático cross-compilado | **IDEA §6:** _"El usuario instala Oxid ejecutando un solo binario."_ **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ | `.github/workflows/release.yml` — build+publish de `oxid`/`oxidd` para linux-gnu, linux-musl (x86_64 y aarch64, estático), macOS (x86_64 + Apple Silicon) y Windows en cada tag `vX.Y.Z`. `flake.nix` (validado con `nix build`) para instalación nativa en NixOS/Nix | ✅ Done |
 
 ---
 
 ## Priorización
 
-> **Última actualización:** a0c064d — P0 completo (seguridad + secretos) entregado ✅
+> **Última actualización:** P5 (Dockerfile, self-hosting, release binaries) entregado ✅ — ver commit de guardrails/infra.
 
 | Prioridad | Categoría | Tareas | Justificación |
 |---|---|---|---|
@@ -167,6 +167,6 @@
 | **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 | La feature estrella del producto no funciona end-to-end |
 | **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.4 | Diferenciador competitivo vs levantar contenedores por branch |
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x, 11.x | Features de producto completo, no MVP |
-| **P5 — Ops/Deploy** | Dockerfile, config global | 12.x | Necesario para self-hosting real |
+| **P5 — Ops/Deploy** | Dockerfile, release binaries | 12.1, 12.2, 12.4 ✅ · 12.3 superseded | Necesario para self-hosting real |
 
 **Total: ~50 tareas granulares.** Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.
