@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
+use oxid_core::services::var_resolution::{set_secret, VarSources};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
-    DomainError, Environment, EnvironmentId, EnvironmentState, EnvironmentStore, GitError, GitPort,
-    OciError, OffsetDateTime, Project, ProjectId, ProjectStore, RepoUrl, RepositoryError,
-    StateTransition,
+    DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore,
+    GitError, GitPort, OciError, OffsetDateTime, Project, ProjectId, ProjectStore, RepoUrl,
+    RepositoryError, SecretStore, SecretValue, StateTransition,
 };
 
 use crate::adapter::config::{self, ConfigError};
@@ -91,9 +92,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         let parsed = config::parse_file(repo_dir.join("oxid.toml"))?;
-        let id = self.store.next_project_id().await?;
-        let project = Project::new(id, parsed.name, repo_url, parsed.config)?;
-        ProjectStore::create(&self.store, &project).await?;
+        let mut project = Project::new(ProjectId(0), parsed.name, repo_url, parsed.config)?;
+        let id = ProjectStore::create(&self.store, &project).await?;
+        project.id = id;
         Ok(project)
     }
 
@@ -154,22 +155,44 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // 3. Create the environment (Building) and persist it.
         let url = subdomain_for(&branch, &project.config.base_domain);
         let now = OffsetDateTime::now_utc();
-        let env_id = self.store.next_environment_id().await?;
-        let env = Environment::new(
-            env_id,
+        let mut env = Environment::new(
+            EnvironmentId(0),
             project.id,
             Branch::new(commit.branch, commit.sha)?,
             EnvironmentState::Building,
             url.clone(),
             now,
         )?;
-        EnvironmentStore::create(&self.store, &env).await?;
+        let env_id = EnvironmentStore::create(&self.store, &env).await?;
+        env.id = env_id;
 
-        // 4. Run the container.
-        let env_vars = BTreeMap::from([
-            ("OXID_BRANCH".to_owned(), branch.to_string()),
-            ("OXID_ENV_URL".to_owned(), url.clone()),
-        ]);
+        // 4. Resolve the effective environment: Global -> Project -> Branch
+        //    secrets plus orchestrator runtime variables (SPEC.md §2.1/§4.4).
+        let mut sources = VarSources::default();
+        let secrets = SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch))
+            .await?;
+        for (name, scope, value) in secrets.iter() {
+            set_secret(&mut sources, name, scope, value.as_str());
+        }
+        set_secret(
+            &mut sources,
+            "OXID_BRANCH",
+            EnvVarScope::Runtime,
+            branch.to_string(),
+        );
+        set_secret(
+            &mut sources,
+            "OXID_ENV_URL",
+            EnvVarScope::Runtime,
+            url.clone(),
+        );
+        let env_vars = sources
+            .resolve()
+            .into_iter()
+            .map(|(k, v)| (k, v.as_str().to_owned()))
+            .collect::<BTreeMap<_, _>>();
+
+        // 5. Run the container.
         let name = container_name(&project, &branch);
         let spec = ContainerSpec {
             name: name.clone(),
@@ -185,8 +208,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         };
         self.oci.run(&spec).await?;
 
-        // 5. Transition to Running and record the deployment.
-        let mut env = env;
+        // 6. Run the `[build].on_start` hooks (migrations, seeds).
+        for command in &project.config.build.on_start {
+            self.oci.exec(&name, command).await?;
+        }
+
+        // 7. Transition to Running and record the deployment.
         env.transition(StateTransition::BuildSucceeded, now)
             .map_err(|e| state_err(&e))?;
         self.store.update(&env).await?;
@@ -208,7 +235,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn pause(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
-        let env = self.ensure_environment(environment_id).await?;
+        let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
@@ -216,7 +243,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .pause(&container_name(&project, &env.branch.name))
             .await?;
 
-        let mut env = env;
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::IdleTimeout, now)
             .map_err(|e| state_err(&e))?;
@@ -229,7 +255,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn wake(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
-        let env = self.ensure_environment(environment_id).await?;
+        let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
@@ -237,7 +263,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .unpause(&container_name(&project, &env.branch.name))
             .await?;
 
-        let mut env = env;
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
@@ -258,6 +283,55 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .oci
             .logs(&container_name(&project, &env.branch.name))
             .await?)
+    }
+
+    /// Stores or replaces a secret at the given scope
+    /// (`Global` when `project_id` is `None`).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence or encryption failures.
+    pub async fn set_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+        scope: EnvVarScope,
+        value: &str,
+    ) -> Result<(), CpError> {
+        Ok(SecretStore::set_secret(
+            &self.store,
+            project_id,
+            branch,
+            name,
+            scope,
+            &SecretValue::new(value),
+        )
+        .await?)
+    }
+
+    /// Lists secret names and scopes for a context (values are never exposed).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence failures.
+    pub async fn list_secrets(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+    ) -> Result<Vec<(String, EnvVarScope)>, CpError> {
+        Ok(SecretStore::list_secrets(&self.store, project_id, branch).await?)
+    }
+
+    /// Deletes a secret from a scope.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the secret does not exist.
+    pub async fn delete_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+    ) -> Result<(), CpError> {
+        Ok(SecretStore::delete_secret(&self.store, project_id, branch, name).await?)
     }
 
     /// Runs one garbage-collection pass over every environment: evaluates
@@ -446,7 +520,7 @@ mod tests {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("run:{}", spec.name));
+                .push(format!("run:{}:env={:?}", spec.name, spec.env));
             Ok(())
         }
         async fn pause(&self, name: &str) -> Result<(), OciError> {
@@ -468,6 +542,13 @@ mod tests {
         async fn logs(&self, name: &str) -> Result<String, OciError> {
             self.calls.lock().unwrap().push(format!("logs:{name}"));
             Ok("build log".to_owned())
+        }
+        async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("exec:{name}:{command}"));
+            Ok(())
         }
     }
 

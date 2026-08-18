@@ -14,9 +14,12 @@ use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError, Environment,
-    EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime, Project, ProjectConfig,
-    ProjectId, ProjectStore, RepoUrl, RepositoryError, StateTransition, Ttl,
+    EnvironmentId, EnvironmentState, EnvironmentStore, EnvVarScope, OffsetDateTime, Project,
+    ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext, SecretStore,
+    SecretValue, StateTransition, Ttl,
 };
+
+use crate::adapter::crypto::{Cipher, CryptoError};
 
 /// Errors surfaced while opening the store.
 #[derive(Debug, thiserror::Error)]
@@ -27,12 +30,16 @@ pub enum StoreError {
     /// Embedded migrations could not run.
     #[error("migration failure: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
+    /// Secret encryption or decryption failed.
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
 }
 
 /// A connected, migrated `SQLite` database.
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    cipher: Cipher,
 }
 
 impl SqliteStore {
@@ -41,16 +48,16 @@ impl SqliteStore {
     ///
     /// # Errors
     /// Returns [`StoreError`] on connection or migration failure.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub async fn open(path: impl AsRef<Path>, cipher: Cipher) -> Result<Self, StoreError> {
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true);
-        Self::open_with(opts).await
+        Self::open_with(opts, cipher).await
     }
 
-    /// Opens an ephemeral in-memory database (tests).
+    /// Opens an ephemeral in-memory database (tests) with a fixed test key.
     ///
     /// # Errors
     /// Returns [`StoreError`] on connection or migration failure.
@@ -58,44 +65,16 @@ impl SqliteStore {
         let opts = SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true);
-        Self::open_with(opts).await
+        Self::open_with(opts, Cipher::from_key([1u8; 32])).await
     }
 
-    async fn open_with(opts: SqliteConnectOptions) -> Result<Self, StoreError> {
+    async fn open_with(opts: SqliteConnectOptions, cipher: Cipher) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
-    }
-
-    /// Allocates the next free project id (`MAX(id) + 1`).
-    ///
-    /// # Errors
-    /// Returns [`RepositoryError`] on query failure.
-    pub async fn next_project_id(&self) -> Result<ProjectId, RepositoryError> {
-        let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) + 1 FROM projects")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        Ok(ProjectId(
-            u64::try_from(row.0).map_err(|_| storage("project id overflowed u64"))?,
-        ))
-    }
-
-    /// Allocates the next free environment id (`MAX(id) + 1`).
-    ///
-    /// # Errors
-    /// Returns [`RepositoryError`] on query failure.
-    pub async fn next_environment_id(&self) -> Result<EnvironmentId, RepositoryError> {
-        let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(id), 0) + 1 FROM environments")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
-        Ok(EnvironmentId(
-            u64::try_from(row.0).map_err(|_| storage("environment id overflowed u64"))?,
-        ))
+        Ok(Self { pool, cipher })
     }
 
     /// Lists every environment across all projects, regardless of state.
@@ -165,7 +144,6 @@ fn ts_from_row(
 
 fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
     ProjectBinds {
-        id: id_as_i64(project.id.0),
         name: &project.name,
         repo_url: project.repo_url.as_str(),
         base_domain: &project.config.base_domain,
@@ -182,7 +160,6 @@ fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
 }
 
 struct ProjectBinds<'a> {
-    id: i64,
     name: &'a str,
     repo_url: &'a str,
     base_domain: &'a str,
@@ -196,6 +173,9 @@ struct ProjectBinds<'a> {
 }
 
 const PROJECT_COLUMNS: &str = "id, name, repo_url, base_domain, pause_after_seconds, \
+     destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json";
+
+const PROJECT_COLUMNS_NO_ID: &str = "name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json";
 
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, RepositoryError> {
@@ -236,13 +216,12 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
 }
 
 impl ProjectStore for SqliteStore {
-    async fn create(&self, project: &Project) -> Result<(), RepositoryError> {
+    async fn create(&self, project: &Project) -> Result<ProjectId, RepositoryError> {
         let binds = project_to_binds(project);
-        sqlx::query(&format!(
-            "INSERT INTO projects ({PROJECT_COLUMNS}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        let row = sqlx::query(&format!(
+            "INSERT INTO projects ({PROJECT_COLUMNS_NO_ID}) VALUES \
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
-        .bind(binds.id)
         .bind(binds.name)
         .bind(binds.repo_url)
         .bind(binds.base_domain)
@@ -253,10 +232,13 @@ impl ProjectStore for SqliteStore {
         .bind(binds.build_context)
         .bind(binds.on_start_json)
         .bind(binds.dependencies_json)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(())
+        let id: i64 = row.try_get("id").map_err(storage)?;
+        Ok(ProjectId(
+            u64::try_from(id).map_err(|_| storage("project id overflowed u64"))?,
+        ))
     }
 
     async fn get(&self, id: ProjectId) -> Result<Option<Project>, RepositoryError> {
@@ -300,6 +282,9 @@ impl ProjectStore for SqliteStore {
 // ---------------------------------------------------------------------------
 
 const ENV_COLUMNS: &str = "id, project_id, branch_name, commit_sha, state, url, \
+     created_at, updated_at, last_accessed_at";
+
+const ENV_COLUMNS_NO_ID: &str = "project_id, branch_name, commit_sha, state, url, \
      created_at, updated_at, last_accessed_at";
 
 fn env_to_binds(env: &Environment) -> EnvBinds<'_> {
@@ -364,13 +349,12 @@ fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, Repository
 }
 
 impl EnvironmentStore for SqliteStore {
-    async fn create(&self, env: &Environment) -> Result<(), RepositoryError> {
+    async fn create(&self, env: &Environment) -> Result<EnvironmentId, RepositoryError> {
         let binds = env_to_binds(env);
-        sqlx::query(&format!(
-            "INSERT INTO environments ({ENV_COLUMNS}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        let row = sqlx::query(&format!(
+            "INSERT INTO environments ({ENV_COLUMNS_NO_ID}) VALUES \
+             (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
-        .bind(binds.id)
         .bind(binds.project_id)
         .bind(binds.branch_name)
         .bind(binds.commit_sha)
@@ -379,10 +363,13 @@ impl EnvironmentStore for SqliteStore {
         .bind(binds.created_at)
         .bind(binds.updated_at)
         .bind(binds.last_accessed_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        Ok(())
+        let id: i64 = row.try_get("id").map_err(storage)?;
+        Ok(EnvironmentId(
+            u64::try_from(id).map_err(|_| storage("environment id overflowed u64"))?,
+        ))
     }
 
     async fn get(&self, id: EnvironmentId) -> Result<Option<Environment>, RepositoryError> {
@@ -533,6 +520,135 @@ impl AuditStore for SqliteStore {
         rows.iter().map(audit_from_row).collect()
     }
 }
+
+// ---------------------------------------------------------------------------
+// secret mapping
+// ---------------------------------------------------------------------------
+
+impl SecretStore for SqliteStore {
+    async fn set_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+        scope: EnvVarScope,
+        value: &SecretValue,
+    ) -> Result<(), RepositoryError> {
+        let value_enc = self.cipher.encrypt(value.as_str()).map_err(storage)?;
+        let project_bind = project_id.map(|id| id_as_i64(id.0));
+        let branch_bind = branch.map(oxid_core::BranchName::as_str);
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+
+        sqlx::query(
+            "INSERT INTO secrets (project_id, branch, name, scope, value_enc, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT DO UPDATE SET scope = excluded.scope, \
+             value_enc = excluded.value_enc, updated_at = excluded.updated_at",
+        )
+        .bind(project_bind)
+        .bind(branch_bind)
+        .bind(name)
+        .bind(scope.to_string())
+        .bind(value_enc)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn secrets_for(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+    ) -> Result<SecretContext, RepositoryError> {
+        let project_bind = project_id.map(|id| id_as_i64(id.0));
+        let branch_bind = branch.map(oxid_core::BranchName::as_str);
+        let rows = sqlx::query(&format!(
+            "SELECT {SECRET_COLUMNS} FROM secrets WHERE {SECRET_CONTEXT_FILTER} ORDER BY name"
+        ))
+        .bind(project_bind)
+        .bind(project_bind)
+        .bind(branch_bind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut ctx = SecretContext::new();
+        for row in rows {
+            let name: String = row.try_get("name").map_err(storage)?;
+            let scope: String = row.try_get("scope").map_err(storage)?;
+            let scope = scope
+                .parse::<EnvVarScope>()
+                .map_err(storage)?;
+            let value_enc: String = row.try_get("value_enc").map_err(storage)?;
+            let value = self.cipher.decrypt(&value_enc).map_err(storage)?;
+            ctx.set(name, scope, SecretValue::new(value));
+        }
+        Ok(ctx)
+    }
+
+    async fn list_secrets(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+    ) -> Result<Vec<(String, EnvVarScope)>, RepositoryError> {
+        let project_bind = project_id.map(|id| id_as_i64(id.0));
+        let branch_bind = branch.map(oxid_core::BranchName::as_str);
+        let rows = sqlx::query(&format!(
+            "SELECT name, scope FROM secrets WHERE {SECRET_CONTEXT_FILTER} ORDER BY name"
+        ))
+        .bind(project_bind)
+        .bind(project_bind)
+        .bind(branch_bind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        rows.iter()
+            .map(|row| {
+                let name: String = row.try_get("name").map_err(storage)?;
+                let scope: String = row.try_get("scope").map_err(storage)?;
+                let scope = scope
+                    .parse::<EnvVarScope>()
+                    .map_err(storage)?;
+                Ok((name, scope))
+            })
+            .collect()
+    }
+
+    async fn delete_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+    ) -> Result<(), RepositoryError> {
+        let project_bind = project_id.map(|id| id_as_i64(id.0));
+        let branch_bind = branch.map(oxid_core::BranchName::as_str);
+        let res = sqlx::query(
+            "DELETE FROM secrets WHERE project_id IS ? AND branch IS ? AND name = ?",
+        )
+        .bind(project_bind)
+        .bind(branch_bind)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "secret `{name}` does not exist in this scope"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Filter matching global (`project_id IS NULL`), project and branch secrets
+/// for a context. `?1` = project id (used twice), `?2` = branch name.
+const SECRET_CONTEXT_FILTER: &str = "project_id IS NULL OR project_id = ? OR \
+     (project_id = ? AND (branch IS NULL OR branch = ?))";
+
+const SECRET_COLUMNS: &str = "name, scope, value_enc";
 
 #[cfg(test)]
 mod tests {

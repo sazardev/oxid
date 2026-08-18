@@ -23,6 +23,32 @@ pub enum EnvVarScope {
     Runtime,
 }
 
+impl std::fmt::Display for EnvVarScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Branch => "branch",
+            Self::Runtime => "runtime",
+        };
+        f.write_str(s)
+    }
+}
+
+impl std::str::FromStr for EnvVarScope {
+    type Err = crate::DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "global" => Ok(Self::Global),
+            "project" => Ok(Self::Project),
+            "branch" => Ok(Self::Branch),
+            "runtime" => Ok(Self::Runtime),
+            _ => crate::domain::error::invalid(format!("unknown env var scope `{s}`")),
+        }
+    }
+}
+
 /// A resolved environment variable name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

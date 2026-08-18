@@ -8,6 +8,7 @@ use std::path::Path;
 
 use bollard::Docker;
 use bollard::container::{Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions};
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
 use bollard::models::{HostConfig, PortBinding};
 use bytes::Bytes;
@@ -163,6 +164,37 @@ impl ContainerPort for DockerClient {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {
+        let exec = self
+            .docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    cmd: Some(vec!["/bin/sh", "-c", command]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(map_err)?;
+
+        match self
+            .docker
+            .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+            .await
+            .map_err(map_err)?
+        {
+            StartExecResults::Attached { mut output, .. } => {
+                while let Some(item) = output.next().await {
+                    item.map_err(map_err)?;
+                }
+                Ok(())
+            }
+            StartExecResults::Detached => Ok(()),
+        }
     }
 }
 

@@ -14,6 +14,7 @@ use crate::domain::audit::AuditEvent;
 use crate::domain::branch::BranchName;
 use crate::domain::environment::{Environment, EnvironmentId};
 use crate::domain::project::{Project, ProjectId};
+use crate::domain::secret_context::{EnvVarScope, SecretContext, SecretValue};
 use crate::domain::state::EnvironmentState;
 use crate::domain::value_objects::RepoUrl;
 
@@ -34,11 +35,12 @@ pub enum RepositoryError {
 /// Persistence contract for [`Project`] records.
 #[trait_variant::make(Send)]
 pub trait ProjectStore {
-    /// Inserts a new project.
+    /// Inserts a new project and returns its database-assigned id.
     ///
     /// # Errors
-    /// [`RepositoryError::Conflict`] if the id already exists.
-    async fn create(&self, project: &Project) -> Result<(), RepositoryError>;
+    /// [`RepositoryError::Conflict`] if a project with the same `repo_url`
+    /// already exists.
+    async fn create(&self, project: &Project) -> Result<ProjectId, RepositoryError>;
     /// Loads a project by id, or `None` if absent.
     ///
     /// # Errors
@@ -59,11 +61,11 @@ pub trait ProjectStore {
 /// Persistence contract for [`Environment`] records.
 #[trait_variant::make(Send)]
 pub trait EnvironmentStore {
-    /// Inserts a new environment.
+    /// Inserts a new environment and returns its database-assigned id.
     ///
     /// # Errors
     /// [`RepositoryError::Conflict`] if the id already exists.
-    async fn create(&self, env: &Environment) -> Result<(), RepositoryError>;
+    async fn create(&self, env: &Environment) -> Result<EnvironmentId, RepositoryError>;
     /// Loads an environment by id, or `None` if absent.
     ///
     /// # Errors
@@ -118,6 +120,64 @@ pub trait AuditStore {
     /// # Errors
     /// Any storage failure.
     async fn list_recent(&self, limit: u64) -> Result<Vec<AuditEvent>, RepositoryError>;
+}
+
+// ---------------------------------------------------------------------------
+// Secret port (SPEC.md §4.4 inyección de variables)
+// ---------------------------------------------------------------------------
+
+/// Persistence contract for environment variables and secrets.
+///
+/// A secret belongs to one of three scopes — `Global`, `Project` or `Branch` —
+/// encoded positionally: `(None, None)` is global, `(Some(project), None)` is
+/// project-scoped and `(Some(project), Some(branch))` is branch-scoped. Values
+/// are opaque to the domain; adapters are responsible for encryption at rest.
+#[trait_variant::make(Send)]
+pub trait SecretStore {
+    /// Stores (or replaces) a secret at the given scope.
+    ///
+    /// # Errors
+    /// [`RepositoryError::Storage`] on persistence or encryption failure.
+    async fn set_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+        scope: EnvVarScope,
+        value: &SecretValue,
+    ) -> Result<(), RepositoryError>;
+
+    /// Loads every secret relevant to a project/branch context, preserving its
+    /// scope so resolution (`Global -> Project -> Branch`) can be applied.
+    ///
+    /// # Errors
+    /// [`RepositoryError::Storage`] on persistence or decryption failure.
+    async fn secrets_for(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+    ) -> Result<SecretContext, RepositoryError>;
+
+    /// Lists stored secret names and their scopes for a context (no values).
+    ///
+    /// # Errors
+    /// [`RepositoryError::Storage`] on query failure.
+    async fn list_secrets(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+    ) -> Result<Vec<(String, EnvVarScope)>, RepositoryError>;
+
+    /// Deletes a secret by name within a context.
+    ///
+    /// # Errors
+    /// [`RepositoryError::NotFound`] if the secret does not exist.
+    async fn delete_secret(
+        &self,
+        project_id: Option<ProjectId>,
+        branch: Option<&BranchName>,
+        name: &str,
+    ) -> Result<(), RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,4 +315,12 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::NotFound`] if the container does not exist.
     async fn logs(&self, name: &str) -> Result<String, OciError>;
+    /// Runs a one-off command inside a running container (`docker exec`).
+    ///
+    /// Used to execute `[build].on_start` hooks after a deployment.
+    ///
+    /// # Errors
+    /// [`OciError::NotFound`] if the container does not exist,
+    /// [`OciError::Failure`] if the command exits non-zero.
+    async fn exec(&self, name: &str, command: &str) -> Result<(), OciError>;
 }

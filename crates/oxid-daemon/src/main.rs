@@ -1,13 +1,18 @@
 //! Oxid daemon binary: starts the HTTP control-plane server.
 //!
 //! Configuration via environment:
-//! - `OXID_DATA_DIR` — data directory (default `/data`), holding `audit.sqlite`
-//!   and the `git-cache/`.
+//! - `OXID_DATA_DIR` — data directory (default `/data`), holding `audit.sqlite`,
+//!   the `git-cache/` and the generated `secret.key`.
 //! - `OXID_ADDR` — bind address (default `0.0.0.0:8080`).
+//! - `OXID_MASTER_KEY` — optional 64-char hex master key for secret encryption.
+//!   When unset, a key is generated and persisted to `/data/secret.key`.
+//! - `OXID_WEBHOOK_SECRET` — shared secret verifying GitHub webhook signatures.
+//!   Webhooks are rejected while unset.
 
 use std::path::PathBuf;
 
 use oxid_daemon::ControlPlane;
+use oxid_daemon::adapter::crypto::Cipher;
 use oxid_daemon::adapter::git::GitClient;
 use oxid_daemon::adapter::oci::DockerClient;
 use oxid_daemon::adapter::store::SqliteStore;
@@ -26,10 +31,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_GC_INTERVAL_SECS);
 
+    let cipher = match std::env::var("OXID_MASTER_KEY") {
+        Ok(raw) => {
+            let bytes = hex::decode(&raw).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid OXID_MASTER_KEY: {e}"),
+                )
+            })?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "OXID_MASTER_KEY must be 64 hex characters (32 bytes)",
+                )
+            })?;
+            Cipher::from_key(key)
+        }
+        Err(_) => Cipher::load_or_create(&PathBuf::from(&data_dir).join("secret.key"))?,
+    };
+
     let db_path = PathBuf::from(&data_dir).join("audit.sqlite");
     let cache_dir = PathBuf::from(&data_dir).join("git-cache");
 
-    let store = SqliteStore::open(db_path).await?;
+    let store = SqliteStore::open(db_path, cipher).await?;
     let git = GitClient::new();
     let oci = DockerClient::connect()?;
     let cp = ControlPlane::new(store, git, oci, cache_dir);
@@ -39,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(gc_interval_secs),
     ));
 
-    let app = router(ApiState { cp });
+    let webhook_secret = std::env::var("OXID_WEBHOOK_SECRET").ok();
+    let app = router(ApiState { cp, webhook_secret });
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!(
         "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"

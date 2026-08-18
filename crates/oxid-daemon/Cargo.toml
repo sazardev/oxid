@@ -26,6 +26,11 @@ bytes.workspace = true
 git2.workspace = true
 axum.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+aes-gcm.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
