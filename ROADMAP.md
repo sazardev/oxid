@@ -23,8 +23,8 @@
 | 1.1 | `oxid down <branch>` — destruir entorno | **SPEC §5.1:** _"`$ ctrl up my-repo --branch feature-login` → Fuerza un despliegue manual."_ Se infiere `down` como operación opuesta. | No existe | No existe |
 | 1.2 | `oxid status` — listar entornos del proyecto actual | **IDEA §4:** _"Comandos cortos, salida coloreada e intuitiva. Ej: `oxid up feature-login`, `oxid env set`."_ | `oxid ps` lista proyectos, no entornos por proyecto | No existe |
 | 1.3 | `oxid logs <branch> -f` — streaming real vía SSE/chunked | **SPEC §5.1:** _"`$ ctrl logs feature-login -f` → Streaming de logs de la rama."_ | Stub: imprime "not implemented yet" | Stub |
-| 1.4 | `oxid env set KEY=val --scope global` — inyectar secretos | **SPEC §5.1:** _"`$ ctrl env set my-repo DB_PASSWORD=secret --scope global` → Inyecta variables."_ | Stub: imprime "not implemented yet" | Stub |
-| 1.5 | `oxid env list` — ver secretos configurados | **IDEA §4:** La tabla de interfaces muestra `oxid env set` como ejemplo de la CLI. `list` es el complemento natural. | No existe | No existe |
+| 1.4 | `oxid env set KEY=val --scope global` — inyectar secretos | **SPEC §5.1:** _"`$ ctrl env set my-repo DB_PASSWORD=secret --scope global` → Inyecta variables."_ | `cli/main.rs` — `oxid env set KEY=VAL --scope <global\|project\|branch> [--project ID] [--branch B]` | ✅ Done (a0c064d) |
+| 1.5 | `oxid env list` — ver secretos configurados | **IDEA §4:** La tabla de interfaces muestra `oxid env set` como ejemplo de la CLI. `list` es el complemento natural. | `cli/main.rs` — `oxid env list [--scope ...]` (valores nunca expuestos) | ✅ Done (a0c064d) |
 | 1.6 | `oxid pause <branch>` — pausar manualmente | **IDEA §6:** _"Oxid apagó el contenedor, liberando 500MB de RAM."_ El usuario debe poder forzar esta acción. | No existe | No existe |
 | 1.7 | `oxid wake <branch>` — despertar manualmente | **IDEA §6:** _"Un tester entra a la URL, Oxid lo nota, hace `unpause` en 200ms."_ El usuario debe poder forzar esta acción. | No existe | No existe |
 | 1.8 | Coloreado ANSI con prefijos `[+]` `[~]` `[>]` | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks. `[>]` in Oxid Orange for actionable prompts."_ | Solo usa `eprintln!` y `println!` sin códigos ANSI | Parcial |
@@ -37,8 +37,8 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 2.1 | Verificación HMAC-SHA256 de webhooks GitHub | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab. Se verifica el payload criptográficamente."_ | `api.rs:206-243` — acepta cualquier JSON sin verificar firma | No existe |
-| 2.2 | Secret configurable (`OXID_WEBHOOK_SECRET`) | **SPEC §4.1:** implícito en _"Se verifica el payload criptográficamente"_. HMAC requiere un shared secret. | No existe | No existe |
+| 2.1 | Verificación HMAC-SHA256 de webhooks GitHub | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab. Se verifica el payload criptográficamente."_ | `api.rs` — `verify_hmac` + `X-Hub-Signature-256` (comparación constante vía `hmac`) | ✅ Done (a0c064d) |
+| 2.2 | Secret configurable (`OXID_WEBHOOK_SECRET`) | **SPEC §4.1:** implícito en _"Se verifica el payload criptográficamente"_. HMAC requiere un shared secret. | `main.rs` lee `OXID_WEBHOOK_SECRET`; webhooks rechazados si no está configurado | ✅ Done (a0c064d) |
 | 2.3 | Soporte webhooks GitLab (formato distinto) | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab."_ Menciona ambos proveedores. | Solo parsea formato GitHub (`ref`, `repository.full_name`) | No existe |
 | 2.4 | Rate limiting en la API HTTP | **SPEC §1:** _"Ecosistema Unificado: No requiere herramientas de terceros."_ Implica protección integrada. | No existe | No existe |
 | 2.5 | Autenticación API (bearer token mínimo) | **SPEC §6:** La configuración incluye _"tokens"_ en `/data/config.toml`. | No existe | No existe |
@@ -51,9 +51,9 @@
 |---|---|---|---|---|
 | 3.1 | Almacenamiento encriptado de secretos (AES-GCM) | **SPEC §4.4:** _"Se compilan los secretos cacheados en disco (encriptados mediante AES-GCM usando una clave maestra local) y se inyectan dinámicamente."_ | `secret_context.rs` — dominio puro, sin persistencia ni encriptación | No existe |
 | 3.2 | Clave maestra local para desencriptar | **SPEC §4.4:** _"una clave maestra local"_ — parte de la infraestructura de encriptación AES-GCM. | No existe | No existe |
-| 3.3 | Inyección real de variables al contenedor en `deploy()` | **SPEC §4.4:** _"se inyectan dinámicamente"_ al contenedor. **IDEA §6:** _"inyecta variables secretas y despliega."_ | `control_plane.rs:169-172` — solo inyecta `OXID_BRANCH` y `OXID_ENV_URL`, no secretos del usuario | Parcial |
-| 3.4 | Resolución de `SecretContext` con herencia `Global→Project→Branch→Runtime` | **SPEC §2.1:** _"Las variables de entorno se calculan por una matriz de herencia: Global → Project → Branch → Runtime."_ | `var_resolution.rs` existe en dominio pero `ControlPlane::deploy` no lo invoca | No conectado |
-| 3.5 | Persistencia de secretos en SQLite (tabla `secrets`) | **SPEC §4.4:** _"secretos cacheados en disco"_ — implica persistencia. **IDEA §3:** _"guarda cada variable inyectada."_ | No existe tabla `secrets` en `0001_init.sql` | No existe |
+| 3.3 | Inyección real de variables al contenedor en `deploy()` | **SPEC §4.4:** _"se inyectan dinámicamente"_ al contenedor. **IDEA §6:** _"inyecta variables secretas y despliega."_ | `control_plane.rs` — resuelve `VarSources` (Global→Project→Branch→Runtime) e inyecta el mapa resultante en `ContainerSpec.env` | ✅ Done (a0c064d) |
+| 3.4 | Resolución de `SecretContext` con herencia `Global→Project→Branch→Runtime` | **SPEC §2.1:** _"Las variables de entorno se calculan por una matriz de herencia: Global → Project → Branch → Runtime."_ | `var_resolution.rs` conectado a `ControlPlane::deploy`; runtime gana sobre todo | ✅ Done (a0c064d) |
+| 3.5 | Persistencia de secretos en SQLite (tabla `secrets`) | **SPEC §4.4:** _"secretos cacheados en disco"_ — implica persistencia. **IDEA §3:** _"guarda cada variable inyectada."_ | Tabla `secrets` en `0001_init.sql` + `SecretStore` en `SqliteStore` (valores cifrados AES-GCM) | ✅ Done (a0c064d) |
 
 ---
 
@@ -85,8 +85,8 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 6.1 | Locking concurrente en SQLite | **SPEC §4.2:** _"Se adquiere un bloqueo transaccional en SQLite para evitar condiciones de carrera si entran múltiples pushes a la misma rama simultáneamente."_ | `control_plane.rs` — no hay locking; `store.rs` usa transacciones pero sin adquirir locks explícitos | No existe |
-| 6.2 | Ejecución de `on_start` hooks (migrations, seeds) | **IDEA §6 (oxid.toml):** _"`on_start = ["npm run db:migrate", "npm run db:seed"]` Command injected to run once the container starts"_ **IDEA §6:** _"compila si es necesario, inyecta variables secretas y despliega"_ | `control_plane.rs:168-186` — ejecuta `run` del contenedor pero no ejecuta comandos `on_start` dentro de él | No existe |
+| 6.1 | Locking concurrente en SQLite | **SPEC §4.2:** _"Se adquiere un bloqueo transaccional en SQLite para evitar condiciones de carrera si entran múltiples pushes a la misma rama simultáneamente."_ | IDs `AUTOINCREMENT` + `RETURNING id` (asignación atómica); pool con `max_connections(1)` serializa escrituras | ✅ Done (a0c064d) |
+| 6.2 | Ejecución de `on_start` hooks (migrations, seeds) | **IDEA §6 (oxid.toml):** _"`on_start = ["npm run db:migrate", "npm run db:seed"]` Command injected to run once the container starts"_ **IDEA §6:** _"compila si es necesario, inyecta variables secretas y despliega"_ | `ContainerPort::exec` (`docker exec`) invocado tras `run` en `deploy()` | ✅ Done (a0c064d) |
 | 6.3 | Caché de capas Docker (BuildKit volumes) | **SPEC §4.5:** _"Se aplican técnicas de caché de capas (BuildKit) y volúmenes compartidos para dependencias (ej. ~/.m2, ~/.cargo/registry, node_modules en volúmenes Docker huérfanos mapeados automáticamente)."_ | `oci.rs:61-73` — `build_image` sin volúmenes de caché configurados | No existe |
 | 6.4 | WebSocket para notificaciones en vivo | **SPEC §4.7:** _"Registro en la base de datos de eventos ... y emisión por WebSocket hacia los clientes."_ | No existe — solo audit trail en SQLite | No existe |
 | 6.5 | Cálculo de métricas de ahorro de RAM | **SPEC §5.2:** _"Visualización de ... uso de CPU/RAM en tiempo real por contenedor."_ **DESIGN §3.4:** _"Bottom pane: System stats (CPU / RAM saved by Oxid)."_ | No existe | No existe |
@@ -97,8 +97,8 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 7.1 | Reemplazar `MAX(id)+1` por IDs autoincrementales | **SPEC §1:** _"Eficiencia Absoluta ... Huella de memoria mínima."_ IDs inseguros bajo concurrencia contradicen este principio. | `store.rs` — `SELECT COALESCE(MAX(id), 0) + 1` para asignación de IDs | Deuda técnica |
-| 7.2 | Tabla `secrets` para persistir variables de entorno | **SPEC §4.4:** _"secretos cacheados en disco"_ **IDEA §3:** _"guarda ... cada variable inyectada."_ | No existe en `0001_init.sql` | No existe |
+| 7.1 | Reemplazar `MAX(id)+1` por IDs autoincrementales | **SPEC §1:** _"Eficiencia Absoluta ... Huella de memoria mínima."_ IDs inseguros bajo concurrencia contradicen este principio. | `store.rs` — `AUTOINCREMENT` + `RETURNING id`; `next_*_id` eliminados | ✅ Done (a0c064d) |
+| 7.2 | Tabla `secrets` para persistir variables de entorno | **SPEC §4.4:** _"secretos cacheados en disco"_ **IDEA §3:** _"guarda ... cada variable inyectada."_ | Tabla `secrets` en `0001_init.sql` con índice UNIQUE por scope | ✅ Done (a0c064d) |
 | 7.3 | Tabla `resource_pools` para trackear pools | **SPEC §3.1:** _"Resource Pools"_ — el dominio los modela pero no se persisten. | `resource_pool.rs` es solo lógica en memoria | No existe |
 
 ---
@@ -107,7 +107,7 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 8.1 | Prefijos coloreados: `[+]` verde, `[~]` gris, `[>]` naranja | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks (e.g., pausing). `[>]` in Oxid Orange for actionable prompts or active builds."_ | `cli/main.rs` — usa `println!` y `eprintln!` sin códigos ANSI | No implementado |
+| 8.1 | Prefijos coloreados: `[+]` verde, `[~]` gris, `[>]` naranja | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks (e.g., pausing). `[>]` in Oxid Orange for actionable prompts or active builds."_ | `cli/main.rs` — helpers `ok`/`bg`/`action`/`error` con ANSI | ✅ Done (a0c064d) |
 | 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | `config.rs` devuelve errores como `ConfigError::Validation(String)` sin acción sugerida | Parcial |
 | 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs:86-131` — solo imprime `[>] oxid up` y `[+] Environment live at` | No implementado |
 
@@ -158,10 +158,12 @@
 
 ## Priorización
 
+> **Última actualización:** a0c064d — P0 completo (seguridad + secretos) entregado ✅
+
 | Prioridad | Categoría | Tareas | Justificación |
 |---|---|---|---|
-| **P0 — Core funcional** | Control plane, Secretos, Webhook auth | 2.1, 2.2, 3.3, 3.4, 6.1, 6.2 | Sin estos, el sistema no es seguro ni funcional |
-| **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.8, 8.1–8.3 | Sin esto, la CLI es inutilizable para el usuario final |
+| **P0 — Core funcional** | Control plane, Secretos, Webhook auth | 2.1, 2.2, 3.3, 3.4, 3.5, 6.1, 6.2, 7.1, 7.2 ✅ | Sin estos, el sistema no es seguro ni funcional |
+| **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.3, 1.6–1.10, 8.2, 8.3 | Sin esto, la CLI es inutilizable para el usuario final |
 | **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 | La feature estrella del producto no funciona end-to-end |
 | **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.4 | Diferenciador competitivo vs levantar contenedores por branch |
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x, 11.x | Features de producto completo, no MVP |
