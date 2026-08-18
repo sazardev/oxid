@@ -1,0 +1,13 @@
+target/
+.git/
+.githooks/
+.github/
+.cargo/
+.claude/
+.agents/
+docs/
+assets/
+*.md
+Dockerfile
+docker-compose*.yml
+.dockerignore

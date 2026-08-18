@@ -1,0 +1,92 @@
+# Example self-hosting setup for Oxid (SPEC.md §6 "Configuración y
+# Self-Hosting"): the daemon + Traefik, wired for scale-to-zero routing.
+#
+#   docker compose up -d
+#
+# Then point a wildcard DNS/hosts entry at this host for your chosen base
+# domain (e.g. `*.local.dev` -> 127.0.0.1) and deploy a project against
+# http://localhost:8080 (or through Traefik once you've registered it).
+#
+# This is a starting point, not a hardened production stack — see the
+# comments below for what to change before exposing it beyond localhost.
+
+services:
+  traefik:
+    image: traefik:v3.3
+    environment:
+      # Traefik's bundled Docker client negotiates an old default API
+      # version that recent Docker Engine releases reject outright
+      # ("client version 1.24 is too old"). Force a modern one explicitly
+      # rather than relying on negotiation.
+      DOCKER_API_VERSION: "1.41"
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=oxid-net
+      - --entrypoints.web.address=:80
+      # Uncomment for TLS once you have real certificates / an ACME resolver
+      # configured — do not expose plain HTTP beyond localhost otherwise.
+      # - --entrypoints.websecure.address=:443
+      # A dedicated entrypoint for the dashboard/API: without it, the
+      # "insecure" API binds to Traefik's internal default (8080), not the
+      # 8081 published below.
+      - --entrypoints.traefik.address=:8081
+      - --api.dashboard=true
+      - --api.insecure=true # dashboard over plain HTTP — fine for localhost, remove otherwise
+    ports:
+      - "80:80"
+      # - "443:443"
+      - "8081:8081" # Traefik dashboard (remove or protect before exposing this host)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - oxid-net
+    restart: unless-stopped
+
+  oxid-daemon:
+    build: .
+    # Or, once published: image: ghcr.io/sazardev/oxid:latest
+    environment:
+      OXID_DATA_DIR: /data
+      OXID_ADDR: 0.0.0.0:8080
+      # Required for webhook ingestion to be accepted at all — generate with
+      # `openssl rand -hex 32` and configure the same value as your GitHub
+      # webhook's secret.
+      OXID_WEBHOOK_SECRET: ${OXID_WEBHOOK_SECRET:?set OXID_WEBHOOK_SECRET}
+      # Bearer token the CLI/dashboard must send once this daemon is
+      # reachable beyond localhost. Generate with `openssl rand -hex 32`.
+      OXID_API_TOKEN: ${OXID_API_TOKEN:?set OXID_API_TOKEN}
+      # Joining Traefik's network switches deployed containers from
+      # publishing a host port to being routed by Traefik labels instead
+      # (see ControlPlane::with_traefik / SPEC.md §3.2).
+      OXID_DOCKER_NETWORK: oxid-net
+      OXID_DAEMON_URL: http://oxid-daemon:8080
+    ports:
+      # Direct access for the CLI/dashboard (`OXID_API=http://localhost:8080`).
+      # Traefik only routes *deployed environments*, not this control API —
+      # remove this if you'd rather reach it exclusively through Traefik/a
+      # private network.
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - oxid-data:/data
+    networks:
+      - oxid-net
+    labels:
+      # Wake-on-request needs a Traefik service pointing back at this
+      # daemon's own /api/v1/wake, shared across every branch of every
+      # project. Per-branch containers get their own routing/heartbeat
+      # labels automatically from ControlPlane::deploy — see
+      # `traefik_labels` in crates/oxid-daemon/src/service/control_plane.rs
+      # for exactly what gets attached to each deployed environment.
+      - traefik.enable=true
+      - traefik.docker.network=oxid-net
+      - traefik.http.services.oxid-wake.loadbalancer.server.port=8080
+    restart: unless-stopped
+
+networks:
+  oxid-net:
+    name: oxid-net
+
+volumes:
+  oxid-data:

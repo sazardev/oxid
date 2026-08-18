@@ -1,0 +1,10 @@
+# Config for `cross` (https://github.com/cross-rs/cross), used by
+# .github/workflows/release.yml for targets that need a foreign C toolchain
+# (aarch64 Linux). git2's vendored libgit2/OpenSSL and sqlx's bundled sqlite
+# all compile C code from source — cmake and perl drive those builds and
+# aren't guaranteed to be present in every cross-rs target image.
+
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes cmake perl",
+]
