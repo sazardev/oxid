@@ -9,6 +9,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+use futures_core::Stream;
 
 use crate::domain::audit::AuditEvent;
 use crate::domain::branch::BranchName;
@@ -249,6 +252,10 @@ pub enum OciError {
     Failure(String),
 }
 
+/// A boxed, `Send` stream of container log lines, yielded as they're
+/// written rather than gathered into a single bounded snapshot.
+pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, OciError>> + Send>>;
+
 /// Inputs for a container image build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildSpec {
@@ -338,6 +345,13 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::NotFound`] if the container does not exist.
     async fn logs(&self, name: &str) -> Result<String, OciError>;
+    /// Follows a container's logs live (`docker logs -f`), yielding new
+    /// lines as they're written instead of a bounded snapshot. Backs the
+    /// SSE `/logs/stream` endpoint (SPEC.md §5).
+    ///
+    /// # Errors
+    /// [`OciError::NotFound`] if the container does not exist.
+    async fn stream_logs(&self, name: &str) -> Result<LogStream, OciError>;
     /// Runs a one-off command inside a running container (`docker exec`).
     ///
     /// Used to execute `[build].on_start` hooks after a deployment.

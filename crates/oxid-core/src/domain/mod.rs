@@ -19,7 +19,7 @@ pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
 pub use ports::{
     AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, EnvironmentStore, GitError,
-    GitPort, OciError, ProjectStore, RepositoryError, SecretStore,
+    GitPort, LogStream, OciError, ProjectStore, RepositoryError, SecretStore,
 };
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};

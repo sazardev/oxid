@@ -16,7 +16,7 @@ use bollard::image::{BuildImageOptions, RemoveImageOptions};
 use bollard::models::{EndpointSettings, HostConfig, PortBinding};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use oxid_core::{BuildSpec, ContainerPort, ContainerSpec, OciError};
+use oxid_core::{BuildSpec, ContainerPort, ContainerSpec, LogStream, OciError};
 
 /// Backed by a Docker connection (default socket).
 #[derive(Debug, Clone)]
@@ -210,6 +210,22 @@ impl ContainerPort for DockerClient {
             out.push('\n');
         }
         Ok(out)
+    }
+
+    async fn stream_logs(&self, name: &str) -> Result<LogStream, OciError> {
+        let options = LogsOptions {
+            follow: true,
+            stdout: true,
+            stderr: true,
+            timestamps: false,
+            tail: "50".to_owned(),
+            ..Default::default()
+        };
+        let stream = self.docker.logs(name, Some(options)).map(|item| {
+            item.map(|line| line.to_string().trim_end().to_owned())
+                .map_err(map_err)
+        });
+        Ok(Box::pin(stream))
     }
 
     async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {

@@ -2,13 +2,17 @@
 //!
 //! The CLI, TUI, dashboard and desktop app all consume this router.
 
+use std::convert::Infallible;
+
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use oxid_core::{
     BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId, EnvironmentState, GitPort,
@@ -74,6 +78,10 @@ pub fn router<
         .route("/api/v1/environments/{env_id}/pause", post(pause))
         .route("/api/v1/environments/{env_id}/wake", post(wake))
         .route("/api/v1/environments/{env_id}/logs", get(logs))
+        .route(
+            "/api/v1/environments/{env_id}/logs/stream",
+            get(stream_logs),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_token::<G, O>,
@@ -347,6 +355,25 @@ async fn logs<
 ) -> ApiResult<Json<Value>> {
     let logs = state.cp.logs(EnvironmentId(env_id)).await?;
     Ok(Json(json!({ "logs": logs })))
+}
+
+/// Follows an environment's container logs live over SSE, one `data:` event
+/// per line, instead of the bounded snapshot [`logs`] returns.
+async fn stream_logs<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(env_id): Path<u64>,
+) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>> {
+    let log_stream = state.cp.stream_logs(EnvironmentId(env_id)).await?;
+    let events = log_stream.map(|item| {
+        Ok(match item {
+            Ok(line) => Event::default().data(line),
+            Err(err) => Event::default().event("error").data(err.to_string()),
+        })
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
 }
 
 /// Query for `DELETE /api/v1/environments/{env_id}`.
@@ -844,6 +871,15 @@ mod tests {
             self.calls.lock().unwrap().push(format!("logs:{name}"));
             Ok("build log".to_owned())
         }
+        async fn stream_logs(&self, name: &str) -> Result<oxid_core::LogStream, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stream_logs:{name}"));
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                "build log".to_owned()
+            )])))
+        }
         async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {
             self.calls
                 .lock()
@@ -1069,6 +1105,41 @@ port = 8080
                 .any(|c| c.starts_with("run:oxid-app-feature-login")),
             "{calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn logs_stream_endpoint_emits_sse_data_events() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/environments/{}/logs/stream", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("data: build log"), "{text:?}");
     }
 
     #[tokio::test]

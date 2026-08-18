@@ -14,8 +14,9 @@ use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
     Dependency, DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState,
-    EnvironmentStore, GitError, GitPort, OciError, OffsetDateTime, PoolError, PoolKind, Project,
-    ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore, SecretValue, StateTransition,
+    EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime, PoolError, PoolKind,
+    Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore, SecretValue,
+    StateTransition,
 };
 
 use crate::adapter::config::{self, ConfigError};
@@ -803,6 +804,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?)
     }
 
+    /// Follows an environment's container logs live, yielding new lines as
+    /// they're written (SPEC.md §5's SSE `/logs/stream` endpoint).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on missing records or Docker failures.
+    pub async fn stream_logs(&self, environment_id: EnvironmentId) -> Result<LogStream, CpError> {
+        let env = self.ensure_environment(environment_id).await?;
+        let project = ProjectStore::get(&self.store, env.project_id)
+            .await?
+            .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
+        Ok(self
+            .oci
+            .stream_logs(&container_name(&project, &env.branch.name))
+            .await?)
+    }
+
     /// Stores or replaces a secret at the given scope
     /// (`Global` when `project_id` is `None`).
     ///
@@ -1203,6 +1220,15 @@ mod tests {
         async fn logs(&self, name: &str) -> Result<String, OciError> {
             self.calls.lock().unwrap().push(format!("logs:{name}"));
             Ok("build log".to_owned())
+        }
+        async fn stream_logs(&self, name: &str) -> Result<LogStream, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("stream_logs:{name}"));
+            Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+                "build log".to_owned()
+            )])))
         }
         async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {
             self.calls
@@ -1653,6 +1679,10 @@ port = 8080
 
         let logs = cp.logs(env.id).await.unwrap();
         assert_eq!(logs, "build log");
+
+        let mut stream = cp.stream_logs(env.id).await.unwrap();
+        let first = futures_util::StreamExt::next(&mut stream).await;
+        assert_eq!(first, Some(Ok("build log".to_owned())));
     }
 
     #[tokio::test]

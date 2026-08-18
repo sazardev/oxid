@@ -5,9 +5,9 @@
 //! per-invocation with `--api`.
 
 use std::io::Write as _;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
@@ -75,7 +75,8 @@ enum Command {
     Logs {
         /// Branch whose logs to show.
         branch: String,
-        /// Poll for new output as it is written (not true streaming).
+        /// Stream new output live (SSE) as it's written, instead of a
+        /// one-shot snapshot.
         #[arg(long, short)]
         follow: bool,
     },
@@ -537,28 +538,47 @@ async fn post_empty(client: &Client, url: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Fetches an environment's logs; with `follow`, polls every 2s and prints
-/// only newly-appeared trailing lines. This is poll-based, not a true SSE
-/// stream — the daemon only exposes a snapshot `logs` endpoint today.
+/// Fetches an environment's logs. Without `follow`, a one-shot snapshot;
+/// with `follow`, consumes the daemon's SSE `/logs/stream` endpoint and
+/// prints each `data:` line as it arrives — a real live stream, not polling.
 async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Result<(), String> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
-    let url = format!("{base}/api/v1/environments/{env_id}/logs");
 
-    let mut seen_lines = 0usize;
-    loop {
-        let value = get_json(client, url.clone()).await?;
+    if !follow {
+        let url = format!("{base}/api/v1/environments/{env_id}/logs");
+        let value = get_json(client, url).await?;
         let logs = value["logs"].as_str().unwrap_or("");
-        let lines: Vec<&str> = logs.lines().collect();
-        for line in lines.iter().skip(seen_lines) {
+        for line in logs.lines() {
             println!("{line}");
         }
-        seen_lines = lines.len();
-
-        if !follow {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        return Ok(());
     }
+
+    let url = format!("{base}/api/v1/environments/{env_id}/logs/stream");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("request failed with status {}", response.status()));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find("\n\n") {
+            let frame: String = buf.drain(..pos + 2).collect();
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    println!("{}", data.trim_start());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_ps(client: &Client, base: &str) -> Result<(), String> {

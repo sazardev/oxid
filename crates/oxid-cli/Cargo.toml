@@ -19,3 +19,4 @@ clap = { version = "4.5", features = ["derive"] }
 reqwest.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+futures-util.workspace = true
