@@ -1,0 +1,53 @@
+# cargo-deny configuration — supply-chain guardrails.
+# Run locally with `cargo deny check`; enforced in CI on every push/PR.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail the build on known security vulnerabilities (RustSec advisory DB) and
+# yanked crates. Unmaintained crates are a warning, not a hard failure — an
+# unmaintained-but-secure dependency shouldn't block a release by itself.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses compatible with Oxid's own 0BSD license. Anything
+# outside this list (e.g. copyleft) fails the check rather than silently
+# entering the dependency tree.
+allow = [
+    "0BSD",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions of a crate are common in a large dependency graph and
+# usually harmless — warn instead of blocking, to stay out of the way.
+multiple-versions = "warn"
+wildcards = "deny"
+# oxid-core is a workspace path dependency, not an external crate pulled in
+# without a version bound — the thing `wildcards` is meant to catch.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+# Only crates.io by default — a git/path dependency is a supply-chain risk
+# that should be a deliberate, reviewed exception, not an accident.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -6,6 +6,7 @@
   <p><strong>Ephemeral environments that breathe. Ferrous performance, invisible footprint.</strong></p>
 
   <p>
+    <a href="https://github.com/sazardev/oxid/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sazardev/oxid/actions/workflows/ci.yml/badge.svg"></a>
     <a href="LICENSE"><img alt="License: 0BSD" src="https://img.shields.io/badge/license-0BSD-DE5236.svg"></a>
     <img alt="Rust edition 2024" src="https://img.shields.io/badge/rust-edition%202024-DE5236.svg">
     <img alt="Status: alpha" src="https://img.shields.io/badge/status-alpha-262626.svg">
@@ -88,6 +89,10 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 cargo fmt --check
 ```
+
+Building the workspace also wires up git hooks that run these (plus a
+security/dependency audit) automatically on commit/push — see
+[Guardrails](CONTRIBUTING.md#guardrails) in `CONTRIBUTING.md`.
 
 ## Contributing
 

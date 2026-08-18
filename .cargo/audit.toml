@@ -1,0 +1,20 @@
+# cargo-audit configuration. Run with `cargo audit`; enforced in CI.
+#
+# https://docs.rs/cargo-audit/latest/cargo_audit/config/index.html
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa crate, Marvin timing side-channel): pulled in
+    # transitively via `sqlx-mysql`, an *optional* dependency of the `sqlx`
+    # crate that Cargo.lock lists unconditionally regardless of whether it's
+    # actually activated (verified: `cargo tree -i sqlx-mysql` and
+    # `cargo tree -i rsa` both resolve to nothing — neither is part of the
+    # graph that actually gets compiled). We only enable the `sqlite` sqlx
+    # feature with `default-features = false` (see workspace Cargo.toml);
+    # the `mysql` feature that would pull `sqlx-mysql`/`rsa` in for real is
+    # never requested anywhere in this workspace. No fix is available
+    # upstream for `rsa` itself. Re-check with `cargo audit` on every sqlx
+    # bump in case a future sqlx release stops listing unused optional deps
+    # in the lockfile, at which point this ignore becomes unnecessary.
+    "RUSTSEC-2023-0071",
+]

@@ -42,6 +42,46 @@ cargo clippy --workspace --all-targets   # warnings on clippy::all + pedantic ar
 cargo test --workspace
 ```
 
+The git hooks below run these for you automatically — see [Guardrails](#guardrails).
+
+## Guardrails
+
+Cloning and building the repo wires up local git hooks automatically: the
+first `cargo build`/`test`/`check` sets `core.hooksPath` to the tracked
+`.githooks/` directory (see `crates/oxid-core/build.rs` — it only ever
+touches your **local**, per-repo git config, never anything global, and only
+if you haven't already customized `core.hooksPath` yourself).
+
+| Stage | Hook | Checks | Speed |
+|---|---|---|---|
+| `git commit` | [`.githooks/pre-commit`](.githooks/pre-commit) | `cargo fmt --check`, merge-conflict markers, staged secrets (`gitleaks protect --staged`, or a small built-in pattern scan if gitleaks isn't installed), oversized files, `cargo check --workspace` (only if Rust files changed) | Fast — no clippy, no test suite |
+| `git push` | [`.githooks/pre-push`](.githooks/pre-push) | All of the above plus `cargo clippy -D warnings`, `cargo test --workspace`, the `oxid-core` hexagonal-boundary check, `cargo audit`, `cargo deny check`, and a `gitleaks` scan of the commits being pushed | Thorough — this is the last local gate before code leaves your machine |
+| Every push/PR | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Same checks as `pre-push`, plus `gitleaks-action` over full history | Authoritative — hooks can be skipped with `--no-verify`, CI can't |
+
+For full local coverage, install the two optional scanners the hooks call
+out to automatically when present:
+
+```bash
+cargo install cargo-audit --locked   # RustSec advisory DB scan
+cargo install cargo-deny --locked    # license / duplicate-dep / supply-chain checks
+# gitleaks: https://github.com/gitleaks/gitleaks#installing
+```
+
+Without them, `pre-push` prints a warning and skips that specific check
+locally — CI always runs the full set regardless, so nothing actually slips
+through to `main` unnoticed.
+
+`cargo-deny`'s policy lives in [`deny.toml`](deny.toml) (0BSD-compatible
+license allowlist, deny on wildcard/unknown-registry dependencies, warn on
+duplicate versions). `cargo-audit`'s policy lives in
+[`.cargo/audit.toml`](.cargo/audit.toml) — any ignored advisory there is
+accompanied by a comment explaining exactly why it's a false positive or has
+no available fix.
+
+In a real emergency, hooks can be bypassed with `--no-verify` — CI will still
+catch anything that matters before it can be merged, so treat bypassing as
+"defer the check," not "skip the check."
+
 ## Architecture rules
 
 Oxid follows hexagonal architecture (ports & adapters) — see `SPEC.md` §2 and
