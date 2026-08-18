@@ -119,9 +119,12 @@ code {
   border-color: var(--orange);
 }
 
-.nav-cta {
+.primary-nav a.nav-cta {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
   border: 1px solid var(--border);
-  padding: 0.4rem 0.75rem;
+  padding: 0.6rem 0.75rem;
   border-radius: 2px;
   font-family: var(--font-mono);
 }
