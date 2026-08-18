@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Oxid logo mark (monochrome)">
+  <title>Oxid</title>
+  <!-- Recolor by setting `color` on this <svg> (or a parent) — uses currentColor. -->
+  <path
+    d="M37.5,21.03 L15,60 L37.5,98.97 L82.5,98.97 L105,60 L82.5,21.03"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="9"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

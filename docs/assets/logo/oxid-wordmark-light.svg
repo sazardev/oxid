@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 120" width="340" height="120" role="img" aria-label="Oxid">
+  <title>Oxid</title>
+  <!-- For light backgrounds (e.g. GitHub README on light theme). -->
+  <g transform="translate(10,15) scale(0.75)">
+    <path
+      d="M37.5,21.03 L15,60 L37.5,98.97 L82.5,98.97 L105,60 L82.5,21.03"
+      fill="none"
+      stroke="#DE5236"
+      stroke-width="9"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </g>
+  <text
+    x="125"
+    y="82"
+    font-family="Fira Sans, ui-sans-serif, system-ui, sans-serif"
+    font-weight="700"
+    font-size="60"
+    letter-spacing="-1"
+    fill="#121212"
+  >oxid</text>
+</svg>
