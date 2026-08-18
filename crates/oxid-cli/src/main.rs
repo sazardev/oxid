@@ -1,7 +1,11 @@
 //! Oxid command-line interface.
 //!
 //! Thin client over the daemon's HTTP API (SPEC.md §5.1). Point it at a running
-//! daemon with `OXID_API` (default `http://127.0.0.1:8080`).
+//! daemon with `OXID_API` (default `http://127.0.0.1:8080`), or override
+//! per-invocation with `--api`.
+
+use std::io::Write as _;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use reqwest::Client;
@@ -11,6 +15,9 @@ use serde_json::{Value, json};
 #[derive(Debug, Parser)]
 #[command(name = "oxid", version, about, long_about = None)]
 struct Cli {
+    /// Daemon base URL. Overrides `OXID_API` when set.
+    #[arg(long, global = true)]
+    api: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -22,6 +29,26 @@ enum Command {
         /// Branch to deploy.
         branch: String,
     },
+    /// List environments for the project in the current directory.
+    Status,
+    /// Destroy a branch's environment permanently.
+    Down {
+        /// Branch whose environment to destroy.
+        branch: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Suspend a branch's environment (scale-to-zero).
+    Pause {
+        /// Branch to pause.
+        branch: String,
+    },
+    /// Wake a suspended branch environment.
+    Wake {
+        /// Branch to wake.
+        branch: String,
+    },
     /// List registered projects.
     Ps,
     /// Manage environment variables / secrets.
@@ -29,11 +56,11 @@ enum Command {
         #[command(subcommand)]
         action: EnvAction,
     },
-    /// Stream logs of a branch environment.
+    /// Show logs of a branch environment.
     Logs {
-        /// Branch whose logs to follow.
+        /// Branch whose logs to show.
         branch: String,
-        /// Follow output as it is written.
+        /// Poll for new output as it is written (not true streaming).
         #[arg(long, short)]
         follow: bool,
     },
@@ -91,6 +118,7 @@ const GREEN: &str = "\x1b[32m";
 const GRAY: &str = "\x1b[90m";
 const ORANGE: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
+const DIM_ITALIC: &str = "\x1b[3;90m";
 const RESET: &str = "\x1b[0m";
 
 fn ok(msg: impl std::fmt::Display) {
@@ -109,8 +137,23 @@ fn error(msg: impl std::fmt::Display) {
     eprintln!("{RED}[!]{RESET} {msg}");
 }
 
-fn api_base() -> String {
-    std::env::var("OXID_API").unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
+/// Colors a lifecycle state per DESIGN.md §3.1 (Running green, Building
+/// orange, Paused/Hibernating dim-italic "asleep" look).
+fn colored_state(state: &str) -> String {
+    match state {
+        "running" => format!("{GREEN}{state}{RESET}"),
+        "building" => format!("{ORANGE}{state}{RESET}"),
+        "paused" | "hibernating" => format!("{DIM_ITALIC}{state}{RESET}"),
+        "destroyed" => format!("{RED}{state}{RESET}"),
+        other => other.to_owned(),
+    }
+}
+
+fn api_base(cli_flag: Option<&str>) -> String {
+    cli_flag
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OXID_API").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
 }
 
 fn report_error(body: &str, status: reqwest::StatusCode) {
@@ -125,10 +168,14 @@ fn report_error(body: &str, status: reqwest::StatusCode) {
 async fn main() {
     let cli = Cli::parse();
     let client = Client::new();
-    let base = api_base();
+    let base = api_base(cli.api.as_deref());
 
     let result = match cli.command {
         Command::Up { branch } => cmd_up(&client, &base, &branch).await,
+        Command::Status => cmd_status(&client, &base).await,
+        Command::Down { branch, force } => cmd_down(&client, &base, &branch, force).await,
+        Command::Pause { branch } => cmd_pause(&client, &base, &branch).await,
+        Command::Wake { branch } => cmd_wake(&client, &base, &branch).await,
         Command::Ps => cmd_ps(&client, &base).await,
         Command::Env { action } => match action {
             EnvAction::Set {
@@ -136,7 +183,17 @@ async fn main() {
                 scope,
                 project,
                 branch,
-            } => cmd_env_set(&client, &base, &assignment, &scope, project, branch.as_deref()).await,
+            } => {
+                cmd_env_set(
+                    &client,
+                    &base,
+                    &assignment,
+                    &scope,
+                    project,
+                    branch.as_deref(),
+                )
+                .await
+            }
             EnvAction::List {
                 scope,
                 project,
@@ -149,11 +206,7 @@ async fn main() {
                 branch,
             } => cmd_env_delete(&client, &base, &name, &scope, project, branch.as_deref()).await,
         },
-        Command::Logs { branch, follow } => {
-            let follow = if follow { " -f" } else { "" };
-            println!("[>] oxid logs {branch}{follow} (not implemented yet)");
-            Ok(())
-        }
+        Command::Logs { branch, follow } => cmd_logs(&client, &base, &branch, follow).await,
     };
 
     if let Err(message) = result {
@@ -167,8 +220,7 @@ async fn main() {
 /// Idempotent on the daemon side: repeated registrations return the existing
 /// project.
 async fn register_project(client: &Client, base: &str) -> Result<Value, String> {
-    let repo_dir =
-        std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
+    let repo_dir = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
     let response = client
         .post(format!("{base}/api/v1/projects"))
         .json(&json!({ "repo_dir": repo_dir.display().to_string() }))
@@ -189,17 +241,66 @@ async fn register_project(client: &Client, base: &str) -> Result<Value, String> 
     Ok(project)
 }
 
+async fn get_json(client: &Client, url: String) -> Result<Value, String> {
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach daemon at {url}: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        report_error(&body, status);
+        return Err("request failed".to_owned());
+    }
+    serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))
+}
+
+/// Registers the project for `cwd`, then resolves `branch` to its single
+/// running environment. Fails with a hint to `oxid status` when the branch
+/// has no environment.
+async fn resolve_environment(
+    client: &Client,
+    base: &str,
+    branch: &str,
+) -> Result<(u64, Value), String> {
+    let project = register_project(client, base).await?;
+    let project_id = project["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing project id".to_owned())?;
+    let envs = get_json(
+        client,
+        format!("{base}/api/v1/projects/{project_id}/environments?branch={branch}"),
+    )
+    .await?;
+    let envs = envs
+        .as_array()
+        .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
+    let env = envs.first().ok_or_else(|| {
+        format!("no environment found for branch `{branch}`; run `oxid status` to see what's live")
+    })?;
+    let env_id = env["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing environment id".to_owned())?;
+    Ok((env_id, env.clone()))
+}
+
 async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), String> {
     action(format!("oxid up {branch}"));
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
         .ok_or_else(|| "daemon response missing project id".to_owned())?;
+    ok("Parsed oxid.toml successfully");
     ok(format!(
         "Project `{}` registered (id {project_id})",
         project["name"]
     ));
 
+    action(format!("Building image for {branch}..."));
     let response = client
         .post(format!("{base}/api/v1/projects/{project_id}/deploy"))
         .json(&json!({ "branch": branch }))
@@ -220,6 +321,131 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), String>
     let url = env["url"].as_str().unwrap_or("?");
     ok(format!("Environment live at: {url}"));
     Ok(())
+}
+
+async fn cmd_status(client: &Client, base: &str) -> Result<(), String> {
+    let project = register_project(client, base).await?;
+    let project_id = project["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing project id".to_owned())?;
+    let envs = get_json(
+        client,
+        format!("{base}/api/v1/projects/{project_id}/environments"),
+    )
+    .await?;
+    let envs = envs
+        .as_array()
+        .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
+    if envs.is_empty() {
+        bg(format!(
+            "No environments for `{}` yet. Deploy one with `oxid up <branch>`.",
+            project["name"]
+        ));
+        return Ok(());
+    }
+    println!("{:<24} {:<24} URL", "BRANCH", "STATE");
+    for env in envs {
+        let branch = env["branch"]["name"].as_str().unwrap_or("?");
+        let state = env["state"].as_str().unwrap_or("?");
+        let url = env["url"].as_str().unwrap_or("?");
+        println!("{:<24} {:<33} {}", branch, colored_state(state), url);
+    }
+    Ok(())
+}
+
+async fn cmd_down(client: &Client, base: &str, branch: &str, force: bool) -> Result<(), String> {
+    let (env_id, _) = resolve_environment(client, base, branch).await?;
+    if !force
+        && !confirm(&format!(
+            "This will permanently destroy `{branch}` and its container. Continue? [y/N] "
+        ))
+    {
+        bg("Aborted (re-run with --force to skip this prompt).");
+        return Ok(());
+    }
+    let response = client
+        .delete(format!("{base}/api/v1/environments/{env_id}"))
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        report_error(&body, status);
+        return Err("destroying environment failed".to_owned());
+    }
+    ok(format!("Environment `{branch}` destroyed"));
+    Ok(())
+}
+
+/// Prompts for a `y`/`N` confirmation on stdin.
+fn confirm(prompt: &str) -> bool {
+    print!("{ORANGE}[>]{RESET} {prompt}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+async fn cmd_pause(client: &Client, base: &str, branch: &str) -> Result<(), String> {
+    let (env_id, _) = resolve_environment(client, base, branch).await?;
+    post_empty(client, format!("{base}/api/v1/environments/{env_id}/pause")).await?;
+    bg(format!("Environment `{branch}` paused"));
+    Ok(())
+}
+
+async fn cmd_wake(client: &Client, base: &str, branch: &str) -> Result<(), String> {
+    let (env_id, _) = resolve_environment(client, base, branch).await?;
+    post_empty(client, format!("{base}/api/v1/environments/{env_id}/wake")).await?;
+    ok(format!("Environment `{branch}` woken"));
+    Ok(())
+}
+
+async fn post_empty(client: &Client, url: String) -> Result<(), String> {
+    let response = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach daemon at {url}: {e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        report_error(&body, status);
+        return Err("request failed".to_owned());
+    }
+    Ok(())
+}
+
+/// Fetches an environment's logs; with `follow`, polls every 2s and prints
+/// only newly-appeared trailing lines. This is poll-based, not a true SSE
+/// stream — the daemon only exposes a snapshot `logs` endpoint today.
+async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Result<(), String> {
+    let (env_id, _) = resolve_environment(client, base, branch).await?;
+    let url = format!("{base}/api/v1/environments/{env_id}/logs");
+
+    let mut seen_lines = 0usize;
+    loop {
+        let value = get_json(client, url.clone()).await?;
+        let logs = value["logs"].as_str().unwrap_or("");
+        let lines: Vec<&str> = logs.lines().collect();
+        for line in lines.iter().skip(seen_lines) {
+            println!("{line}");
+        }
+        seen_lines = lines.len();
+
+        if !follow {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 async fn cmd_ps(client: &Client, base: &str) -> Result<(), String> {
@@ -283,8 +509,14 @@ fn scope_context(
     }
 }
 
-async fn ensure_project_id(client: &Client, base: &str, project: Option<u64>) -> Result<u64, String> {
-    if let Some(id) = project { Ok(id) } else {
+async fn ensure_project_id(
+    client: &Client,
+    base: &str,
+    project: Option<u64>,
+) -> Result<u64, String> {
+    if let Some(id) = project {
+        Ok(id)
+    } else {
         let project = register_project(client, base).await?;
         project["id"]
             .as_u64()
@@ -364,7 +596,9 @@ async fn cmd_env_list(
     let (project_id, branch) = scope_context(scope, project, branch)?;
     let project_id = ensure_project_id(client, base, project_id).await?;
 
-    let url = if scope == "global" { format!("{base}/api/v1/secrets") } else {
+    let url = if scope == "global" {
+        format!("{base}/api/v1/secrets")
+    } else {
         let branch_qs = branch
             .as_ref()
             .map(|b| format!("?branch={b}"))
@@ -385,7 +619,8 @@ async fn cmd_env_list(
         report_error(&body, status);
         return Err("listing secrets failed".to_owned());
     }
-    let value: Value = serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     let secrets = value["secrets"].as_array().cloned().unwrap_or_default();
     if secrets.is_empty() {
         bg("No secrets in this scope.");
@@ -464,6 +699,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_status_command() {
+        let cli = Cli::try_parse_from(["oxid", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn parses_down_with_force() {
+        let cli = Cli::try_parse_from(["oxid", "down", "feature-a", "--force"]).unwrap();
+        match cli.command {
+            Command::Down { branch, force } => {
+                assert_eq!(branch, "feature-a");
+                assert!(force);
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_down_without_force() {
+        let cli = Cli::try_parse_from(["oxid", "down", "feature-a"]).unwrap();
+        match cli.command {
+            Command::Down { force, .. } => assert!(!force),
+            other => panic!("expected Down, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pause_and_wake() {
+        let cli = Cli::try_parse_from(["oxid", "pause", "feature-a"]).unwrap();
+        assert!(matches!(cli.command, Command::Pause { branch } if branch == "feature-a"));
+        let cli = Cli::try_parse_from(["oxid", "wake", "feature-a"]).unwrap();
+        assert!(matches!(cli.command, Command::Wake { branch } if branch == "feature-a"));
+    }
+
+    #[test]
+    fn parses_global_api_flag() {
+        let cli = Cli::try_parse_from(["oxid", "--api", "http://example.com", "ps"]).unwrap();
+        assert_eq!(cli.api.as_deref(), Some("http://example.com"));
+
+        let cli = Cli::try_parse_from(["oxid", "ps", "--api", "http://example.com"]).unwrap();
+        assert_eq!(cli.api.as_deref(), Some("http://example.com"));
+    }
+
+    #[test]
+    fn api_base_prefers_flag_over_env() {
+        assert_eq!(api_base(Some("http://flag:1")), "http://flag:1".to_owned());
+    }
+
+    #[test]
     fn parses_logs_with_follow() {
         let cli = Cli::try_parse_from(["oxid", "logs", "feature-a", "-f"]).unwrap();
         match cli.command {
@@ -478,10 +762,17 @@ mod tests {
     #[test]
     fn parses_env_set() {
         let cli =
-            Cli::try_parse_from(["oxid", "env", "set", "DB_PASSWORD=x", "--scope", "project"]).unwrap();
+            Cli::try_parse_from(["oxid", "env", "set", "DB_PASSWORD=x", "--scope", "project"])
+                .unwrap();
         match cli.command {
             Command::Env {
-                action: EnvAction::Set { assignment, scope, project, branch },
+                action:
+                    EnvAction::Set {
+                        assignment,
+                        scope,
+                        project,
+                        branch,
+                    },
             } => {
                 assert_eq!(assignment, "DB_PASSWORD=x");
                 assert_eq!(scope, "project");
@@ -495,12 +786,26 @@ mod tests {
     #[test]
     fn parses_env_list_with_branch_scope() {
         let cli = Cli::try_parse_from([
-            "oxid", "env", "list", "--scope", "branch", "--branch", "feat-a", "--project", "3",
+            "oxid",
+            "env",
+            "list",
+            "--scope",
+            "branch",
+            "--branch",
+            "feat-a",
+            "--project",
+            "3",
         ])
         .unwrap();
         match cli.command {
             Command::Env {
-                action: EnvAction::List { scope, branch, project, .. },
+                action:
+                    EnvAction::List {
+                        scope,
+                        branch,
+                        project,
+                        ..
+                    },
             } => {
                 assert_eq!(scope, "branch");
                 assert_eq!(branch.as_deref(), Some("feat-a"));

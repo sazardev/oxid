@@ -271,10 +271,19 @@ pub struct ContainerSpec {
     pub env: BTreeMap<String, String>,
     /// Port the container listens on internally.
     pub container_port: u16,
-    /// Port to publish on the host.
+    /// Port to publish on the host. Ignored when `network` is set, since
+    /// Traefik reaches the container directly over the shared docker
+    /// network instead of a published host port.
     pub host_port: u16,
-    /// Labels used for routing/inventory (e.g. `oxid.project`).
+    /// Labels used for routing/inventory (e.g. `oxid.project`), including
+    /// the Traefik router/service/middleware labels when `network` is set.
     pub labels: BTreeMap<String, String>,
+    /// Docker network shared with Traefik and the daemon
+    /// (`OXID_DOCKER_NETWORK`). When set, the container is attached to it
+    /// and no host port is published (SPEC.md §3.2). When `None`, the
+    /// container publishes `host_port` for direct local access instead —
+    /// the fallback used when no Traefik instance is configured.
+    pub network: Option<String>,
 }
 
 /// Container orchestration contract backed by the Docker socket.
@@ -290,6 +299,14 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::Failure`] on failure.
     async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError>;
+    /// Starts an existing, stopped container (`docker start`). Distinct from
+    /// [`ContainerPort::run`], which creates a new container from a spec;
+    /// this is used to wake a `Hibernating` environment whose container was
+    /// `stop`ped (not `pause`d) and therefore still exists.
+    ///
+    /// # Errors
+    /// [`OciError::NotFound`] if the container does not exist.
+    async fn start(&self, name: &str) -> Result<(), OciError>;
     /// Suspends a running container (`docker pause`).
     ///
     /// # Errors

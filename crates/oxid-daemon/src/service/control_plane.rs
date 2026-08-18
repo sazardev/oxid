@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
-use oxid_core::services::var_resolution::{set_secret, VarSources};
+use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
     DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore,
@@ -63,10 +63,22 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     git: G,
     oci: O,
     cache_dir: PathBuf,
+    /// Docker network shared with Traefik and this daemon. `None` (the
+    /// default) falls back to publishing `host_port` directly, which is
+    /// only safe with a single environment per project at a time.
+    docker_network: Option<String>,
+    /// Base URL this daemon is reachable at from inside `docker_network`,
+    /// used to build the Traefik `errors`/`forwardAuth` middleware labels
+    /// (e.g. `http://oxid-daemon:8080`).
+    daemon_url: String,
 }
 
+const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
+
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
-    /// Creates a control plane bound to a store, git client and docker client.
+    /// Creates a control plane bound to a store, git client and docker
+    /// client. Traefik integration is disabled until
+    /// [`ControlPlane::with_traefik`] is called.
     #[must_use]
     pub fn new(store: SqliteStore, git: G, oci: O, cache_dir: PathBuf) -> Self {
         Self {
@@ -74,7 +86,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             git,
             oci,
             cache_dir,
+            docker_network: None,
+            daemon_url: DEFAULT_DAEMON_URL.to_owned(),
         }
+    }
+
+    /// Enables Traefik routing: deployed containers join `network` (no host
+    /// port is published) and carry labels pointing Traefik's `errors` and
+    /// `forwardAuth` middlewares at `daemon_url` (SPEC.md §3.2).
+    #[must_use]
+    pub fn with_traefik(
+        mut self,
+        network: impl Into<String>,
+        daemon_url: impl Into<String>,
+    ) -> Self {
+        self.docker_network = Some(network.into());
+        self.daemon_url = daemon_url.into();
+        self
     }
 
     /// Registers the project declared by `oxid.toml` in `repo_dir`.
@@ -169,8 +197,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // 4. Resolve the effective environment: Global -> Project -> Branch
         //    secrets plus orchestrator runtime variables (SPEC.md §2.1/§4.4).
         let mut sources = VarSources::default();
-        let secrets = SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch))
-            .await?;
+        let secrets =
+            SecretStore::secrets_for(&self.store, Some(project.id), Some(&branch)).await?;
         for (name, scope, value) in secrets.iter() {
             set_secret(&mut sources, name, scope, value.as_str());
         }
@@ -194,17 +222,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
         // 5. Run the container.
         let name = container_name(&project, &branch);
+        let mut labels = BTreeMap::from([
+            ("oxid.project".to_owned(), project.name.clone()),
+            ("oxid.branch".to_owned(), branch.to_string()),
+            ("oxid.url".to_owned(), url.clone()),
+        ]);
+        labels.extend(self.traefik_labels(&name, &url, project.config.port));
         let spec = ContainerSpec {
             name: name.clone(),
             image,
             env: env_vars,
             container_port: project.config.port,
             host_port: project.config.port,
-            labels: BTreeMap::from([
-                ("oxid.project".to_owned(), project.name.clone()),
-                ("oxid.branch".to_owned(), branch.to_string()),
-                ("oxid.url".to_owned(), url),
-            ]),
+            labels,
+            network: self.docker_network.clone(),
         };
         self.oci.run(&spec).await?;
 
@@ -252,22 +283,115 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
     /// Wakes a suspended environment.
     ///
+    /// `Paused` containers are still alive in memory (`docker unpause`);
+    /// `Hibernating` ones were fully `stop`ped and must be `start`ed instead.
+    ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn wake(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
-        let mut env = self.ensure_environment(environment_id).await?;
+        let env = self.ensure_environment(environment_id).await?;
+        self.wake_env(env).await
+    }
+
+    /// Wakes the environment routed at `url` (matched against the `Host`
+    /// header Traefik forwards). Used by the wake-on-request endpoint
+    /// (SPEC.md §3.2). Returns `None` silently when no environment owns
+    /// `url`, since Traefik may forward hosts Oxid does not manage.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence or Docker failures.
+    pub async fn wake_by_url(&self, url: &str) -> Result<Option<Environment>, CpError> {
+        let Some(env) = self.store.find_by_url(url).await? else {
+            return Ok(None);
+        };
+        let id = env.id;
+        self.wake_env(env).await?;
+        Ok(EnvironmentStore::get(&self.store, id).await?)
+    }
+
+    /// Refreshes `last_accessed_at` for the environment routed at `url`
+    /// without changing its state. Backs the heartbeat endpoint a Traefik
+    /// `forwardAuth` middleware calls on every request to a `Running`
+    /// environment (SPEC.md §3.2 traffic monitor). No-ops silently when no
+    /// environment owns `url`.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence failures.
+    pub async fn touch_by_url(&self, url: &str) -> Result<(), CpError> {
+        let Some(mut env) = self.store.find_by_url(url).await? else {
+            return Ok(());
+        };
+        let now = OffsetDateTime::now_utc();
+        // Touching is best-effort bookkeeping; a Destroyed/terminal state
+        // simply can't be touched and that's fine to ignore.
+        let _ = env.touch(now);
+        self.store.update(&env).await?;
+        Ok(())
+    }
+
+    async fn wake_env(&self, mut env: Environment) -> Result<(), CpError> {
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
-        self.oci
-            .unpause(&container_name(&project, &env.branch.name))
-            .await?;
+        let name = container_name(&project, &env.branch.name);
+        match env.state {
+            EnvironmentState::Hibernating => self.oci.start(&name).await?,
+            _ => self.oci.unpause(&name).await?,
+        }
 
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
         self.store.update(&env).await?;
         Ok(())
+    }
+
+    /// Permanently destroys an environment (`oxid down`): stops and removes
+    /// its container, then transitions it to `Destroyed`.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on missing records or Docker failures.
+    pub async fn destroy(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+        let mut env = self.ensure_environment(environment_id).await?;
+        let project = ProjectStore::get(&self.store, env.project_id)
+            .await?
+            .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
+        let name = container_name(&project, &env.branch.name);
+        self.oci.stop(&name).await?;
+        self.oci.remove(&name).await?;
+
+        let now = OffsetDateTime::now_utc();
+        env.transition(StateTransition::Destroy, now)
+            .map_err(|e| state_err(&e))?;
+        self.store.update(&env).await?;
+        self.store
+            .record(&AuditEvent::new(
+                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                env.id,
+                StateTransition::Destroy,
+                None,
+                now,
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Finds the environment for `branch` within a project, if any.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn find_environment_by_branch(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+    ) -> Result<Option<Environment>, CpError> {
+        self.ensure_project(project_id).await?;
+        Ok(self
+            .store
+            .list_by_project(project_id)
+            .await?
+            .into_iter()
+            .find(|e| &e.branch.name == branch))
     }
 
     /// Returns the logs of an environment's container.
@@ -419,6 +543,59 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(())
     }
 
+    /// Builds the Traefik labels that route `url` to `name` on
+    /// `container_port`, plus the `forwardAuth` heartbeat middleware that
+    /// keeps `last_accessed_at` fresh while the environment is `Running`
+    /// (SPEC.md §3.2). Empty when Traefik integration is disabled
+    /// (`docker_network` unset), leaving `deploy` to fall back to publishing
+    /// `host_port` for direct local access.
+    ///
+    /// This only labels the environment's own container. Wiring the
+    /// wake-on-request side (Traefik's `errors` middleware) additionally
+    /// requires a globally-defined `oxid-wake` service pointing at this
+    /// daemon's `/api/v1/wake` — since that's shared across every branch of
+    /// every project, it belongs on the daemon's *own* container/compose
+    /// entry, not here. Add these labels there:
+    ///   traefik.http.services.oxid-wake.loadbalancer.server.port=8080
+    ///   traefik.http.middlewares.<router>-errors.errors.status=502-504
+    ///   traefik.http.middlewares.<router>-errors.errors.service=oxid-wake
+    ///   traefik.http.middlewares.<router>-errors.errors.query=/api/v1/wake
+    fn traefik_labels(
+        &self,
+        name: &str,
+        url: &str,
+        container_port: u16,
+    ) -> BTreeMap<String, String> {
+        let Some(network) = &self.docker_network else {
+            return BTreeMap::new();
+        };
+        let heartbeat = format!("{name}-heartbeat");
+        BTreeMap::from([
+            ("traefik.enable".to_owned(), "true".to_owned()),
+            ("traefik.docker.network".to_owned(), network.clone()),
+            (
+                format!("traefik.http.routers.{name}.rule"),
+                format!("Host(`{url}`)"),
+            ),
+            (
+                format!("traefik.http.routers.{name}.entrypoints"),
+                "web".to_owned(),
+            ),
+            (
+                format!("traefik.http.routers.{name}.middlewares"),
+                heartbeat.clone(),
+            ),
+            (
+                format!("traefik.http.services.{name}.loadbalancer.server.port"),
+                container_port.to_string(),
+            ),
+            (
+                format!("traefik.http.middlewares.{heartbeat}.forwardauth.address"),
+                format!("{}/api/v1/heartbeat", self.daemon_url),
+            ),
+        ])
+    }
+
     async fn find_project_by_repo(
         &self,
         repo_url: &RepoUrl,
@@ -521,6 +698,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("run:{}:env={:?}", spec.name, spec.env));
+            Ok(())
+        }
+        async fn start(&self, name: &str) -> Result<(), OciError> {
+            self.calls.lock().unwrap().push(format!("start:{name}"));
             Ok(())
         }
         async fn pause(&self, name: &str) -> Result<(), OciError> {
@@ -649,6 +830,133 @@ port = 8080
 
         let logs = cp.logs(env.id).await.unwrap();
         assert_eq!(logs, "build log");
+    }
+
+    #[tokio::test]
+    async fn destroy_stops_removes_and_transitions() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        cp.destroy(env.id).await.unwrap();
+        let destroyed = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(destroyed.state, EnvironmentState::Destroyed);
+
+        let calls = oci.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.starts_with("stop:")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn find_environment_by_branch_matches_and_misses() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        let found = cp
+            .find_environment_by_branch(project.id, &BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(found.unwrap().id, env.id);
+
+        let missing = cp
+            .find_environment_by_branch(project.id, &BranchName::parse("feature-b").unwrap())
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn wake_by_url_unpauses_paused_and_starts_hibernating() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        cp.pause(env.id).await.unwrap();
+        let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
+        assert_eq!(woken.state, EnvironmentState::Running);
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("unpause:")),
+            "{:?}",
+            oci.calls
+        );
+
+        // Force it to Hibernating directly (bypassing the multi-hour sweep
+        // needed to get there naturally) to test the `start` branch of wake.
+        let mut hibernating = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        hibernating
+            .transition(StateTransition::IdleTimeout, OffsetDateTime::now_utc())
+            .unwrap();
+        hibernating
+            .transition(StateTransition::DeepSleep, OffsetDateTime::now_utc())
+            .unwrap();
+        EnvironmentStore::update(&cp.store, &hibernating)
+            .await
+            .unwrap();
+
+        let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
+        assert_eq!(woken.state, EnvironmentState::Running);
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("start:")),
+            "{:?}",
+            oci.calls
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_by_url_unknown_host_is_none() {
+        let cp = cp(FakeOci::default()).await;
+        assert!(cp.wake_by_url("nobody.local.dev").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn touch_by_url_refreshes_last_access_and_ignores_unknown() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        cp.touch_by_url("nobody.local.dev").await.unwrap();
+
+        let before = env.last_accessed_at;
+        touch_env(&cp, env.clone(), before - time::Duration::hours(1)).await;
+        cp.touch_by_url(&env.url).await.unwrap();
+        let touched = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(touched.last_accessed_at > before - time::Duration::hours(1));
     }
 
     #[tokio::test]

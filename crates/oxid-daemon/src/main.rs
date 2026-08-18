@@ -8,6 +8,14 @@
 //!   When unset, a key is generated and persisted to `/data/secret.key`.
 //! - `OXID_WEBHOOK_SECRET` — shared secret verifying GitHub webhook signatures.
 //!   Webhooks are rejected while unset.
+//! - `OXID_DOCKER_NETWORK` — docker network shared with Traefik and this
+//!   daemon. When set, deployed containers join it and skip publishing a
+//!   host port (SPEC.md §3.2). Unset by default: containers publish
+//!   `[routing].port` directly, which only supports one live environment per
+//!   project at a time.
+//! - `OXID_DAEMON_URL` — this daemon's own address as reachable from inside
+//!   `OXID_DOCKER_NETWORK` (default `http://oxid-daemon:8080`), used to build
+//!   the Traefik `forwardAuth`/`errors` middleware labels.
 
 use std::path::PathBuf;
 
@@ -56,7 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteStore::open(db_path, cipher).await?;
     let git = GitClient::new();
     let oci = DockerClient::connect()?;
-    let cp = ControlPlane::new(store, git, oci, cache_dir);
+    let mut cp = ControlPlane::new(store, git, oci, cache_dir);
+    if let Ok(network) = std::env::var("OXID_DOCKER_NETWORK") {
+        let daemon_url = std::env::var("OXID_DAEMON_URL")
+            .unwrap_or_else(|_| "http://oxid-daemon:8080".to_owned());
+        cp = cp.with_traefik(network, daemon_url);
+    }
 
     tokio::spawn(oxid_daemon::service::scheduler::run(
         cp.clone(),

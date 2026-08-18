@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, LogsOptions, NetworkingConfig, RemoveContainerOptions,
+};
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::BuildImageOptions;
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::{EndpointSettings, HostConfig, PortBinding};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use oxid_core::{BuildSpec, ContainerPort, ContainerSpec, OciError};
@@ -78,14 +80,26 @@ impl ContainerPort for DockerClient {
         let mut exposed_ports = HashMap::new();
         exposed_ports.insert(format!("{}/tcp", spec.container_port), HashMap::new());
 
-        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-        port_bindings.insert(
-            format!("{}/tcp", spec.container_port),
-            Some(vec![PortBinding {
-                host_port: Some(spec.host_port.to_string()),
-                ..Default::default()
-            }]),
-        );
+        // When a Traefik network is configured, the container is reached
+        // directly over that network and no host port is published — two
+        // branches of the same project can then run concurrently. Without
+        // it, fall back to publishing `host_port` for direct local access.
+        let port_bindings = spec.network.is_none().then(|| {
+            let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+            bindings.insert(
+                format!("{}/tcp", spec.container_port),
+                Some(vec![PortBinding {
+                    host_port: Some(spec.host_port.to_string()),
+                    ..Default::default()
+                }]),
+            );
+            bindings
+        });
+
+        let networking_config: Option<NetworkingConfig<String>> =
+            spec.network.as_ref().map(|network| NetworkingConfig {
+                endpoints_config: HashMap::from([(network.clone(), EndpointSettings::default())]),
+            });
 
         let config = Config {
             image: Some(spec.image.clone()),
@@ -98,9 +112,10 @@ impl ContainerPort for DockerClient {
                     .collect(),
             ),
             host_config: Some(HostConfig {
-                port_bindings: Some(port_bindings),
+                port_bindings,
                 ..Default::default()
             }),
+            networking_config,
             ..Default::default()
         };
 
@@ -117,6 +132,13 @@ impl ContainerPort for DockerClient {
             .await
             .map_err(map_err)?;
         Ok(())
+    }
+
+    async fn start(&self, name: &str) -> Result<(), OciError> {
+        self.docker
+            .start_container::<String>(name, None)
+            .await
+            .map_err(map_err)
     }
 
     async fn pause(&self, name: &str) -> Result<(), OciError> {

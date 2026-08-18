@@ -8,8 +8,8 @@ use std::path::Path;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 
 /// Errors surfaced while encrypting or decrypting secrets.
 #[derive(Debug, thiserror::Error)]
@@ -50,17 +50,14 @@ impl Cipher {
     pub fn load_or_create(path: &Path) -> Result<Self, CryptoError> {
         if path.exists() {
             let raw = std::fs::read(path).map_err(|e| CryptoError::KeyFile(e.to_string()))?;
-            let key: [u8; 32] = raw
-                .try_into()
-                .map_err(|_| CryptoError::KeyFile(format!("`{}` is not a 32-byte key", path.display())))?;
+            let key: [u8; 32] = raw.try_into().map_err(|_| {
+                CryptoError::KeyFile(format!("`{}` is not a 32-byte key", path.display()))
+            })?;
             return Ok(Self { key });
         }
         let cipher = Self::generate();
-        std::fs::create_dir_all(
-            path.parent()
-                .unwrap_or_else(|| std::path::Path::new(".")),
-        )
-        .map_err(|e| CryptoError::KeyFile(e.to_string()))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+            .map_err(|e| CryptoError::KeyFile(e.to_string()))?;
         std::fs::write(path, cipher.key).map_err(|e| CryptoError::KeyFile(e.to_string()))?;
         Ok(cipher)
     }
@@ -100,7 +97,9 @@ impl Cipher {
             .map_err(|e| CryptoError::Operation(e.to_string()))?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|_| CryptoError::Operation("decryption failed (wrong master key?)".to_owned()))?;
+            .map_err(|_| {
+                CryptoError::Operation("decryption failed (wrong master key?)".to_owned())
+            })?;
         String::from_utf8(plaintext)
             .map_err(|e| CryptoError::Operation(format!("decrypted value is not UTF-8: {e}")))
     }

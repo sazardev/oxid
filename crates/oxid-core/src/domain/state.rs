@@ -38,13 +38,19 @@ impl EnvironmentState {
                 StateTransition::IdleTimeout,
                 StateTransition::Woken,
                 StateTransition::TtlExpired,
+                StateTransition::Destroy,
             ],
             Self::Paused => &[
                 StateTransition::Woken,
                 StateTransition::DeepSleep,
                 StateTransition::TtlExpired,
+                StateTransition::Destroy,
             ],
-            Self::Hibernating => &[StateTransition::Woken, StateTransition::TtlExpired],
+            Self::Hibernating => &[
+                StateTransition::Woken,
+                StateTransition::TtlExpired,
+                StateTransition::Destroy,
+            ],
             Self::Destroyed => &[],
         }
     }
@@ -66,6 +72,8 @@ pub enum StateTransition {
     DeepSleep,
     /// TTL (`destroy_after`) exceeded.
     TtlExpired,
+    /// User explicitly destroyed the environment (`oxid down`).
+    Destroy,
 }
 
 impl StateTransition {
@@ -73,7 +81,7 @@ impl StateTransition {
     #[must_use]
     pub fn target(self) -> EnvironmentState {
         match self {
-            Self::BuildFailed | Self::TtlExpired => EnvironmentState::Destroyed,
+            Self::BuildFailed | Self::TtlExpired | Self::Destroy => EnvironmentState::Destroyed,
             Self::IdleTimeout => EnvironmentState::Paused,
             Self::BuildSucceeded | Self::Woken => EnvironmentState::Running,
             Self::DeepSleep => EnvironmentState::Hibernating,
@@ -162,6 +170,7 @@ impl fmt::Display for StateTransition {
             Self::Woken => "woken",
             Self::DeepSleep => "deep_sleep",
             Self::TtlExpired => "ttl_expired",
+            Self::Destroy => "destroy",
         };
         f.write_str(s)
     }
@@ -178,6 +187,7 @@ impl FromStr for StateTransition {
             "woken" => Ok(Self::Woken),
             "deep_sleep" => Ok(Self::DeepSleep),
             "ttl_expired" => Ok(Self::TtlExpired),
+            "destroy" => Ok(Self::Destroy),
             _ => crate::domain::error::invalid(format!("unknown state transition `{s}`")),
         }
     }
@@ -224,6 +234,7 @@ mod tests {
             StateTransition::DeepSleep,
             StateTransition::TtlExpired,
             StateTransition::BuildFailed,
+            StateTransition::Destroy,
         ] {
             let err = TransitionTable::apply(EnvironmentState::Destroyed, transition).unwrap_err();
             assert!(

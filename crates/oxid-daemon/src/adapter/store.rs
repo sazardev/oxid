@@ -13,8 +13,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
-    AuditEvent, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError, Environment,
-    EnvironmentId, EnvironmentState, EnvironmentStore, EnvVarScope, OffsetDateTime, Project,
+    AuditEvent, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError, EnvVarScope,
+    Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime, Project,
     ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext, SecretStore,
     SecretValue, StateTransition, Ttl,
 };
@@ -92,6 +92,24 @@ impl SqliteStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(env_from_row).collect()
+    }
+
+    /// Finds the environment routed at `url`, if any.
+    ///
+    /// Backs the wake-on-request and heartbeat endpoints, which only know
+    /// the `Host` header Traefik forwards, not an environment id.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn find_by_url(&self, url: &str) -> Result<Option<Environment>, RepositoryError> {
+        let row = sqlx::query(&format!(
+            "SELECT {ENV_COLUMNS} FROM environments WHERE url = ?"
+        ))
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(env_from_row).transpose()
     }
 }
 
@@ -578,9 +596,7 @@ impl SecretStore for SqliteStore {
         for row in rows {
             let name: String = row.try_get("name").map_err(storage)?;
             let scope: String = row.try_get("scope").map_err(storage)?;
-            let scope = scope
-                .parse::<EnvVarScope>()
-                .map_err(storage)?;
+            let scope = scope.parse::<EnvVarScope>().map_err(storage)?;
             let value_enc: String = row.try_get("value_enc").map_err(storage)?;
             let value = self.cipher.decrypt(&value_enc).map_err(storage)?;
             ctx.set(name, scope, SecretValue::new(value));
@@ -609,9 +625,7 @@ impl SecretStore for SqliteStore {
             .map(|row| {
                 let name: String = row.try_get("name").map_err(storage)?;
                 let scope: String = row.try_get("scope").map_err(storage)?;
-                let scope = scope
-                    .parse::<EnvVarScope>()
-                    .map_err(storage)?;
+                let scope = scope.parse::<EnvVarScope>().map_err(storage)?;
                 Ok((name, scope))
             })
             .collect()
@@ -625,15 +639,14 @@ impl SecretStore for SqliteStore {
     ) -> Result<(), RepositoryError> {
         let project_bind = project_id.map(|id| id_as_i64(id.0));
         let branch_bind = branch.map(oxid_core::BranchName::as_str);
-        let res = sqlx::query(
-            "DELETE FROM secrets WHERE project_id IS ? AND branch IS ? AND name = ?",
-        )
-        .bind(project_bind)
-        .bind(branch_bind)
-        .bind(name)
-        .execute(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let res =
+            sqlx::query("DELETE FROM secrets WHERE project_id IS ? AND branch IS ? AND name = ?")
+                .bind(project_bind)
+                .bind(branch_bind)
+                .bind(name)
+                .execute(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         if res.rows_affected() == 0 {
             return Err(RepositoryError::NotFound(format!(
                 "secret `{name}` does not exist in this scope"

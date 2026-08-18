@@ -47,7 +47,11 @@ pub fn router<
         )
         .route("/api/v1/projects/{id}/environments", get(list_environments))
         .route("/api/v1/projects/{id}/deploy", post(deploy))
-        .route("/api/v1/secrets", get(list_global_secrets).post(set_global_secret))
+        .route("/api/v1/environments/{env_id}", delete(destroy))
+        .route(
+            "/api/v1/secrets",
+            get(list_global_secrets).post(set_global_secret),
+        )
         .route("/api/v1/secrets/{name}", delete(delete_global_secret))
         .route(
             "/api/v1/projects/{id}/secrets",
@@ -60,6 +64,11 @@ pub fn router<
         .route("/api/v1/environments/{env_id}/pause", post(pause))
         .route("/api/v1/environments/{env_id}/wake", post(wake))
         .route("/api/v1/environments/{env_id}/logs", get(logs))
+        .route("/api/v1/wake", post(wake_by_host))
+        .route(
+            "/api/v1/heartbeat",
+            get(heartbeat_by_host).post(heartbeat_by_host),
+        )
         .route("/api/v1/webhooks/github", post(github_webhook))
         .with_state(state)
 }
@@ -80,6 +89,13 @@ pub struct RegisterBody {
 pub struct DeployBody {
     /// Branch to deploy.
     pub branch: String,
+}
+
+/// Query for `GET /api/v1/projects/{id}/environments`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListEnvironmentsQuery {
+    /// When set, only the environment for this branch is returned.
+    pub branch: Option<String>,
 }
 
 /// Body for `POST /api/v1/secrets` and `POST /api/v1/projects/{id}/secrets`.
@@ -196,8 +212,19 @@ async fn list_environments<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    Query(query): Query<ListEnvironmentsQuery>,
 ) -> ApiResult<Json<Vec<Environment>>> {
-    Ok(Json(state.cp.list_environments(ProjectId(id)).await?))
+    let envs = state.cp.list_environments(ProjectId(id)).await?;
+    let envs = match query.branch {
+        Some(raw) => {
+            let branch = parse_branch(&raw)?;
+            envs.into_iter()
+                .filter(|e| e.branch.name == branch)
+                .collect()
+        }
+        None => envs,
+    };
+    Ok(Json(envs))
 }
 
 async fn deploy<
@@ -244,6 +271,84 @@ async fn logs<
 ) -> ApiResult<Json<Value>> {
     let logs = state.cp.logs(EnvironmentId(env_id)).await?;
     Ok(Json(json!({ "logs": logs })))
+}
+
+async fn destroy<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(env_id): Path<u64>,
+) -> ApiResult<StatusCode> {
+    state.cp.destroy(EnvironmentId(env_id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Extracts the routed host from a request, preferring `X-Forwarded-Host`
+/// (set by Traefik) and falling back to `Host`, stripping any port suffix.
+fn routed_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|v| v.to_str().ok())?;
+    Some(raw.split(':').next().unwrap_or(raw).to_owned())
+}
+
+/// Wake-on-request endpoint (SPEC.md §3.2): Traefik's `errors` middleware
+/// forwards the original request here (preserving `Host`) when the target
+/// container is paused/hibernating and the proxy gets a connection error.
+/// Unpauses/starts the environment and returns a small page that reloads.
+async fn wake_by_host<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let Some(host) = routed_host(&headers) else {
+        return Ok((StatusCode::BAD_REQUEST, "missing Host header").into_response());
+    };
+    let env = state.cp.wake_by_url(&host).await?;
+    let branch = env
+        .as_ref()
+        .map_or_else(|| host.clone(), |e| e.branch.name.to_string());
+    Ok((
+        StatusCode::OK,
+        axum::response::Html(wake_page_html(&branch)),
+    )
+        .into_response())
+}
+
+/// Heartbeat endpoint (SPEC.md §3.2 traffic monitor): wired as a Traefik
+/// `forwardAuth` middleware on every router, it refreshes `last_accessed_at`
+/// on each request to a live environment. Always `200 OK` so it never blocks
+/// traffic, even for hosts Oxid does not manage.
+async fn heartbeat_by_host<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    if let Some(host) = routed_host(&headers) {
+        state.cp.touch_by_url(&host).await?;
+    }
+    Ok(StatusCode::OK)
+}
+
+/// Small dark-themed page shown while an environment wakes up
+/// (DESIGN.md §1 palette, §3.1 "Paused" state).
+fn wake_page_html(branch: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><meta http-equiv="refresh" content="1">
+<style>
+body {{ background:#121212; color:#F4F4F5; font-family:monospace;
+       display:flex; height:100vh; align-items:center; justify-content:center; }}
+strong {{ color:#DE5236; }}
+</style></head>
+<body><p>[~] Waking up <strong>{branch}</strong>&hellip;</p></body></html>"#
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -417,11 +522,7 @@ fn parse_scope(raw: &str) -> ApiResult<EnvVarScope> {
 }
 
 fn validate_secret_name(name: &str) -> ApiResult<&str> {
-    if name.trim().is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.trim().is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(ApiError::from_validation(format!(
             "invalid secret name `{name}`; use alphanumeric characters and underscores"
         )));
@@ -454,7 +555,10 @@ async fn github_webhook<
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| {
-            ApiError::new(StatusCode::UNAUTHORIZED, "missing `X-Hub-Signature-256` header")
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "missing `X-Hub-Signature-256` header",
+            )
         })?;
     verify_hmac(secret, &body, signature)?;
 
@@ -490,14 +594,14 @@ async fn github_webhook<
 
 /// Verifies `X-Hub-Signature-256` (`sha256=<hex hmac>`) against the raw body.
 fn verify_hmac(secret: &str, body: &[u8], signature: &str) -> ApiResult<()> {
-    let provided = signature
-        .strip_prefix("sha256=")
-        .ok_or_else(|| {
-            ApiError::new(StatusCode::UNAUTHORIZED, "signature must be prefixed with `sha256=`")
-        })?;
-    let provided_bytes = hex::decode(provided).map_err(|_| {
-        ApiError::new(StatusCode::UNAUTHORIZED, "signature is not valid hex")
+    let provided = signature.strip_prefix("sha256=").ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "signature must be prefixed with `sha256=`",
+        )
     })?;
+    let provided_bytes = hex::decode(provided)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "signature is not valid hex"))?;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid secret"))?;
     mac.update(body);
@@ -581,6 +685,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("run:{}:env={:?}", spec.name, spec.env));
+            Ok(())
+        }
+        async fn start(&self, name: &str) -> Result<(), OciError> {
+            self.calls.lock().unwrap().push(format!("start:{name}"));
             Ok(())
         }
         async fn pause(&self, name: &str) -> Result<(), OciError> {
@@ -671,8 +779,7 @@ port = 8080
     /// Sends a GitHub webhook with a valid `X-Hub-Signature-256` header.
     async fn signed_webhook(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
         let raw = payload.to_string();
-        let mut mac =
-            hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
         mac.update(raw.as_bytes());
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
@@ -921,19 +1028,13 @@ port = 8080
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
 
-        let (status, body) =
-            json_request(&app, "GET", "/api/v1/secrets", json!({})).await;
+        let (status, body) = json_request(&app, "GET", "/api/v1/secrets", json!({})).await;
         assert_eq!(status, StatusCode::OK);
         let value: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
 
-        let (status, _) = json_request(
-            &app,
-            "DELETE",
-            "/api/v1/secrets/GLOBAL_FLAG",
-            json!({}),
-        )
-        .await;
+        let (status, _) =
+            json_request(&app, "DELETE", "/api/v1/secrets/GLOBAL_FLAG", json!({})).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
@@ -961,5 +1062,194 @@ port = 8080
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn request_with_host(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        host: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn destroy_removes_environment() {
+        let repo = repo_dir_with_config();
+        let (app, oci) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, _) = json_request(
+            &app,
+            "DELETE",
+            format!("/api/v1/environments/{}", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("remove:")),
+            "{:?}",
+            oci.calls
+        );
+    }
+
+    #[tokio::test]
+    async fn list_environments_filters_by_branch() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!(
+                "/api/v1/projects/{}/environments?branch=feature-login",
+                project.id.0
+            )
+            .as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let envs: Vec<Environment> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envs.len(), 1);
+
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/projects/{}/environments?branch=nope", project.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let envs: Vec<Environment> = serde_json::from_slice(&body).unwrap();
+        assert!(envs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wake_by_host_wakes_matching_environment() {
+        let repo = repo_dir_with_config();
+        let (app, oci) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/environments/{}/pause", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+
+        let (status, body) = request_with_host(&app, "POST", "/api/v1/wake", &env.url).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body).contains("feature-login"));
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("unpause:")),
+            "{:?}",
+            oci.calls
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_by_host_unknown_host_is_ok_noop() {
+        let (app, _) = test_app().await;
+        let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody.local.dev").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_always_ok() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", &env.url).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody.local.dev").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

@@ -20,16 +20,16 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 1.1 | `oxid down <branch>` — destruir entorno | **SPEC §5.1:** _"`$ ctrl up my-repo --branch feature-login` → Fuerza un despliegue manual."_ Se infiere `down` como operación opuesta. | No existe | No existe |
-| 1.2 | `oxid status` — listar entornos del proyecto actual | **IDEA §4:** _"Comandos cortos, salida coloreada e intuitiva. Ej: `oxid up feature-login`, `oxid env set`."_ | `oxid ps` lista proyectos, no entornos por proyecto | No existe |
-| 1.3 | `oxid logs <branch> -f` — streaming real vía SSE/chunked | **SPEC §5.1:** _"`$ ctrl logs feature-login -f` → Streaming de logs de la rama."_ | Stub: imprime "not implemented yet" | Stub |
+| 1.1 | `oxid down <branch>` — destruir entorno | **SPEC §5.1:** _"`$ ctrl up my-repo --branch feature-login` → Fuerza un despliegue manual."_ Se infiere `down` como operación opuesta. | `cli/main.rs` — `oxid down <branch> [--force]`, resuelve rama → entorno y llama `DELETE /environments/{id}` | ✅ Done |
+| 1.2 | `oxid status` — listar entornos del proyecto actual | **IDEA §4:** _"Comandos cortos, salida coloreada e intuitiva. Ej: `oxid up feature-login`, `oxid env set`."_ | `cli/main.rs` — `oxid status` lista rama/estado/URL coloreado por estado (DESIGN §3.1) | ✅ Done |
+| 1.3 | `oxid logs <branch> -f` — streaming real vía SSE/chunked | **SPEC §5.1:** _"`$ ctrl logs feature-login -f` → Streaming de logs de la rama."_ | `cli/main.rs` — `oxid logs <branch> [-f]` hace polling cada 2s sobre `/logs` (no es SSE real; el daemon solo expone un snapshot) | Parcial |
 | 1.4 | `oxid env set KEY=val --scope global` — inyectar secretos | **SPEC §5.1:** _"`$ ctrl env set my-repo DB_PASSWORD=secret --scope global` → Inyecta variables."_ | `cli/main.rs` — `oxid env set KEY=VAL --scope <global\|project\|branch> [--project ID] [--branch B]` | ✅ Done (a0c064d) |
 | 1.5 | `oxid env list` — ver secretos configurados | **IDEA §4:** La tabla de interfaces muestra `oxid env set` como ejemplo de la CLI. `list` es el complemento natural. | `cli/main.rs` — `oxid env list [--scope ...]` (valores nunca expuestos) | ✅ Done (a0c064d) |
-| 1.6 | `oxid pause <branch>` — pausar manualmente | **IDEA §6:** _"Oxid apagó el contenedor, liberando 500MB de RAM."_ El usuario debe poder forzar esta acción. | No existe | No existe |
-| 1.7 | `oxid wake <branch>` — despertar manualmente | **IDEA §6:** _"Un tester entra a la URL, Oxid lo nota, hace `unpause` en 200ms."_ El usuario debe poder forzar esta acción. | No existe | No existe |
-| 1.8 | Coloreado ANSI con prefijos `[+]` `[~]` `[>]` | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks. `[>]` in Oxid Orange for actionable prompts."_ | Solo usa `eprintln!` y `println!` sin códigos ANSI | Parcial |
-| 1.9 | Flag `--force` para sobreescribir | **DESIGN §5:** _"Offer `[--force]` flags, but clearly state what they overwrite."_ | No existe | No existe |
-| 1.10 | Flag `--api` para configurar daemon URL | **SPEC §6:** La sección de configuración sugiere que el sistema debe ser configurable. Actualmente hardcodea `OXID_API`. | Hardcodea `OXID_API` env var | Falta |
+| 1.6 | `oxid pause <branch>` — pausar manualmente | **IDEA §6:** _"Oxid apagó el contenedor, liberando 500MB de RAM."_ El usuario debe poder forzar esta acción. | `cli/main.rs` — `oxid pause <branch>` | ✅ Done |
+| 1.7 | `oxid wake <branch>` — despertar manualmente | **IDEA §6:** _"Un tester entra a la URL, Oxid lo nota, hace `unpause` en 200ms."_ El usuario debe poder forzar esta acción. | `cli/main.rs` — `oxid wake <branch>` | ✅ Done |
+| 1.8 | Coloreado ANSI con prefijos `[+]` `[~]` `[>]` | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks. `[>]` in Oxid Orange for actionable prompts."_ | `cli/main.rs` — helpers `ok`/`bg`/`action`/`error` con ANSI | ✅ Done (a0c064d) |
+| 1.9 | Flag `--force` para sobreescribir | **DESIGN §5:** _"Offer `[--force]` flags, but clearly state what they overwrite."_ | `cli/main.rs` — `oxid down --force` salta la confirmación interactiva de destrucción | ✅ Done |
+| 1.10 | Flag `--api` para configurar daemon URL | **SPEC §6:** La sección de configuración sugiere que el sistema debe ser configurable. Actualmente hardcodea `OXID_API`. | `cli/main.rs` — flag global `--api <url>`, tiene prioridad sobre `OXID_API` | ✅ Done |
 
 ---
 
@@ -73,10 +73,10 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 5.1 | Integración con Traefik (labels Docker + configuración) | **SPEC §3.2:** _"Un proxy inverso (Traefik) actúa como entrada."_ **SPEC §4.6:** _"Se levanta el contenedor con etiquetas específicas del proxy. Ejemplo: Subdominio → feat-login.dev.local."_ | `control_plane.rs:180-184` — agrega labels `oxid.project`, `oxid.branch`, `oxid.url` pero no labels de Traefik | No existe |
-| 5.2 | Endpoint de wake-on-request que Traefik llama | **SPEC §3.2:** _"Traefik está configurado para redirigir peticiones fallidas (por contenedor pausado) a un endpoint especial del orquestador en Rust."_ | `api.rs:44-45` — endpoint `POST /environments/{id}/wake` existe pero Traefik no lo usa | No conectado |
-| 5.3 | Devolver señal de recarga al navegador (302 → wake → retry) | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms) y devuelve una señal de recarga al navegador."_ | No existe — el endpoint wake solo retorna `204 No Content` | No existe |
-| 5.4 | Monitor de tráfico real (métricas de Traefik para GC) | **SPEC §3.2:** _"Un cron interno de Rust evalúa la actividad de red. Si la rama feature-x no recibe peticiones en 30 minutos, ejecuta docker pause feature-x."_ **IDEA §6:** _"Oxid lo nota, hace unpause"_ | `gc.rs` solo compara `last_accessed_at` de SQLite, no métricas de tráfico HTTP reales | No existe |
+| 5.1 | Integración con Traefik (labels Docker + configuración) | **SPEC §3.2:** _"Un proxy inverso (Traefik) actúa como entrada."_ **SPEC §4.6:** _"Se levanta el contenedor con etiquetas específicas del proxy. Ejemplo: Subdominio → feat-login.dev.local."_ | `control_plane.rs` — `deploy()` agrega labels `traefik.enable`, router/service/middleware por rama, y une el contenedor a `OXID_DOCKER_NETWORK` (sin publicar host port) cuando está configurado; fallback a host-port si no | ✅ Done |
+| 5.2 | Endpoint de wake-on-request que Traefik llama | **SPEC §3.2:** _"Traefik está configurado para redirigir peticiones fallidas (por contenedor pausado) a un endpoint especial del orquestador en Rust."_ | `api.rs` — `POST /api/v1/wake` lee `Host`/`X-Forwarded-Host`, resuelve el entorno y lo despierta (`wake_by_url`); pensado como target de la `errors` middleware de Traefik | ✅ Done |
+| 5.3 | Devolver señal de recarga al navegador (302 → wake → retry) | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms) y devuelve una señal de recarga al navegador."_ | `api.rs::wake_page_html` — página HTML con `meta refresh` estilo DESIGN (Carbon Black/Oxid Orange) | ✅ Done |
+| 5.4 | Monitor de tráfico real (métricas de Traefik para GC) | **SPEC §3.2:** _"Un cron interno de Rust evalúa la actividad de red. Si la rama feature-x no recibe peticiones en 30 minutos, ejecuta docker pause feature-x."_ **IDEA §6:** _"Oxid lo nota, hace unpause"_ | `api.rs::heartbeat_by_host` + `control_plane.rs::touch_by_url` — endpoint `GET/POST /api/v1/heartbeat` pensado como `forwardAuth` middleware de Traefik en cada request; refresca `last_accessed_at` real en vez de solo tocarlo al desplegar | ✅ Done (requiere wiring de Traefik, ver nota abajo) |
 | 5.5 | Latencia objetivo < 300ms para unpause | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms)"_ — métrica de referencia. | No hay benchmarks ni mediciones | No medido |
 
 ---
@@ -109,7 +109,7 @@
 |---|---|---|---|---|
 | 8.1 | Prefijos coloreados: `[+]` verde, `[~]` gris, `[>]` naranja | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks (e.g., pausing). `[>]` in Oxid Orange for actionable prompts or active builds."_ | `cli/main.rs` — helpers `ok`/`bg`/`action`/`error` con ANSI | ✅ Done (a0c064d) |
 | 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | `config.rs` devuelve errores como `ConfigError::Validation(String)` sin acción sugerida | Parcial |
-| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs:86-131` — solo imprime `[>] oxid up` y `[+] Environment live at` | No implementado |
+| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs::cmd_up` — imprime parse/registro/building/live; sin línea de shared-DB ni cache-hit % porque ninguno de los dos existe todavía (bloqueado por 4.1–4.4 y 6.3) | Parcial |
 
 ---
 
@@ -158,13 +158,29 @@
 
 ## Priorización
 
-> **Última actualización:** a0c064d — P0 completo (seguridad + secretos) entregado ✅
+> **Última actualización:** P1 (UX CLI) y P2 (Scale-to-Zero real) entregados ✅ — pendiente de commit.
+>
+> De paso se corrigieron dos bugs latentes encontrados durante la implementación de P2:
+> - Cada branch publicaba el mismo `host_port`, así que dos ramas del mismo proyecto no podían
+>   correr a la vez. Se resuelve al unir el contenedor a `OXID_DOCKER_NETWORK` (Traefik) en vez de
+>   publicar puerto de host.
+> - `wake()` siempre llamaba `docker unpause`, que no hace nada útil sobre un contenedor
+>   `Hibernating` (fue `stop`peado, no `pause`ado). Ahora se añadió `ContainerPort::start` y
+>   `wake` distingue `Paused` (`unpause`) de `Hibernating` (`start`).
+>
+> **Nota de wiring pendiente (fuera del alcance de este repo):** las labels de Traefik (5.1) y
+> los endpoints `/api/v1/wake` y `/api/v1/heartbeat` (5.2/5.4) están implementados y probados,
+> pero requieren un Traefik real corriendo con `OXID_DOCKER_NETWORK` configurado, más una
+> `service` global `oxid-wake` definida en las labels del propio contenedor del daemon (ver
+> comentario en `control_plane.rs::traefik_labels`) para que la `errors` middleware pueda
+> apuntar ahí. Sin ese paso de infraestructura, el sistema sigue funcionando en modo
+> "host-port directo" (una rama viva a la vez por proyecto).
 
 | Prioridad | Categoría | Tareas | Justificación |
 |---|---|---|---|
 | **P0 — Core funcional** | Control plane, Secretos, Webhook auth | 2.1, 2.2, 3.3, 3.4, 3.5, 6.1, 6.2, 7.1, 7.2 ✅ | Sin estos, el sistema no es seguro ni funcional |
-| **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.3, 1.6–1.10, 8.2, 8.3 | Sin esto, la CLI es inutilizable para el usuario final |
-| **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 | La feature estrella del producto no funciona end-to-end |
+| **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.10 ✅ (1.3 parcial: polling, no SSE), 8.1 ✅ | Sin esto, la CLI es inutilizable para el usuario final |
+| **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 ✅ (requiere wiring de infraestructura, ver nota arriba) | La feature estrella del producto ahora emite lo necesario end-to-end |
 | **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.4 | Diferenciador competitivo vs levantar contenedores por branch |
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, config global | 12.x | Necesario para self-hosting real |
