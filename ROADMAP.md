@@ -129,9 +129,9 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 10.1 | Dashboard web embebido en el binario | **SPEC §5.3:** _"Incluido dentro del mismo binario estático de Rust (archivos precompilados e incrustados)."_ | No existe | No existe |
-| 10.2 | Estilo brutalista con bordes duros, sin sombras | **DESIGN §3.2:** _"Use sharp corners (border-radius: 2px or 0px). Use hard 1px solid borders (#333333) instead of drop shadows to separate cards. Layout: Brutalist and data-dense."_ | — | No existe |
-| 10.3 | Métricas globales del nodo | **SPEC §5.3:** _"Métricas globales del nodo, auditoría histórica de despliegues y visor de logs estructurados."_ | — | No existe |
+| 10.1 | Dashboard web embebido en el binario | **SPEC §5.3:** _"Incluido dentro del mismo binario estático de Rust (archivos precompilados e incrustados)."_ | `crates/oxid-daemon/web/*` embebido vía `include_str!` en `api.rs`, servido en `/`, sin build step ni dependencias nuevas (Alpine.js vendorizado, 54KB) | Hecho |
+| 10.2 | Estilo brutalista con bordes duros, sin sombras | **DESIGN §3.2:** _"Use sharp corners (border-radius: 2px or 0px). Use hard 1px solid borders (#333333) instead of drop shadows to separate cards. Layout: Brutalist and data-dense."_ | `web/style.css` implementa la paleta y tipografía completas de DESIGN.md §1-3 | Hecho |
+| 10.3 | Métricas globales del nodo | **SPEC §5.3:** _"Métricas globales del nodo, auditoría histórica de despliegues y visor de logs estructurados."_ | `GET /api/v1/stats` (`ControlPlane::node_stats`) + panel de auditoría/cola + visor de logs en vivo (streaming real vía `fetch`+`ReadableStream`, no `EventSource`, para poder enviar el header `Authorization`) | Hecho |
 
 ---
 
@@ -278,7 +278,7 @@
 | **P1 — UX CLI** | Coloreado, comandos faltantes | 1.1–1.10 ✅ (1.3 parcial: polling, no SSE), 8.1 ✅ | Sin esto, la CLI es inutilizable para el usuario final |
 | **P2 — Scale-to-Zero real** | Traefik, wake-on-request | 5.1–5.4 ✅ (requiere wiring de infraestructura, ver nota arriba) | La feature estrella del producto ahora emite lo necesario end-to-end |
 | **P3 — Resource pooling** | Multiplexación DB real | 4.1–4.5, 7.3 ✅ | Diferenciador competitivo vs levantar contenedores por branch — verificado en vivo con Postgres+Redis reales |
-| **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x, 11.x | Features de producto completo, no MVP |
+| **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x ✅, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, release binaries | 12.1, 12.2, 12.4 ✅ · 12.3 superseded | Necesario para self-hosting real |
 
 **Total: ~50 tareas granulares.** Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.

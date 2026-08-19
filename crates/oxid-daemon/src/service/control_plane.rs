@@ -67,6 +67,30 @@ pub struct GcSummary {
     pub errors: Vec<(EnvironmentId, String)>,
 }
 
+/// Aggregate node-wide counts for the web dashboard's overview — see
+/// [`ControlPlane::node_stats`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct NodeStats {
+    /// Number of registered projects.
+    pub projects: u64,
+    /// Environments currently `Running`.
+    pub environments_running: u64,
+    /// Environments currently `Paused`.
+    pub environments_paused: u64,
+    /// Environments currently `Building`.
+    pub environments_building: u64,
+    /// Environments currently `Hibernating`.
+    pub environments_hibernating: u64,
+    /// Environments currently `Destroyed` (kept for rollback history).
+    pub environments_destroyed: u64,
+    /// Deploys currently waiting for host capacity.
+    pub queue_length: u64,
+    /// Total host memory Docker reports, in bytes.
+    pub host_total_memory_bytes: u64,
+    /// Host CPU count Docker reports.
+    pub host_cpu_count: u32,
+}
+
 /// Result of a capacity-aware deploy attempt (see
 /// [`ControlPlane::deploy_or_queue`]).
 #[derive(Debug, Clone)]
@@ -1260,6 +1284,34 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         &self,
     ) -> Result<Vec<crate::adapter::store::QueuedDeploy>, CpError> {
         Ok(self.store.list_deploy_queue().await?)
+    }
+
+    /// Aggregate counts + host capacity for the web dashboard's overview —
+    /// one call instead of the client fetching every project's environments
+    /// just to total them up.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage or `docker info` failures.
+    pub async fn node_stats(&self) -> Result<NodeStats, CpError> {
+        let projects = self.store.list().await?;
+        let mut stats = NodeStats {
+            projects: projects.len() as u64,
+            ..NodeStats::default()
+        };
+        for env in self.store.list_all_environments().await? {
+            match env.state {
+                EnvironmentState::Running => stats.environments_running += 1,
+                EnvironmentState::Paused => stats.environments_paused += 1,
+                EnvironmentState::Building => stats.environments_building += 1,
+                EnvironmentState::Hibernating => stats.environments_hibernating += 1,
+                EnvironmentState::Destroyed => stats.environments_destroyed += 1,
+            }
+        }
+        stats.queue_length = self.store.list_deploy_queue().await?.len() as u64;
+        let host = self.oci.host_capacity().await?;
+        stats.host_total_memory_bytes = host.total_memory_bytes;
+        stats.host_cpu_count = host.cpu_count;
+        Ok(stats)
     }
 
     /// Returns an environment's full audit history, oldest first.

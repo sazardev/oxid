@@ -10,7 +10,7 @@ use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
@@ -112,6 +112,7 @@ pub fn router<
         .route("/api/v1/rotate-key", post(rotate_key))
         .route("/api/v1/audit", get(recent_audit))
         .route("/api/v1/queue", get(list_queue))
+        .route("/api/v1/stats", get(stats))
         .route("/api/v1/backup", get(backup))
         .route("/api/v1/backup/restore", post(restore))
         .route(
@@ -140,6 +141,11 @@ pub fn router<
 
     Router::new()
         .route("/api/v1/health", get(health))
+        .route("/", get(dashboard_index))
+        .route("/index.html", get(dashboard_index))
+        .route("/style.css", get(dashboard_style))
+        .route("/app.js", get(dashboard_app_js))
+        .route("/vendor/alpine.min.js", get(dashboard_alpine_js))
         .route("/api/v1/wake", post(wake_by_host))
         .route(
             "/api/v1/heartbeat",
@@ -374,6 +380,49 @@ type ApiResult<T> = Result<T, ApiError>;
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+// ---------------------------------------------------------------------------
+// web dashboard (SPEC.md §5.3: "incluido dentro del mismo binario estático de
+// Rust, archivos precompilados e incrustados") — a handful of static files
+// embedded at compile time via `include_str!`, no build step, no bundler,
+// and (besides the vendored Alpine.js) no client-side dependency at all.
+// ---------------------------------------------------------------------------
+
+async fn dashboard_index() -> Html<&'static str> {
+    Html(include_str!("../web/index.html"))
+}
+
+async fn dashboard_style() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../web/style.css"),
+    )
+}
+
+async fn dashboard_app_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/app.js"),
+    )
+}
+
+async fn dashboard_alpine_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../web/vendor/alpine.min.js"),
+    )
+}
+
+/// Aggregate counts + host capacity backing the dashboard's stat cards —
+/// see [`ControlPlane::node_stats`].
+async fn stats<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Json<crate::NodeStats>> {
+    Ok(Json(state.cp.node_stats().await?))
 }
 
 async fn register_project<
@@ -1487,6 +1536,51 @@ port = 8080
         let (app, _) = test_app().await;
         let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_static_assets_are_served_without_a_token() {
+        let app = test_app_with_token("s3cr3t").await;
+        for (path, marker) in [
+            ("/", "OXID"),
+            ("/index.html", "OXID"),
+            ("/style.css", "--oxid-orange"),
+            ("/app.js", "function dashboard()"),
+            ("/vendor/alpine.min.js", "Alpine"),
+        ] {
+            let (status, body) = json_request(&app, "GET", path, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let text = String::from_utf8(body).unwrap();
+            assert!(text.contains(marker), "{path}: {text:.200}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_endpoint_reports_aggregate_counts() {
+        let (app, _) = test_app().await;
+        let repo = repo_dir_with_config();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+
+        let (status, body) = json_request(&app, "GET", "/api/v1/stats", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let node_stats: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(node_stats["projects"], 1);
+        assert_eq!(node_stats["environments_running"], 1);
+        assert!(node_stats["host_total_memory_bytes"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

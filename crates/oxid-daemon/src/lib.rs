@@ -13,4 +13,4 @@ pub mod adapter;
 pub mod api;
 pub mod service;
 
-pub use service::control_plane::{ControlPlane, CpError, DeployOutcome, GcSummary};
+pub use service::control_plane::{ControlPlane, CpError, DeployOutcome, GcSummary, NodeStats};

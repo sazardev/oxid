@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Oxid — Control Plane</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+    <script src="/vendor/alpine.min.js" defer></script>
+  </head>
+  <body x-data="dashboard()" x-init="init()">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 100 100" aria-hidden="true">
+          <path
+            d="M50 4 L93 27 V73 L50 96 L7 73 V27 Z"
+            fill="none"
+            stroke="#DE5236"
+            stroke-width="6"
+          />
+          <path d="M50 4 L93 27" stroke="#121212" stroke-width="8" />
+        </svg>
+        <span class="wordmark">OXID</span>
+        <span class="tagline">control plane</span>
+      </div>
+      <div class="conn">
+        <span
+          class="dot"
+          :class="online ? 'dot-green' : 'dot-red'"
+          :title="online ? 'Connected' : 'Unreachable'"
+        ></span>
+        <input
+          class="token-input"
+          type="password"
+          placeholder="Bearer token (if configured)"
+          x-model="token"
+          @change="saveToken()"
+        />
+        <button class="btn btn-ghost" @click="refreshAll()" title="Refresh now">
+          ⟳
+        </button>
+      </div>
+    </header>
+
+    <div class="banner banner-error" x-show="authError" x-cloak>
+      [!] 401/403 from the daemon — check the bearer token above.
+    </div>
+    <div class="banner banner-error" x-show="connError" x-cloak>
+      [!] Cannot reach the daemon at <code x-text="apiBase"></code>.
+    </div>
+
+    <section class="stats">
+      <div class="stat-card">
+        <div class="stat-value" x-text="stats.projects ?? '—'"></div>
+        <div class="stat-label">Projects</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value state-running" x-text="stats.environments_running ?? '—'"></div>
+        <div class="stat-label">Running</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value state-paused" x-text="stats.environments_paused ?? '—'"></div>
+        <div class="stat-label">Paused</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value state-building" x-text="stats.environments_building ?? '—'"></div>
+        <div class="stat-label">Building</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" x-text="stats.queue_length ?? '—'"></div>
+        <div class="stat-label">Queued</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" x-text="hostMemoryLabel()"></div>
+        <div class="stat-label">Host memory</div>
+      </div>
+    </section>
+
+    <main class="layout">
+      <section class="panel panel-main">
+        <h2>Environments</h2>
+        <template x-if="projects.length === 0">
+          <p class="muted">No projects registered yet — run <code>oxid up &lt;branch&gt;</code> from a project directory.</p>
+        </template>
+        <template x-for="project in projects" :key="project.id">
+          <div class="project">
+            <div class="project-head">
+              <span class="project-name" x-text="project.name"></span>
+              <span class="project-repo" x-text="project.repo_url"></span>
+            </div>
+            <table class="env-table" x-show="project.environments.length > 0">
+              <thead>
+                <tr>
+                  <th>Branch</th>
+                  <th>State</th>
+                  <th>URL</th>
+                  <th>Updated</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="env in project.environments" :key="env.id">
+                  <tr :class="'row-' + env.state">
+                    <td class="mono" x-text="env.branch.name"></td>
+                    <td>
+                      <span class="badge" :class="'badge-' + env.state">
+                        <span x-show="env.state === 'building'" class="spinner"></span>
+                        <span x-text="env.state"></span>
+                      </span>
+                    </td>
+                    <td>
+                      <a
+                        class="mono link"
+                        :href="'http://' + env.url"
+                        target="_blank"
+                        rel="noopener"
+                        x-text="env.url"
+                      ></a>
+                    </td>
+                    <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
+                    <td class="actions">
+                      <button
+                        class="btn btn-sm"
+                        x-show="env.state === 'running'"
+                        @click="pause(env)"
+                      >
+                        pause
+                      </button>
+                      <button
+                        class="btn btn-sm"
+                        x-show="env.state === 'paused' || env.state === 'hibernating'"
+                        @click="wake(env)"
+                      >
+                        wake
+                      </button>
+                      <button
+                        class="btn btn-sm"
+                        x-show="env.state !== 'destroyed' && env.state !== 'building'"
+                        @click="openLogs(env)"
+                      >
+                        logs
+                      </button>
+                      <button
+                        class="btn btn-sm btn-danger"
+                        x-show="env.state !== 'destroyed'"
+                        @click="destroy(env)"
+                      >
+                        destroy
+                      </button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <p class="muted" x-show="project.environments.length === 0">No live branches.</p>
+          </div>
+        </template>
+      </section>
+
+      <aside class="panel panel-side">
+        <h2>Deploy queue</h2>
+        <template x-if="queue.length === 0">
+          <p class="muted">Empty — every deploy has capacity.</p>
+        </template>
+        <ol class="queue-list">
+          <template x-for="item in queue" :key="item.id">
+            <li>
+              <span class="mono" x-text="item.branch"></span>
+              <span class="muted" x-text="'#' + item.project_id"></span>
+            </li>
+          </template>
+        </ol>
+
+        <h2>Recent audit</h2>
+        <ol class="audit-list">
+          <template x-for="event in audit" :key="event.id">
+            <li>
+              <span class="mono muted" x-text="formatTime(event.occurred_at)"></span>
+              <span class="badge badge-audit" x-text="event.kind"></span>
+              <span class="muted" x-text="event.detail ?? ''"></span>
+            </li>
+          </template>
+        </ol>
+      </aside>
+    </main>
+
+    <div class="modal-backdrop" x-show="logsOpen" x-cloak @click.self="closeLogs()">
+      <div class="modal">
+        <div class="modal-head">
+          <span x-text="'Logs — ' + logsBranch"></span>
+          <button class="btn btn-ghost" @click="closeLogs()">✕</button>
+        </div>
+        <pre class="log-output" x-ref="logOutput" x-text="logLines.join('\n')"></pre>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <span>Ephemeral environments that breathe.</span>
+      <span x-text="'auto-refresh ' + refreshIntervalSecs + 's'"></span>
+    </footer>
+  </body>
+</html>
