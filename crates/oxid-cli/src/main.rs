@@ -678,23 +678,22 @@ async fn cmd_env_set(
     let (name, value) = parse_assignment(assignment)?;
     let (project_id, branch) = scope_context(scope, project, branch)?;
 
-    let (url, payload) = match (project_id, scope) {
-        (None, "global") => (
+    let (url, payload) = if scope == "global" {
+        (
             format!("{base}/api/v1/secrets"),
             json!({ "name": name, "scope": scope, "value": value }),
-        ),
-        (Some(id), _) => (
-            format!("{base}/api/v1/projects/{id}/secrets"),
+        )
+    } else {
+        let project_id = ensure_project_id(client, base, project_id).await?;
+        (
+            format!("{base}/api/v1/projects/{project_id}/secrets"),
             json!({
                 "name": name,
                 "scope": scope,
                 "value": value,
                 "branch": branch,
             }),
-        ),
-        (None, _) => {
-            return Err("`--project` is required for a non-global scope".to_owned());
-        }
+        )
     };
 
     let response = client
@@ -780,18 +779,15 @@ async fn cmd_env_delete(
 ) -> Result<(), String> {
     let (project_id, branch) = scope_context(scope, project, branch)?;
 
-    let url = match (project_id, scope) {
-        (None, "global") => format!("{base}/api/v1/secrets/{name}"),
-        (Some(id), _) => {
-            let branch_qs = branch
-                .as_ref()
-                .map(|b| format!("?branch={b}"))
-                .unwrap_or_default();
-            format!("{base}/api/v1/projects/{id}/secrets/{name}{branch_qs}")
-        }
-        (None, _) => {
-            return Err("`--project` is required for a non-global scope".to_owned());
-        }
+    let url = if scope == "global" {
+        format!("{base}/api/v1/secrets/{name}")
+    } else {
+        let project_id = ensure_project_id(client, base, project_id).await?;
+        let branch_qs = branch
+            .as_ref()
+            .map(|b| format!("?branch={b}"))
+            .unwrap_or_default();
+        format!("{base}/api/v1/projects/{project_id}/secrets/{name}{branch_qs}")
     };
 
     let response = client
