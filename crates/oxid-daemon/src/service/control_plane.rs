@@ -1042,6 +1042,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             _ => self.oci.unpause(&name).await?,
         }
 
+        // Backfills `host_port` for an environment that predates dynamic
+        // port assignment (deployed by an older Oxid build, so this column
+        // was never populated) — otherwise it stays wrong forever, since
+        // waking only starts/unpauses the *existing* container instead of
+        // recreating it through `run()`, which is the only other place that
+        // learns this. Best-effort: `network.is_some()` (Traefik) or a
+        // lookup failure just leaves it as it was.
+        if env.host_port.is_none() && self.docker_network.is_none() {
+            env.host_port = self
+                .oci
+                .published_port(&name, project.config.port)
+                .await
+                .unwrap_or(None);
+        }
+
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
@@ -1389,6 +1404,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// each against its project's idle/TTL policy (SPEC.md §3.2) and applies
     /// the resulting pause/hibernate/destroy action.
     ///
+    /// Every rule here — `pause_after`, the hibernate multiplier, and
+    /// `destroy_after` — is measured from `last_accessed_at`, which only
+    /// ever advances via Traefik's `forwardAuth` heartbeat calling
+    /// [`Self::touch_by_url`] on real traffic. Without `OXID_DOCKER_NETWORK`
+    /// (direct-publish mode), nothing ever calls that — Oxid has no way to
+    /// observe traffic hitting a directly-published port at all — so
+    /// `last_accessed_at` is frozen at creation time forever. Found live:
+    /// a direct-mode environment got auto-paused *immediately* after being
+    /// woken, because by every idle metric available it looked exactly as
+    /// idle as the moment it was created, despite serving real requests the
+    /// whole time. Sweeping on data Oxid knows is meaningless would
+    /// eventually not just re-pause but permanently *destroy* a
+    /// perfectly-live environment once enough wall-clock time passed — so
+    /// the whole pass is skipped in this mode instead of acting on it
+    /// anyway; `pause`/`wake`/`destroy` remain available manually (CLI/API/
+    /// dashboard) either way.
+    ///
     /// A failure on one environment (e.g. a stuck `Building` environment
     /// that cannot legally transition yet) is recorded in
     /// [`GcSummary::errors`] rather than aborting the whole sweep.
@@ -1397,6 +1429,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Returns [`CpError`] only if listing environments or projects fails.
     pub async fn sweep(&self, now: OffsetDateTime) -> Result<GcSummary, CpError> {
         let mut summary = GcSummary::default();
+        if self.docker_network.is_none() {
+            return Ok(summary);
+        }
         let mut projects: std::collections::HashMap<ProjectId, Project> =
             std::collections::HashMap::new();
 
@@ -1490,6 +1525,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     continue;
                 }
             };
+
+            // Same opportunistic backfill as `wake_env`: an environment
+            // deployed before dynamic port assignment existed never got its
+            // `host_port` recorded, and nothing else revisits it — a daemon
+            // restart is a free chance to fix that without waiting for a
+            // redeploy.
+            if env.host_port.is_none()
+                && self.docker_network.is_none()
+                && status != ContainerStatus::Missing
+                && let Ok(Some(port)) = self.oci.published_port(&name, project.config.port).await
+            {
+                env.host_port = Some(port);
+                let _ = self.store.update(&env).await;
+            }
 
             let outcome = match (env.state, status) {
                 (
@@ -1878,6 +1927,17 @@ mod tests {
                 return Err(OciError::Failure("simulated transient failure".to_owned()));
             }
             Ok(spec.network.is_none().then_some(65535))
+        }
+        async fn published_port(
+            &self,
+            name: &str,
+            _container_port: u16,
+        ) -> Result<Option<u16>, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("published_port:{name}"));
+            Ok(Some(65535))
         }
         async fn start(&self, name: &str) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(format!("start:{name}"));
@@ -2749,7 +2809,9 @@ cpu_limit_millicores = 250
     async fn gc_destroy_also_removes_the_image() {
         let repo = repo_dir_with_config();
         let oci = FakeOci::default();
-        let cp = cp(oci.clone()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2844,6 +2906,43 @@ cpu_limit_millicores = 250
         );
     }
 
+    /// Regression test for a real bug found live: an environment deployed
+    /// before dynamic host-port assignment existed has `host_port: None`
+    /// forever, since nothing but `run()` (which only fires on a *new*
+    /// container) ever learns it — waking it just unpauses the existing
+    /// container without recreating it. `wake` must opportunistically
+    /// backfill `host_port` in that case instead of leaving the dashboard
+    /// showing a dead Traefik-style URL forever after a wake.
+    #[tokio::test]
+    async fn wake_backfills_host_port_for_environments_predating_dynamic_ports() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(env.host_port, Some(65535));
+
+        // Simulate a row from before this column existed.
+        let mut stale = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        stale.host_port = None;
+        EnvironmentStore::update(&cp.store, &stale).await.unwrap();
+
+        cp.pause(env.id).await.unwrap();
+        cp.wake(env.id).await.unwrap();
+
+        let refreshed = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.host_port, Some(65535));
+    }
+
     #[tokio::test]
     async fn wake_by_url_unknown_host_is_none() {
         let cp = cp(FakeOci::default()).await;
@@ -2891,10 +2990,45 @@ cpu_limit_millicores = 250
         EnvironmentStore::update(&cp.store, &env).await.unwrap();
     }
 
+    /// Regression test for a real bug found live: without Traefik, nothing
+    /// ever calls [`ControlPlane::touch_by_url`], so `last_accessed_at`
+    /// stays frozen at creation time forever regardless of real traffic —
+    /// a woken environment looked exactly as idle as the moment it was
+    /// created and got auto-paused again on the very next sweep. `sweep`
+    /// must be a complete no-op in this mode instead of acting on data it
+    /// knows is meaningless.
+    #[tokio::test]
+    async fn sweep_does_nothing_without_traefik_even_when_wildly_idle() {
+        let repo = repo_dir_with_config();
+        let cp = cp(FakeOci::default()).await; // no `with_traefik(...)` call
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        // Idle well past every threshold (pause/hibernate/destroy).
+        let now = OffsetDateTime::now_utc();
+        touch_env(&cp, env.clone(), now - time::Duration::days(30)).await;
+
+        let summary = cp.sweep(now).await.unwrap();
+        assert_eq!(summary, GcSummary::default());
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Running);
+    }
+
     #[tokio::test]
     async fn sweep_keeps_recently_active_environment() {
         let repo = repo_dir_with_config();
-        let cp = cp(FakeOci::default()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(FakeOci::default())
+            .await
+            .with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2917,7 +3051,9 @@ cpu_limit_millicores = 250
     async fn sweep_pauses_idle_environment() {
         let repo = repo_dir_with_config();
         let oci = FakeOci::default();
-        let cp = cp(oci.clone()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2961,7 +3097,11 @@ cpu_limit_millicores = 250
     #[tokio::test]
     async fn concurrent_sweep_and_manual_destroy_do_not_corrupt_state() {
         let repo = repo_dir_with_config();
-        let cp = cp(FakeOci::default()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(FakeOci::default())
+            .await
+            .with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2997,7 +3137,9 @@ cpu_limit_millicores = 250
     async fn sweep_hibernates_deeply_idle_paused_environment() {
         let repo = repo_dir_with_config();
         let oci = FakeOci::default();
-        let cp = cp(oci.clone()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -3025,7 +3167,9 @@ cpu_limit_millicores = 250
     async fn sweep_destroys_expired_environment() {
         let repo = repo_dir_with_config();
         let oci = FakeOci::default();
-        let cp = cp(oci.clone()).await;
+        // `sweep` no-ops entirely without Traefik configured (idle detection
+        // needs its heartbeat) — exercise that real path here.
+        let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())

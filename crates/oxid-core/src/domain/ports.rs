@@ -344,6 +344,23 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::Failure`] on failure.
     async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError>;
+    /// Looks up the host port already published for `container_port` on an
+    /// existing container — same information [`ContainerPort::run`] reports
+    /// back at creation time, but for a container that was created before
+    /// this daemon ever tracked it (e.g. one deployed by an older Oxid
+    /// version, or whose row otherwise never recorded it). Used to backfill
+    /// [`crate::Environment::host_port`] opportunistically on wake/
+    /// reconciliation instead of leaving it wrong forever. `None` if the
+    /// container publishes no host port at all (Traefik network mode) or
+    /// isn't running.
+    ///
+    /// # Errors
+    /// [`OciError::NotFound`] if the container does not exist.
+    async fn published_port(
+        &self,
+        name: &str,
+        container_port: u16,
+    ) -> Result<Option<u16>, OciError>;
     /// Starts an existing, stopped container (`docker start`). Distinct from
     /// [`ContainerPort::run`], which creates a new container from a spec;
     /// this is used to wake a `Hibernating` environment whose container was

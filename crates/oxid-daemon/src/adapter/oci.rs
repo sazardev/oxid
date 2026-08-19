@@ -165,18 +165,9 @@ impl ContainerPort for DockerClient {
         if spec.network.is_some() {
             return Ok(None);
         }
-        let info = self
-            .docker
-            .inspect_container(&spec.name, None)
-            .await
-            .map_err(map_err)?;
-        let bound_port = info
-            .network_settings
-            .and_then(|settings| settings.ports)
-            .and_then(|ports| ports.get(&container_port_key).cloned().flatten())
-            .and_then(|bindings| bindings.into_iter().next())
-            .and_then(|binding| binding.host_port)
-            .and_then(|port| port.parse::<u16>().ok())
+        let bound_port = self
+            .published_port(&spec.name, spec.container_port)
+            .await?
             .ok_or_else(|| {
                 OciError::Failure(format!(
                     "container `{}` started but Docker never reported a bound host port for \
@@ -185,6 +176,26 @@ impl ContainerPort for DockerClient {
                 ))
             })?;
         Ok(Some(bound_port))
+    }
+
+    async fn published_port(
+        &self,
+        name: &str,
+        container_port: u16,
+    ) -> Result<Option<u16>, OciError> {
+        let info = self
+            .docker
+            .inspect_container(name, None)
+            .await
+            .map_err(map_err)?;
+        let key = format!("{container_port}/tcp");
+        Ok(info
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .and_then(|ports| ports.get(&key).cloned().flatten())
+            .and_then(|bindings| bindings.into_iter().next())
+            .and_then(|binding| binding.host_port)
+            .and_then(|port| port.parse::<u16>().ok()))
     }
 
     async fn start(&self, name: &str) -> Result<(), OciError> {

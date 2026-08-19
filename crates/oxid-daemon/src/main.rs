@@ -14,7 +14,12 @@
 //!   (SPEC.md §3.2). Unset by default: containers publish `[routing].port`
 //!   directly on a host port Docker picks itself, so a busy port never
 //!   blocks a deploy — every environment's actual address is in
-//!   `oxid status`/the dashboard, not a fixed, predictable one.
+//!   `oxid status`/the dashboard, not a fixed, predictable one. Scale-to-zero
+//!   (`OXID_GC_INTERVAL_SECS` below) only runs with this set: idle detection
+//!   is driven entirely by Traefik's `forwardAuth` heartbeat touching
+//!   `last_accessed_at` on real traffic, which nothing calls in direct-publish
+//!   mode — the GC sweep is a deliberate no-op there instead of auto-pausing/
+//!   destroying environments on data it has no way to know is accurate.
 //! - `OXID_DAEMON_URL` — this daemon's own address as reachable from inside
 //!   `OXID_DOCKER_NETWORK` (default `http://oxid-daemon:8080`), used to build
 //!   the Traefik `forwardAuth`/`errors` middleware labels.

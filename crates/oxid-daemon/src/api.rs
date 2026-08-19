@@ -1295,6 +1295,13 @@ mod tests {
                 .push(format!("run:{}:env={:?}", spec.name, spec.env));
             Ok(spec.network.is_none().then_some(65535))
         }
+        async fn published_port(
+            &self,
+            _name: &str,
+            _container_port: u16,
+        ) -> Result<Option<u16>, OciError> {
+            Ok(Some(65535))
+        }
         async fn start(&self, name: &str) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(format!("start:{name}"));
             Ok(())
