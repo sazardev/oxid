@@ -151,7 +151,27 @@ just "where did we leave off and why."
   a different port, both simultaneously live and independently reachable.
   New `#[ignore]`d Docker-integration test proves two containers on the same
   internal port get distinct host ports.
-- Full test/clippy/fmt pass green (128 daemon/core tests + 32 CLI tests).
+- **Two more bugs found live immediately after, waking the pre-existing
+  `main` on the same playground:**
+  1. Its `host_port` was `NULL` (deployed before the column existed) and
+     stayed that way forever — `wake` only starts/unpauses the *existing*
+     container, it doesn't recreate it through `run()` (the only place that
+     used to learn the port). New `ContainerPort::published_port` inspects
+     an already-running container to read its bound port back; `wake_env`
+     and `reconcile_startup_state` both now backfill a stale `host_port`
+     opportunistically instead of leaving it wrong forever.
+  2. Waking it also caused an *immediate* re-pause on the next GC tick.
+     Root cause: without Traefik, nothing ever calls `touch_by_url`
+     (that's the `forwardAuth` heartbeat), so `last_accessed_at` is frozen
+     at creation time forever — every direct-mode environment looks
+     exactly as idle as a genuinely dead one, and left long enough this
+     wouldn't just mis-pause but permanently *destroy* a live environment.
+     `sweep` is now a deliberate no-op without `OXID_DOCKER_NETWORK`
+     instead of acting on data it can't trust; manual pause/wake/destroy
+     still work fine. 6 existing sweep tests updated to configure
+     `with_traefik(...)` explicitly (the only mode sweep does anything in
+     now); new test proves the no-op directly.
+- Full test/clippy/fmt pass green (130 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
