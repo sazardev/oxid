@@ -107,6 +107,35 @@ just "where did we leave off and why."
   `loadForRoute`'s per-route switch silently skipped the rest of that
   route's loads — now wrapped in try/catch with a visible notice banner,
   plus `cache: "no-store"` on every fetch defensively.
+- **Real repo push+webhook playground (`~/oxid-playground/`), set up for the
+  user to test hands-on — a bare repo as "origin" with a `post-receive`
+  hook that signs and fires the real webhook on every push, so even local
+  git exercises the exact same auto-detect path a real GitHub push would.**
+  Found and fixed 3 more real bugs from that live use:
+  1. `GET /api/v1/stats` gained `traefik_enabled` — without
+     `OXID_DOCKER_NETWORK`, an environment's `url` is a
+     `branch.base-domain` hostname that only means anything as a Traefik
+     `Host()` rule and isn't reachable at all; the dashboard was linking to
+     that dead address instead of the project's actual published
+     `host:port`. Now links to whichever is actually reachable.
+  2. `BuildFailed` audit events were recorded with `detail: None` — the
+     real Docker/git error was in hand but silently dropped before
+     storage, so the audit trail showed a bare "build_failed" with no way
+     to tell what broke or which branch. Now stores the real error string;
+     the dashboard's audit page also gained an `envIndex` branch-name
+     resolution it had the data for but never actually used (every row
+     showed an opaque `#4`).
+  3. `serve()`'s plain-HTTP path called
+     `axum::serve(...).with_graceful_shutdown(...)` with **no timeout** —
+     only the TLS path enforced the documented "drains for up to 10s".
+     A real playground daemon instance never exited on `SIGTERM` while a
+     browser tab sat open on the dashboard (pooled keep-alive connection),
+     needing `SIGKILL`. Now bounded to 10s on both paths.
+  - Single project-wide `[routing].port` (parsed once at registration, not
+    per-branch) means direct-port-publish mode only ever has one live
+    branch per project at a time — confirmed live pushing a second branch
+    while the first was still up (`port already allocated`), which is
+    exactly why item 1 above matters.
 - Full test/clippy/fmt pass green (128 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
