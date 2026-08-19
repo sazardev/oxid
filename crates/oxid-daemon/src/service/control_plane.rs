@@ -21,7 +21,7 @@ use oxid_core::{
 
 use crate::adapter::config::{self, ConfigError};
 use crate::adapter::postgres_pool::PostgresPool;
-use crate::adapter::store::SqliteStore;
+use crate::adapter::store::{ApiTokenSummary, SqliteStore};
 
 /// Errors surfaced by the control plane.
 #[derive(Debug, thiserror::Error)]
@@ -305,7 +305,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         project_id: ProjectId,
         branch: BranchName,
     ) -> Result<Environment, CpError> {
-        self.deploy_at(project_id, branch, None).await
+        self.deploy_at(project_id, branch, None, None).await
+    }
+
+    /// Identical to [`Self::deploy`], but attributes the resulting audit
+    /// events to `operator` (a named API token's owner) instead of leaving
+    /// them anonymous.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on any pipeline step failure.
+    pub async fn deploy_with_operator(
+        &self,
+        project_id: ProjectId,
+        branch: BranchName,
+        operator: Option<String>,
+    ) -> Result<Environment, CpError> {
+        self.deploy_at(project_id, branch, None, operator).await
     }
 
     /// Deploys `branch`, pinned to `sha_override` instead of the branch's
@@ -319,6 +334,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         project_id: ProjectId,
         branch: BranchName,
         sha_override: Option<String>,
+        operator: Option<String>,
     ) -> Result<Environment, CpError> {
         // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
         // comment for the two race conditions this closes).
@@ -393,7 +409,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `replace_previous_deployment` could never clear it on a retry (see
         // regression test `failed_deploy_does_not_permanently_block_branch`).
         if let Err(err) = self
-            .run_and_activate(&project, &branch, image, url, &mut env)
+            .run_and_activate(&project, &branch, image, url, &mut env, operator.as_deref())
             .await
         {
             let now = OffsetDateTime::now_utc();
@@ -401,12 +417,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 let _ = self.store.update(&env).await;
                 let _ = self
                     .store
-                    .record(&AuditEvent::new(
+                    .record(&AuditEvent::with_operator(
                         u64::try_from(now.unix_timestamp()).unwrap_or_default(),
                         env.id,
                         StateTransition::BuildFailed,
                         None,
                         now,
+                        operator.clone(),
                     ))
                     .await;
             }
@@ -439,6 +456,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         to_sha: Option<String>,
     ) -> Result<Environment, CpError> {
+        self.rollback_with_operator(project_id, branch, to_sha, None)
+            .await
+    }
+
+    /// Identical to [`Self::rollback`], attributing the resulting audit
+    /// events to `operator`.
+    ///
+    /// # Errors
+    /// Same as [`Self::rollback`].
+    pub async fn rollback_with_operator(
+        &self,
+        project_id: ProjectId,
+        branch: BranchName,
+        to_sha: Option<String>,
+        operator: Option<String>,
+    ) -> Result<Environment, CpError> {
         let mut history = self.store.list_by_project(project_id).await?;
         history.retain(|e| e.branch.name == branch);
         history.sort_by_key(|e| std::cmp::Reverse(e.id.0));
@@ -465,7 +498,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 })?,
         };
 
-        self.deploy_at(project_id, branch, Some(target_sha)).await
+        self.deploy_at(project_id, branch, Some(target_sha), operator)
+            .await
     }
 
     /// Resolves secrets, runs the container, runs `[build].on_start` hooks,
@@ -479,6 +513,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         image: String,
         url: String,
         env: &mut Environment,
+        operator: Option<&str>,
     ) -> Result<(), CpError> {
         // Global -> Project -> Branch secrets plus orchestrator runtime
         // variables (SPEC.md §2.1/§4.4).
@@ -571,12 +606,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map_err(|e| state_err(&e))?;
         self.store.update(env).await?;
         self.store
-            .record(&AuditEvent::new(
+            .record(&AuditEvent::with_operator(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
                 env.id,
                 StateTransition::BuildSucceeded,
                 Some(name),
                 now,
+                operator.map(str::to_owned),
             ))
             .await?;
         Ok(())
@@ -815,6 +851,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         environment_id: EnvironmentId,
         purge_secrets: bool,
     ) -> Result<(), CpError> {
+        self.destroy_with_operator(environment_id, purge_secrets, None)
+            .await
+    }
+
+    /// Identical to [`Self::destroy`], attributing the resulting audit
+    /// event to `operator`.
+    ///
+    /// # Errors
+    /// Same as [`Self::destroy`].
+    pub async fn destroy_with_operator(
+        &self,
+        environment_id: EnvironmentId,
+        purge_secrets: bool,
+        operator: Option<String>,
+    ) -> Result<(), CpError> {
         let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
@@ -846,12 +897,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map_err(|e| state_err(&e))?;
         self.store.update(&env).await?;
         self.store
-            .record(&AuditEvent::new(
+            .record(&AuditEvent::with_operator(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
                 env.id,
                 StateTransition::Destroy,
                 None,
                 now,
+                operator,
             ))
             .await?;
         Ok(())
@@ -928,6 +980,69 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .oci
             .stream_logs(&container_name(&project, &env.branch.name))
             .await?)
+    }
+
+    /// Mints a new named API token, returning its id and the raw token —
+    /// the only time the raw value is ever available; only its `SHA-256`
+    /// hash is persisted (SPEC.md's "lightweight multi-user" model: named
+    /// tokens on top of the single `OXID_API_TOKEN` master credential,
+    /// giving the audit trail a real operator identity instead of an
+    /// anonymous shared secret).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn create_operator_token(&self, name: &str) -> Result<(u64, String), CpError> {
+        let mut raw = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
+        let raw_token = hex::encode(raw);
+        let id = self
+            .store
+            .create_api_token(name, &hash_token(&raw_token))
+            .await?;
+        Ok((id, raw_token))
+    }
+
+    /// Resolves a bearer token to its operator name, if it matches a live
+    /// (non-revoked) named token.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn find_operator_by_token(&self, raw_token: &str) -> Result<Option<String>, CpError> {
+        Ok(self
+            .store
+            .find_operator_by_token_hash(&hash_token(raw_token))
+            .await?)
+    }
+
+    /// Lists every named token (revoked ones included), newest first.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn list_operator_tokens(&self) -> Result<Vec<ApiTokenSummary>, CpError> {
+        Ok(self.store.list_api_tokens().await?)
+    }
+
+    /// Revokes a named token by id.
+    ///
+    /// # Errors
+    /// [`CpError::NotFound`] if no token with that id exists.
+    pub async fn revoke_operator_token(&self, id: u64) -> Result<(), CpError> {
+        Ok(self.store.revoke_api_token(id).await?)
+    }
+
+    /// Re-encrypts every secret under `new_key` and swaps it in atomically
+    /// (see [`SqliteStore::rotate_master_key`]) — no restart needed. The
+    /// caller is still responsible for persisting `new_key` to
+    /// `secret.key` (see `api.rs`'s `rotate_key` handler), since only it
+    /// knows the data directory.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage or crypto failure.
+    pub async fn rotate_master_key(&self, new_key: [u8; 32]) -> Result<(), CpError> {
+        self.store
+            .rotate_master_key(crate::adapter::crypto::Cipher::from_key(new_key))
+            .await
+            .map_err(|e| CpError::Store(RepositoryError::Storage(e.to_string())))
     }
 
     /// Writes a consistent database snapshot to `dest` (see
@@ -1226,6 +1341,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
 fn state_err(err: &oxid_core::EnvironmentStateError) -> CpError {
     CpError::Domain(DomainError::Invalid(err.to_string()))
+}
+
+/// Hashes a raw API token for storage/lookup — tokens are full-entropy
+/// random values (not user-chosen passwords), so a plain fast hash is
+/// appropriate; no salt/KDF needed since there's nothing to brute-force
+/// offline once the hash alone is known.
+fn hash_token(raw_token: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(raw_token.as_bytes());
+    hex::encode(digest)
 }
 
 fn container_name(project: &Project, branch: &BranchName) -> String {

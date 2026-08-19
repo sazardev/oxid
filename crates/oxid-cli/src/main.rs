@@ -116,6 +116,34 @@ enum Command {
         /// The `.tar` archive to upload.
         file: String,
     },
+    /// Manage named API tokens (requires the master `OXID_API_TOKEN`).
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+    /// Checks the daemon is reachable, reports its version/latency, and
+    /// whether the configured `--token`/`OXID_TOKEN` authenticates.
+    Doctor,
+    /// Rotates the master encryption key: re-encrypts every secret under a
+    /// fresh key with zero downtime (requires the master `OXID_API_TOKEN`).
+    RotateKey,
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenAction {
+    /// Mint a new named token. Prints the raw token once — it's never
+    /// retrievable again after this.
+    Create {
+        /// Name identifying who/what this token is for.
+        name: String,
+    },
+    /// List every token (revoked ones included), without the raw value.
+    List,
+    /// Revoke a token by id.
+    Revoke {
+        /// Token id, from `oxid token list`.
+        id: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -392,6 +420,13 @@ async fn main() {
         }
         Command::Backup { file } => cmd_backup(&client, &base, &file).await,
         Command::Restore { file } => cmd_restore(&client, &base, &file).await,
+        Command::Token { action } => match action {
+            TokenAction::Create { name } => cmd_token_create(&client, &base, &name).await,
+            TokenAction::List => cmd_token_list(&client, &base).await,
+            TokenAction::Revoke { id } => cmd_token_revoke(&client, &base, id).await,
+        },
+        Command::Doctor => cmd_doctor(&client, &base).await,
+        Command::RotateKey => cmd_rotate_key(&client, &base).await,
     };
 
     if let Err(err) = result {
@@ -873,6 +908,168 @@ async fn cmd_restore(client: &Client, base: &str, file: &str) -> Result<(), CliE
     Ok(())
 }
 
+async fn cmd_token_create(client: &Client, base: &str, name: &str) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/tokens");
+    let response = client
+        .post(&url)
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "creating token failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&value) {
+        let token = value["token"].as_str().unwrap_or("?");
+        let id = value["id"].as_u64().unwrap_or(0);
+        ok(format!("Token `{name}` created (id {id}): {token}"));
+        bg("This is the only time the raw token is shown — store it now.");
+    }
+    Ok(())
+}
+
+async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
+    let value = get_json(client, format!("{base}/api/v1/tokens")).await?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    let tokens = value
+        .as_array()
+        .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
+    if tokens.is_empty() {
+        bg("No tokens issued yet.");
+        return Ok(());
+    }
+    println!("{:<5} {:<24} {:<10} CREATED", "ID", "NAME", "STATUS");
+    for token in tokens {
+        let status = if token["revoked"].as_bool().unwrap_or(false) {
+            "revoked"
+        } else {
+            "active"
+        };
+        println!(
+            "{:<5} {:<24} {:<10} {}",
+            token["id"].as_u64().unwrap_or_default(),
+            token["name"].as_str().unwrap_or("?"),
+            status,
+            format_occurred_at(&token["created_at"]),
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_token_revoke(client: &Client, base: &str, id: u64) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/tokens/{id}");
+    let response = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "revoking token failed"));
+    }
+    if !emit_json(&json!({ "status": "revoked", "id": id })) {
+        ok(format!("Token {id} revoked"));
+    }
+    Ok(())
+}
+
+/// Preflight/diagnostic check: is the daemon reachable, what version is it
+/// running, and (if a token is configured) does it actually authenticate —
+/// instead of a command failing halfway through with a less obvious error.
+async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
+    let start = std::time::Instant::now();
+    let url = format!("{base}/api/v1/health");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let latency = start.elapsed();
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "daemon health check failed"));
+    }
+    let health: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    let version = health["version"].as_str().unwrap_or("unknown");
+
+    let (auth_status, auth_ok) = match get_json(client, format!("{base}/api/v1/projects")).await {
+        Ok(_) => ("ok", true),
+        Err(err) if err.code == EXIT_UNAUTHORIZED => ("unauthorized", false),
+        Err(err) => return Err(err),
+    };
+
+    if !emit_json(&json!({
+        "reachable": true,
+        "version": version,
+        "latency_ms": latency.as_millis(),
+        "auth": auth_status,
+    })) {
+        ok(format!(
+            "Daemon reachable at {base} (v{version}, {}ms)",
+            latency.as_millis()
+        ));
+        if auth_ok {
+            ok("Control API authenticates correctly");
+        } else {
+            bg(
+                "Control API requires a token that wasn't provided/didn't work — pass --token or set OXID_TOKEN",
+            );
+        }
+    }
+    if auth_ok {
+        Ok(())
+    } else {
+        Err(CliError::new(
+            "authentication check failed",
+            EXIT_UNAUTHORIZED,
+        ))
+    }
+}
+
+async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/rotate-key");
+    let response = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "rotating master key failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&value) {
+        ok("Master key rotated — every secret re-encrypted, zero downtime");
+        if let Some(note) = value["note"].as_str() {
+            bg(note);
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_ps(client: &Client, base: &str) -> Result<(), CliError> {
     let url = format!("{base}/api/v1/projects");
     let response = client
@@ -1158,6 +1355,45 @@ mod tests {
             Command::Restore { file } => assert_eq!(file, "out.tar"),
             other => panic!("expected Restore, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_token_subcommands() {
+        let cli = Cli::try_parse_from(["oxid", "token", "create", "alice"]).unwrap();
+        match cli.command {
+            Command::Token {
+                action: TokenAction::Create { name },
+            } => assert_eq!(name, "alice"),
+            other => panic!("expected Token::Create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["oxid", "token", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token {
+                action: TokenAction::List
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["oxid", "token", "revoke", "7"]).unwrap();
+        match cli.command {
+            Command::Token {
+                action: TokenAction::Revoke { id },
+            } => assert_eq!(id, 7),
+            other => panic!("expected Token::Revoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_command() {
+        let cli = Cli::try_parse_from(["oxid", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Command::Doctor));
+    }
+
+    #[test]
+    fn parses_rotate_key_command() {
+        let cli = Cli::try_parse_from(["oxid", "rotate-key"]).unwrap();
+        assert!(matches!(cli.command, Command::RotateKey));
     }
 
     #[test]

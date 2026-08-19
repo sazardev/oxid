@@ -6,7 +6,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -22,6 +22,9 @@ use oxid_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use tower_governor::GovernorLayer;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::GlobalKeyExtractor;
 
 use crate::{ControlPlane, CpError};
 
@@ -52,18 +55,34 @@ pub struct ApiState<
     /// the handler's doc comment) rather than hot-swapping a live database,
     /// but accepting the upload at all is still an operator opt-in.
     pub allow_restore: bool,
+    /// Rate limit for the protected control-plane routes: `(requests per
+    /// second sustained, burst size)`. `None` disables it entirely — the
+    /// default, since it only matters once an API token is handed to more
+    /// than one trusted party (`OXID_RATE_LIMIT_PER_SECOND`/
+    /// `OXID_RATE_LIMIT_BURST`). Deliberately a single global bucket, not
+    /// per-client: distinguishing clients would need `ConnectInfo` wired
+    /// through both the plain-HTTP and TLS serve paths in `main.rs` for
+    /// comparatively little benefit on what's meant to be a small
+    /// team/CI's shared credential, not a public API.
+    pub rate_limit: Option<(u64, u32)>,
 }
 
 /// Builds the API router. Every route except `/health`, `/webhooks/github`,
 /// `/wake` and `/heartbeat` requires `state.api_token` when it's configured
 /// (see [`require_bearer_token`]).
+///
+/// # Panics
+/// Panics if `state.rate_limit` is `Some` with a rate-limit configuration
+/// `tower_governor` rejects — can't happen here since both values are
+/// clamped to at least `1` first.
 pub fn router<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     state: ApiState<G, O>,
 ) -> Router {
-    let protected = Router::new()
+    let rate_limit = state.rate_limit;
+    let mut protected = Router::new()
         .route(
             "/api/v1/projects",
             post(register_project).get(list_projects),
@@ -88,6 +107,9 @@ pub fn router<
         )
         .route("/api/v1/environments/{env_id}/pause", post(pause))
         .route("/api/v1/environments/{env_id}/wake", post(wake))
+        .route("/api/v1/tokens", post(create_token).get(list_tokens))
+        .route("/api/v1/tokens/{id}", delete(revoke_token))
+        .route("/api/v1/rotate-key", post(rotate_key))
         .route("/api/v1/audit", get(recent_audit))
         .route("/api/v1/backup", get(backup))
         .route("/api/v1/backup/restore", post(restore))
@@ -105,6 +127,16 @@ pub fn router<
             require_bearer_token::<G, O>,
         ));
 
+    if let Some((per_second, burst)) = rate_limit {
+        let governor_conf = GovernorConfigBuilder::default()
+            .per_second(per_second.max(1))
+            .burst_size(burst.max(1))
+            .key_extractor(GlobalKeyExtractor)
+            .finish()
+            .expect("valid rate limit config");
+        protected = protected.layer(GovernorLayer::new(governor_conf));
+    }
+
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/wake", post(wake_by_host))
@@ -117,16 +149,31 @@ pub fn router<
         .with_state(state)
 }
 
+/// Which credential a request authenticated with — attached to
+/// [`Request::extensions`] by [`require_bearer_token`] so handlers can
+/// attribute audit events to a named operator, or restrict
+/// token-management endpoints to the master credential only.
+#[derive(Debug, Clone)]
+enum AuthedAs {
+    /// The single shared `OXID_API_TOKEN` — anonymous by design (it's
+    /// meant to be one credential for the whole team/CI, not a person).
+    Master,
+    /// A named, database-issued token (see [`create_token`]).
+    Operator(String),
+}
+
 /// Rejects requests missing a valid `Authorization: Bearer <token>` header
 /// when `state.api_token` is configured; passes everything through
-/// unchanged otherwise (open by default, see [`ApiState::api_token`]).
+/// unchanged otherwise (open by default, see [`ApiState::api_token`]). A
+/// valid token is either the master `OXID_API_TOKEN` or any non-revoked
+/// named token issued via `POST /api/v1/tokens`.
 async fn require_bearer_token<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Some(expected) = state.api_token.as_deref() else {
@@ -136,12 +183,53 @@ async fn require_bearer_token<
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match provided {
-        Some(token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
+    let Some(token) = provided else {
+        return ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+            .into_response();
+    };
+    if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+        request.extensions_mut().insert(AuthedAs::Master);
+        return next.run(request).await;
+    }
+    match state.cp.find_operator_by_token(token).await {
+        Ok(Some(name)) => {
+            request.extensions_mut().insert(AuthedAs::Operator(name));
             next.run(request).await
         }
         _ => ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
             .into_response(),
+    }
+}
+
+/// The operator name to attribute an audit event to: `None` for the master
+/// token (anonymous by design) or an unauthenticated (open API) request.
+fn operator_name(authed: Option<&Extension<AuthedAs>>) -> Option<String> {
+    match authed {
+        Some(Extension(AuthedAs::Operator(name))) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// Restricts an endpoint to the master `OXID_API_TOKEN` — used for token
+/// management, so any named operator can't mint or revoke other operators'
+/// credentials. A no-op when the API has no token configured at all
+/// (matches every other endpoint's "open by default" behavior).
+fn require_master<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    state: &ApiState<G, O>,
+    authed: Option<&Extension<AuthedAs>>,
+) -> ApiResult<()> {
+    if state.api_token.is_none() {
+        return Ok(());
+    }
+    match authed {
+        Some(Extension(AuthedAs::Master)) => Ok(()),
+        _ => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "token management requires the master OXID_API_TOKEN",
+        )),
     }
 }
 
@@ -281,7 +369,7 @@ type ApiResult<T> = Result<T, ApiError>;
 // ---------------------------------------------------------------------------
 
 async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
+    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn register_project<
@@ -341,11 +429,122 @@ async fn deploy<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<DeployBody>,
 ) -> ApiResult<(StatusCode, Json<Environment>)> {
     let branch = parse_branch(&body.branch)?;
-    let env = state.cp.deploy(ProjectId(id), branch).await?;
+    let env = state
+        .cp
+        .deploy_with_operator(ProjectId(id), branch, operator_name(authed.as_ref()))
+        .await?;
     Ok((StatusCode::CREATED, Json(env)))
+}
+
+/// Body for `POST /api/v1/tokens`.
+#[derive(Debug, Deserialize)]
+struct CreateTokenBody {
+    /// Human-readable name for the operator this token identifies.
+    name: String,
+}
+
+/// Mints a named token, master-token-only. The raw token is only ever
+/// returned in this response — only its hash is persisted.
+async fn create_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+    Json(body): Json<CreateTokenBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_master(&state, authed.as_ref())?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::from_validation("token name cannot be empty"));
+    }
+    let (id, token) = state.cp.create_operator_token(body.name.trim()).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "name": body.name, "token": token })),
+    ))
+}
+
+/// Lists every named token (never the raw value or its hash),
+/// master-token-only.
+async fn list_tokens<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<Json<Vec<crate::adapter::store::ApiTokenSummary>>> {
+    require_master(&state, authed.as_ref())?;
+    Ok(Json(state.cp.list_operator_tokens().await?))
+}
+
+/// Revokes a named token by id, master-token-only.
+async fn revoke_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<StatusCode> {
+    require_master(&state, authed.as_ref())?;
+    state.cp.revoke_operator_token(id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotates the master encryption key: generates a fresh random key,
+/// re-encrypts every secret and swaps it in with zero downtime (see
+/// [`crate::ControlPlane::rotate_master_key`]), then persists it to
+/// `secret.key`. Master-token-only, since a bad rotation can lock every
+/// secret away.
+///
+/// If the daemon was started with `OXID_MASTER_KEY` set instead of a
+/// `secret.key` file, that environment variable still wins on the next
+/// restart — the response's `note` field calls this out so the caller
+/// doesn't get a nasty surprise after a redeploy.
+async fn rotate_key<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_master(&state, authed.as_ref())?;
+    let mut new_key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut new_key);
+    state.cp.rotate_master_key(new_key).await?;
+
+    let key_path = state.data_dir.join("secret.key");
+    if let Err(e) = std::fs::write(&key_path, new_key) {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "rotated every secret in the database, but failed to persist the new key to \
+                 `{}`: {e}. Do NOT restart the daemon until this is fixed, or it will load the \
+                 old key and be unable to decrypt any secret. The new key is `{}` — set \
+                 OXID_MASTER_KEY to it explicitly if you must restart now.",
+                key_path.display(),
+                hex::encode(new_key)
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "rotated",
+            "note": "already live; if OXID_MASTER_KEY is set on this daemon instead of relying \
+                     on secret.key, update it too before the next restart",
+        })),
+    ))
 }
 
 const DEFAULT_AUDIT_LIMIT: u64 = 50;
@@ -464,12 +663,18 @@ async fn rollback<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RollbackBody>,
 ) -> ApiResult<(StatusCode, Json<Environment>)> {
     let branch = parse_branch(&body.branch)?;
     let env = state
         .cp
-        .rollback(ProjectId(id), branch, body.to_sha)
+        .rollback_with_operator(
+            ProjectId(id),
+            branch,
+            body.to_sha,
+            operator_name(authed.as_ref()),
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(env)))
 }
@@ -554,10 +759,15 @@ async fn destroy<
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
     Query(query): Query<DestroyQuery>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
     state
         .cp
-        .destroy(EnvironmentId(env_id), query.purge_secrets)
+        .destroy_with_operator(
+            EnvironmentId(env_id),
+            query.purge_secrets,
+            operator_name(authed.as_ref()),
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1072,6 +1282,7 @@ mod tests {
                 api_token: None,
                 data_dir: test_data_dir(),
                 allow_restore: true,
+                rate_limit: None,
             }),
             oci,
         )
@@ -1087,6 +1298,7 @@ mod tests {
             api_token: Some(token.to_owned()),
             data_dir: test_data_dir(),
             allow_restore: true,
+            rate_limit: None,
         })
     }
 
@@ -1261,6 +1473,254 @@ port = 8080
     }
 
     #[tokio::test]
+    async fn creating_a_token_requires_the_master_credential() {
+        let app = test_app_with_token("master-secret").await;
+
+        // A request with no token at all isn't even authenticated.
+        let (status, _) =
+            json_request(&app, "POST", "/api/v1/tokens", json!({ "name": "alice" })).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The master token can mint one.
+        let (status, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/tokens",
+            json!({ "name": "alice" }),
+            Some("master-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let alice_token = created["token"].as_str().unwrap().to_owned();
+        assert_eq!(alice_token.len(), 64, "expected a 32-byte hex token");
+
+        // Alice's own (non-master) token cannot mint tokens for others.
+        let (status, _) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/tokens",
+            json!({ "name": "bob" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_named_token_authenticates_and_attributes_audit_events() {
+        let repo = repo_dir_with_config();
+        let app = test_app_with_token("master-secret").await;
+
+        let (_, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/tokens",
+            json!({ "name": "alice" }),
+            Some("master-secret"),
+        )
+        .await;
+        let alice_token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let (status, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = json_request_with_auth(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = json_request_with_auth(
+            &app,
+            "GET",
+            format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+            json!({}),
+            Some("master-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            events.iter().any(|e| e["operator"] == "alice"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_tokens_stop_authenticating() {
+        let app = test_app_with_token("master-secret").await;
+        let (_, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/tokens",
+            json!({ "name": "alice" }),
+            Some("master-secret"),
+        )
+        .await;
+        let created: Value = serde_json::from_slice(&body).unwrap();
+        let alice_token = created["token"].as_str().unwrap().to_owned();
+        let id = created["id"].as_u64().unwrap();
+
+        let (status, _) = json_request_with_auth(
+            &app,
+            "GET",
+            "/api/v1/projects",
+            json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = json_request_with_auth(
+            &app,
+            "DELETE",
+            format!("/api/v1/tokens/{id}").as_str(),
+            json!({}),
+            Some("master-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = json_request_with_auth(
+            &app,
+            "GET",
+            "/api/v1/projects",
+            json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rotate_key_requires_master_and_keeps_secrets_readable() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let data_dir = test_data_dir();
+        let app = router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: Some("master-secret".to_owned()),
+            data_dir: data_dir.clone(),
+            allow_restore: true,
+            rate_limit: None,
+        });
+
+        json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/secrets",
+            json!({ "name": "DB_PASSWORD", "scope": "global", "value": "hunter2" }),
+            Some("master-secret"),
+        )
+        .await;
+
+        let old_key = std::fs::read(data_dir.join("secret.key")).unwrap();
+
+        // A named (non-master) token can't rotate the key.
+        let (_, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/tokens",
+            json!({ "name": "alice" }),
+            Some("master-secret"),
+        )
+        .await;
+        let alice_token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (status, _) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/rotate-key",
+            json!({}),
+            Some(&alice_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The master token can, and the secret.key file actually changes.
+        let (status, _) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/rotate-key",
+            json!({}),
+            Some("master-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let new_key = std::fs::read(data_dir.join("secret.key")).unwrap();
+        assert_ne!(old_key, new_key);
+
+        // Secrets set before rotation are still readable after it — hot
+        // rotation, not "wipe and start over".
+        let (status, body) = json_request_with_auth(
+            &app,
+            "GET",
+            "/api/v1/secrets",
+            json!({}),
+            Some("master-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_blocks_a_burst_past_its_configured_size() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let app = router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: test_data_dir(),
+            allow_restore: true,
+            // 1 request/sec sustained, burst of 2 — the 3rd immediate
+            // request must be rejected.
+            rate_limit: Some((1, 2)),
+        });
+
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+            statuses.push(status);
+        }
+        assert_eq!(statuses[0], StatusCode::OK);
+        assert_eq!(statuses[1], StatusCode::OK);
+        assert_eq!(statuses[2], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
+
+        // Public routes (no auth gate) are never rate-limited by this —
+        // Traefik's forwardAuth heartbeat hits `/heartbeat` on every single
+        // request to a live app and must never be throttled.
+        for _ in 0..5 {
+            let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody").await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
     async fn register_and_deploy_flow() {
         let repo = repo_dir_with_config();
         let (app, oci) = test_app().await;
@@ -1325,6 +1785,7 @@ port = 8080
             api_token: None,
             data_dir: data_dir.clone(),
             allow_restore: true,
+            rate_limit: None,
         });
         // Give the backup something real to capture.
         json_request(
@@ -1365,6 +1826,7 @@ port = 8080
             api_token: None,
             data_dir: test_data_dir(),
             allow_restore: false,
+            rate_limit: None,
         });
 
         let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", vec![1, 2, 3]).await;
@@ -1385,6 +1847,7 @@ port = 8080
             api_token: None,
             data_dir: data_dir.clone(),
             allow_restore: true,
+            rate_limit: None,
         });
 
         let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;

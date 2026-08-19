@@ -8,7 +8,9 @@
 //! - variable-length collections (`on_start`, `dependencies`) as JSON.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
@@ -39,7 +41,11 @@ pub enum StoreError {
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
-    cipher: Cipher,
+    /// `ArcSwap`, not a plain field, so [`Self::rotate_master_key`] can
+    /// atomically swap in a new key with zero downtime — every other clone
+    /// of this `SqliteStore` (one per in-flight request) sees the new key
+    /// on its very next encrypt/decrypt call, no restart needed.
+    cipher: Arc<ArcSwap<Cipher>>,
 }
 
 impl SqliteStore {
@@ -96,13 +102,52 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Re-encrypts every stored secret under `new_cipher` and atomically
+    /// swaps it in — zero downtime, no restart. The re-encryption pass runs
+    /// inside one transaction (all rows or none — with `max_connections(1)`
+    /// this also blocks out any concurrent secret write until it commits,
+    /// so nothing can be written mid-rotation under the wrong key), and
+    /// only *after* it commits successfully does the in-memory cipher
+    /// change — a failed rotation leaves every secret exactly as it was.
+    ///
+    /// The caller (the daemon, which alone knows the data directory) still
+    /// has to persist `new_cipher`'s key to `secret.key` itself — see
+    /// `api.rs`'s `rotate_key` handler.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on query or encryption/decryption failure.
+    pub async fn rotate_master_key(&self, new_cipher: Cipher) -> Result<(), StoreError> {
+        let old_cipher = self.cipher.load_full();
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query("SELECT id, value_enc FROM secrets")
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in rows {
+            let id: i64 = row.try_get("id")?;
+            let value_enc: String = row.try_get("value_enc")?;
+            let plaintext = old_cipher.decrypt(&value_enc)?;
+            let re_encrypted = new_cipher.encrypt(&plaintext)?;
+            sqlx::query("UPDATE secrets SET value_enc = ? WHERE id = ?")
+                .bind(re_encrypted)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        self.cipher.store(Arc::new(new_cipher));
+        Ok(())
+    }
+
     async fn open_with(opts: SqliteConnectOptions, cipher: Cipher) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, cipher })
+        Ok(Self {
+            pool,
+            cipher: Arc::new(ArcSwap::from_pointee(cipher)),
+        })
     }
 
     /// Lists every environment across all projects, regardless of state.
@@ -255,6 +300,118 @@ impl SqliteStore {
             })
             .collect()
     }
+
+    /// Creates a new named API token, storing only its `SHA-256` hash —
+    /// the raw token is returned once here and never persisted or
+    /// retrievable again, same convention as a password.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+    ) -> Result<u64, RepositoryError> {
+        let row = sqlx::query(
+            "INSERT INTO api_tokens (name, token_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(name)
+        .bind(token_hash)
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let id: i64 = row.try_get("id").map_err(storage)?;
+        u64::try_from(id).map_err(|_| storage("token id overflowed u64"))
+    }
+
+    /// Looks up the operator name for a token hash, if it exists and hasn't
+    /// been revoked. Backs bearer-token authentication for named tokens.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn find_operator_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let row =
+            sqlx::query("SELECT name FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        row.map(|r| r.try_get::<String, _>("name").map_err(storage))
+            .transpose()
+    }
+
+    /// Lists every token (including revoked ones), newest first — never
+    /// includes the raw token or its hash.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn list_api_tokens(&self) -> Result<Vec<ApiTokenSummary>, RepositoryError> {
+        let rows =
+            sqlx::query("SELECT id, name, created_at, revoked_at FROM api_tokens ORDER BY id DESC")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                let id: i64 = r.try_get("id").map_err(storage)?;
+                let name: String = r.try_get("name").map_err(storage)?;
+                let created_at = ts_from_row(r, "created_at")?;
+                let revoked_at: Option<i64> = r.try_get("revoked_at").map_err(storage)?;
+                Ok(ApiTokenSummary {
+                    id: u64::try_from(id).map_err(|_| storage("token id overflowed u64"))?,
+                    name,
+                    created_at,
+                    revoked: revoked_at.is_some(),
+                })
+            })
+            .collect()
+    }
+
+    /// Marks a token revoked (idempotent — revoking twice is a no-op, not
+    /// an error).
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError::NotFound`] if no token with that id exists.
+    pub async fn revoke_api_token(&self, id: u64) -> Result<(), RepositoryError> {
+        let res =
+            sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+                .bind(OffsetDateTime::now_utc().unix_timestamp())
+                .bind(id_as_i64(id))
+                .execute(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            // Already revoked or never existed — distinguish so callers get
+            // a real 404 for a bogus id instead of a silent success.
+            let exists = sqlx::query("SELECT 1 FROM api_tokens WHERE id = ?")
+                .bind(id_as_i64(id))
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_some();
+            if !exists {
+                return Err(RepositoryError::NotFound(format!("api token `{id}`")));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Non-secret view of an `api_tokens` row (no hash, no raw token).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ApiTokenSummary {
+    /// Token id (used to revoke it).
+    pub id: u64,
+    /// Human-readable name chosen at creation (e.g. an operator's username).
+    pub name: String,
+    /// When the token was created.
+    pub created_at: OffsetDateTime,
+    /// Whether the token has been revoked.
+    pub revoked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +791,7 @@ impl EnvironmentStore for SqliteStore {
 // audit mapping
 // ---------------------------------------------------------------------------
 
-const AUDIT_COLUMNS: &str = "id, environment_id, kind, detail, occurred_at";
+const AUDIT_COLUMNS: &str = "id, environment_id, kind, detail, occurred_at, operator";
 
 fn audit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -642,27 +799,30 @@ fn audit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Repositor
     let kind: String = row.try_get("kind").map_err(storage)?;
     let detail: Option<String> = row.try_get("detail").map_err(storage)?;
     let occurred_at = ts_from_row(row, "occurred_at")?;
+    let operator: Option<String> = row.try_get("operator").map_err(storage)?;
 
-    Ok(AuditEvent::new(
+    Ok(AuditEvent::with_operator(
         id,
         EnvironmentId(environment_id),
         kind.parse::<StateTransition>()
             .map_err(|e| validation(&e))?,
         detail,
         occurred_at,
+        operator,
     ))
 }
 
 impl AuditStore for SqliteStore {
     async fn record(&self, event: &AuditEvent) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO audit_events (environment_id, kind, detail, occurred_at) \
-                     VALUES (?, ?, ?, ?)",
+            "INSERT INTO audit_events (environment_id, kind, detail, occurred_at, operator) \
+                     VALUES (?, ?, ?, ?, ?)",
         )
         .bind(id_as_i64(event.environment_id.0))
         .bind(event.kind.to_string())
         .bind(event.detail.as_deref())
         .bind(ts(&event.occurred_at))
+        .bind(event.operator.as_deref())
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -710,7 +870,11 @@ impl SecretStore for SqliteStore {
         scope: EnvVarScope,
         value: &SecretValue,
     ) -> Result<(), RepositoryError> {
-        let value_enc = self.cipher.encrypt(value.as_str()).map_err(storage)?;
+        let value_enc = self
+            .cipher
+            .load()
+            .encrypt(value.as_str())
+            .map_err(storage)?;
         let project_bind = project_id.map(|id| id_as_i64(id.0));
         let branch_bind = branch.map(oxid_core::BranchName::as_str);
         let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -763,7 +927,7 @@ impl SecretStore for SqliteStore {
             let scope: String = row.try_get("scope").map_err(storage)?;
             let scope = scope.parse::<EnvVarScope>().map_err(storage)?;
             let value_enc: String = row.try_get("value_enc").map_err(storage)?;
-            let value = self.cipher.decrypt(&value_enc).map_err(storage)?;
+            let value = self.cipher.load().decrypt(&value_enc).map_err(storage)?;
             let mut single = SecretContext::new();
             single.set(name, scope, SecretValue::new(value));
             ctx = ctx.merge([single]);
@@ -857,6 +1021,52 @@ mod tests {
         let dest = dir.path().join("snapshot.sqlite");
         store.backup_to(&dest).await.unwrap();
         assert!(dest.exists(), "expected {} to exist", dest.display());
+    }
+
+    #[tokio::test]
+    async fn rotate_master_key_re_encrypts_and_swaps_with_no_downtime() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        SecretStore::set_secret(
+            &store,
+            None,
+            None,
+            "DB_PASSWORD",
+            EnvVarScope::Global,
+            &SecretValue::new("hunter2".to_owned()),
+        )
+        .await
+        .unwrap();
+
+        let old_value_enc: String = sqlx::query("SELECT value_enc FROM secrets")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .try_get("value_enc")
+            .unwrap();
+
+        let new_cipher = Cipher::from_key([42u8; 32]);
+        store.rotate_master_key(new_cipher).await.unwrap();
+
+        // Still readable through the store (now under the new key).
+        let ctx = SecretStore::secrets_for(&store, None, None).await.unwrap();
+        assert_eq!(
+            ctx.resolved_map().get("DB_PASSWORD").unwrap().as_str(),
+            "hunter2"
+        );
+
+        // The raw ciphertext on disk actually changed — this isn't just an
+        // in-memory swap with stale data left behind.
+        let new_value_enc: String = sqlx::query("SELECT value_enc FROM secrets")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .try_get("value_enc")
+            .unwrap();
+        assert_ne!(old_value_enc, new_value_enc);
+
+        // The old key genuinely can't decrypt it anymore.
+        let old_cipher = Cipher::from_key([1u8; 32]);
+        assert!(old_cipher.decrypt(&new_value_enc).is_err());
     }
 
     fn project(id: u64) -> Project {

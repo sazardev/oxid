@@ -48,6 +48,13 @@
 //!   /api/v1/backup/restore` uploads at all (rejected with `403` otherwise).
 //!   A restore never touches the live database in place — it stages the
 //!   upload and applies it on the *next* startup (see [`apply_staged_restore`]).
+//! - `OXID_RATE_LIMIT_PER_SECOND` / `OXID_RATE_LIMIT_BURST` — when **both**
+//!   are set, caps the protected control-plane routes to a shared token
+//!   bucket (sustained requests/sec, burst size) so a single misbehaving
+//!   script holding the API token can't saturate the daemon. Unset by
+//!   default (unlimited) — it's a single global bucket, not per-client, so
+//!   it only matters once the token is handed to more than one trusted
+//!   party.
 //!
 //! **Network topology note for `OXID_POSTGRES_URL`/`OXID_REDIS_URL`:** the
 //! same URL is used both by this daemon (to run `CREATE`/`DROP DATABASE` as
@@ -149,12 +156,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
+    let rate_limit = rate_limit_from_env();
     let app = router(ApiState {
         cp,
         webhook_secret,
         api_token,
         data_dir: data_dir_path,
         allow_restore,
+        rate_limit,
     });
     let tls = load_tls_config().await?;
     if let Some(config) = tls {
@@ -175,6 +184,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         axum::serve(listener, app).await?;
     }
     Ok(())
+}
+
+/// Reads `OXID_RATE_LIMIT_PER_SECOND`/`OXID_RATE_LIMIT_BURST`. `None`
+/// (rate limiting disabled) unless both are set and parse.
+fn rate_limit_from_env() -> Option<(u64, u32)> {
+    let per_second = std::env::var("OXID_RATE_LIMIT_PER_SECOND")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())?;
+    let burst = std::env::var("OXID_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())?;
+    Some((per_second, burst))
 }
 
 /// Loads `OXID_TLS_CERT`/`OXID_TLS_KEY` into a rustls server config when

@@ -19,6 +19,10 @@ pub struct AuditEvent {
     pub detail: Option<String>,
     /// When the event happened.
     pub occurred_at: OffsetDateTime,
+    /// Name of the operator (named API token) who triggered this event.
+    /// `None` for the master `OXID_API_TOKEN` or system-initiated events
+    /// (the GC sweep).
+    pub operator: Option<String>,
 }
 
 impl AuditEvent {
@@ -31,12 +35,26 @@ impl AuditEvent {
         detail: Option<String>,
         occurred_at: OffsetDateTime,
     ) -> Self {
+        Self::with_operator(id, environment_id, kind, detail, occurred_at, None)
+    }
+
+    /// Creates a new audit event attributed to `operator`.
+    #[must_use]
+    pub fn with_operator(
+        id: u64,
+        environment_id: EnvironmentId,
+        kind: StateTransition,
+        detail: Option<String>,
+        occurred_at: OffsetDateTime,
+        operator: Option<String>,
+    ) -> Self {
         Self {
             id,
             environment_id,
             kind,
             detail,
             occurred_at,
+            operator,
         }
     }
 }
