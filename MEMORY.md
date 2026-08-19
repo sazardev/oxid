@@ -71,7 +71,22 @@ just "where did we leave off and why."
   webhook both report `202 {"status":"queued","position":N}`; `oxid up`
   prints the queued position instead of a misleading "live at" line; new
   `oxid queue` command lists the backlog.
-- Full test/clippy/fmt pass green (125 daemon/core tests + 32 CLI tests).
+- **Embedded web dashboard (this round), live-verified in a real browser:**
+  SPEC.md §5.3's dashboard, implemented with zero new dependencies — static
+  `index.html`/`style.css`/`app.js` + vendored Alpine.js (54KB, no CDN)
+  embedded via `include_str!` and served from `/` alongside the API. Shows
+  live environments (deduplicated per branch like `oxid status`) with
+  DESIGN.md's exact state visualization, pause/wake/destroy actions, the
+  deploy queue, recent audit, and a live log viewer streamed over
+  `fetch()`+`ReadableStream` (not `EventSource`, which can't send the
+  `Authorization` header the API requires). New `GET /api/v1/stats`
+  (`ControlPlane::node_stats`) backs the overview cards in one call. Found
+  and fixed a real bug live: `x-for` needs `<template x-for>` wrapping in
+  Alpine.js, not a bare element — without it every list silently threw and
+  rendered empty. Re-verified after the fix: static assets, `/api/v1/stats`,
+  wake/pause actions, real nginx log streaming, and the bearer-token 401
+  banner → correct-token recovery flow all worked end-to-end.
+- Full test/clippy/fmt pass green (127 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
