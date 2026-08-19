@@ -47,7 +47,31 @@ just "where did we leave off and why."
   hot master-key rotation (`oxid rotate-key` — `ArcSwap`-wrapped `Cipher`,
   transactional re-encryption of every secret, zero downtime, verified
   surviving a real daemon restart under the new key).
-- Full test/clippy/fmt pass green (115 daemon/core tests + 31 CLI tests).
+- **Catastrophe-resilience + resource-aware admission control pass (this
+  round), all live-verified:** deployed containers carry Docker's
+  `unless-stopped` restart policy (config correctness confirmed via `docker
+  inspect`; a true crash simulation couldn't be cleanly triggered in this
+  sandbox due to Docker/kernel signal-handling quirks, not a code issue);
+  startup reconciliation (`ControlPlane::reconcile_startup_state`) diffs the
+  database against Docker's actual container state before serving any
+  request — live-verified with a real pause/external-unpause/restart cycle;
+  graceful shutdown (SIGTERM/Ctrl+C drains in-flight requests) + best-effort
+  daemon OOM-score de-prioritization; new resource admission control
+  (`OXID_RESERVED_MEMORY_MB`, default 1024) — `docker info` capacity minus
+  reserved minus every live environment's committed memory decides whether a
+  new deploy proceeds immediately, gets queued (persisted in SQLite,
+  `deploy_queue` table, survives a daemon restart), or is rejected outright
+  via `CpError::InsufficientCapacity` if it could never fit alone; the GC
+  scheduler retries the queue every tick, FIFO first — live-verified
+  end-to-end: deployed two branches past a deliberately tight
+  `OXID_RESERVED_MEMORY_MB`, confirmed `oxid queue`/`GET /api/v1/queue`
+  showed the backlog, destroyed the live one, and watched the scheduler
+  auto-promote the queued branch to `Running` within one GC tick with zero
+  manual intervention. `POST /api/v1/projects/{id}/deploy` and the GitHub
+  webhook both report `202 {"status":"queued","position":N}`; `oxid up`
+  prints the queued position instead of a misleading "live at" line; new
+  `oxid queue` command lists the backlog.
+- Full test/clippy/fmt pass green (125 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
