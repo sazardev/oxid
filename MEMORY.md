@@ -86,11 +86,33 @@ just "where did we leave off and why."
   rendered empty. Re-verified after the fix: static assets, `/api/v1/stats`,
   wake/pause actions, real nginx log streaming, and the bearer-token 401
   banner → correct-token recovery flow all worked end-to-end.
-- Full test/clippy/fmt pass green (127 daemon/core tests + 32 CLI tests).
+- **Dashboard rebuilt as a real multi-page SPA (this round, live-verified),
+  in response to explicit feedback that the first pass was read-mostly and
+  modal-based instead of a real app:** client-side router
+  (`/ui/environments`, `/ui/projects/:id`, `/ui/projects/:id/secrets`,
+  `/ui/environments/:id?tab=logs|history`, `/ui/queue`, `/ui/audit`,
+  `/ui/admin`) with filters as query params, all deep-linkable — `api.rs`
+  now `.fallback()`s to `index.html` for any unmatched GET so a hard
+  refresh on a nested path still works (tested live: reloading mid-route
+  and watching the client router take over correctly). Added the
+  previously-missing write/process surface: deploy a new branch and roll
+  back from a project's own page, delete a project, full secrets CRUD
+  (global + project/branch-scoped, values write-only), and an admin page
+  (API tokens create/list/revoke, master-key rotation, backup download).
+  Every native `confirm()` was replaced with an in-page confirm modal after
+  discovering live that a native one freezes the entire tab — including
+  CDP-driven browser automation — until a human dismisses it. Also found
+  and fixed live: a project's secrets page rendered empty despite the API
+  returning real data, because an unhandled rejection inside
+  `loadForRoute`'s per-route switch silently skipped the rest of that
+  route's loads — now wrapped in try/catch with a visible notice banner,
+  plus `cache: "no-store"` on every fetch defensively.
+- Full test/clippy/fmt pass green (128 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
-No TUI, no web dashboard, no Tauri desktop app. Single-host only, no HA.
+No TUI, no Tauri desktop app (the web dashboard now covers most of what
+SPEC.md asks of both). Single-host only, no HA.
 API is open by default if `OXID_API_TOKEN` is unset (warned, not enforced).
 Traefik auto-wake-on-request without any manual config still needs the
 operator to wire the `errors` middleware themselves (documented, not
