@@ -346,6 +346,17 @@ h2 {
   opacity: 0.5;
 }
 
+.row-failed {
+  background: #3a1f1a;
+}
+
+.detail-cell {
+  max-width: 480px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 11px;
+}
+
 .badge {
   display: inline-flex;
   align-items: center;

@@ -456,21 +456,27 @@
             <tr>
               <th>When</th>
               <th>Kind</th>
-              <th>Environment</th>
+              <th>Branch</th>
               <th>Operator</th>
               <th>Detail</th>
             </tr>
           </thead>
           <tbody>
             <template x-for="event in filteredAudit()" :key="event.id">
-              <tr>
+              <tr :class="event.kind.toLowerCase().includes('failed') && 'row-failed'">
                 <td class="mono muted" x-text="formatTime(event.occurred_at)"></td>
                 <td><span class="badge badge-audit" x-text="event.kind"></span></td>
                 <td>
-                  <a class="mono link" href="#" @click.prevent="go('/ui/environments/' + event.environment_id)" x-text="event.environment_id"></a>
+                  <a
+                    class="mono link"
+                    href="#"
+                    @click.prevent="go('/ui/environments/' + event.environment_id)"
+                    :title="'environment #' + event.environment_id"
+                    x-text="envRef(event.environment_id)"
+                  ></a>
                 </td>
                 <td class="muted" x-text="event.operator ?? 'anonymous'"></td>
-                <td class="muted" x-text="event.detail ?? ''"></td>
+                <td class="mono detail-cell" x-text="event.detail ?? ''"></td>
               </tr>
             </template>
           </tbody>

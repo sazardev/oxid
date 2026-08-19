@@ -245,9 +245,34 @@ async fn serve(
         println!(
             "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
         );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        // `axum::serve(...).with_graceful_shutdown(fut)` only decides *when*
+        // to stop accepting new connections — once `fut` resolves, it still
+        // waits for every existing connection (an open dashboard tab's
+        // keep-alive, a live log stream) to close on its own, with no cap.
+        // Found live: a browser tab left open on the dashboard kept the
+        // daemon from ever exiting on `SIGTERM`. `axum_server`'s TLS path
+        // below already bounds this at 10s via `graceful_shutdown(Some(..))`;
+        // race the same cap in manually here so the plain-HTTP path actually
+        // matches this function's own doc comment.
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_fut = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = drain_rx.await;
+            })
+            .into_future();
+        tokio::pin!(serve_fut);
+        tokio::select! {
+            result = &mut serve_fut => result?,
+            () = shutdown_signal() => {
+                let _ = drain_tx.send(());
+                if tokio::time::timeout(std::time::Duration::from_secs(10), &mut serve_fut)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("[~] graceful shutdown timed out after 10s, forcing exit");
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -50,6 +50,12 @@ function dashboard() {
     stats: {},
     queue: [],
     audit: [],
+    // environment id -> {branch, projectId, projectName}, for EVERY
+    // environment including destroyed/failed ones (unlike `projects[].
+    // environments`, which only keeps the current live deploy per branch) —
+    // lets the audit trail show which branch/project a `BUILD_FAILED`
+    // event was actually for instead of just an opaque environment id.
+    envIndex: {},
     tokens: [],
     newTokenName: "",
     deployBranch: "",
@@ -160,6 +166,11 @@ function dashboard() {
             this.queue = (await this.apiGetQuiet("/api/v1/queue")) ?? [];
             break;
           case "audit":
+            // Needed to resolve `event.environment_id` back to a branch
+            // name via `envIndex` for display — without it every row in
+            // the audit trail just showed an opaque `#4` (found live: the
+            // user couldn't tell which branch a `BUILD_FAILED` was for).
+            await this.loadProjectsWithEnvironments();
             await this.loadAudit();
             break;
           case "admin":
@@ -278,11 +289,29 @@ function dashboard() {
 
     async loadProjectsWithEnvironments() {
       const projects = await this.apiGet("/api/v1/projects");
+      const envIndex = {};
       for (const project of projects) {
         const envs = await this.apiGet(`/api/v1/projects/${project.id}/environments`);
+        for (const env of envs) {
+          envIndex[env.id] = {
+            branch: env.branch.name,
+            projectId: project.id,
+            projectName: project.name,
+          };
+        }
         project.environments = this.latestPerBranch(envs);
       }
       this.projects = projects;
+      this.envIndex = envIndex;
+    },
+
+    // Resolves an audit event's `environment_id` back to the branch/project
+    // it belongs to — works even for a `BUILD_FAILED`/destroyed environment
+    // that never shows up in the live environments list, since `envIndex`
+    // is built from the *unfiltered* per-project environment list.
+    envRef(environmentId) {
+      const ref = this.envIndex[environmentId];
+      return ref ? `${ref.projectName}/${ref.branch}` : `#${environmentId}`;
     },
 
     // Historical deploys keep one row per past commit (for `oxid rollback`);
@@ -343,7 +372,8 @@ function dashboard() {
         (e) =>
           e.kind.toLowerCase().includes(q) ||
           (e.detail ?? "").toLowerCase().includes(q) ||
-          (e.operator ?? "").toLowerCase().includes(q),
+          (e.operator ?? "").toLowerCase().includes(q) ||
+          this.envRef(e.environment_id).toLowerCase().includes(q),
       );
     },
 

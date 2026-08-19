@@ -627,7 +627,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                         u64::try_from(now.unix_timestamp()).unwrap_or_default(),
                         env.id,
                         StateTransition::BuildFailed,
-                        None,
+                        Some(err.to_string()),
                         now,
                         operator.clone(),
                     ))
@@ -2411,6 +2411,17 @@ port = 8080
         let envs = cp.list_environments(project.id).await.unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].state, EnvironmentState::Destroyed);
+
+        // The audit trail must carry the *real* error (e.g. "port already
+        // allocated"), not a blank `detail` — found live when a real
+        // deploy failure showed up in the dashboard with no way to tell
+        // what actually went wrong.
+        let events = cp.audit_events_for(envs[0].id).await.unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.kind == StateTransition::BuildFailed)
+            .expect("a BuildFailed audit event");
+        assert_eq!(failed.detail.as_deref(), Some(err.to_string().as_str()));
 
         // The retry must succeed instead of hitting "Destroy not allowed
         // from Building".
