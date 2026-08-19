@@ -153,6 +153,13 @@ pub fn router<
         )
         .route("/api/v1/webhooks/github", post(github_webhook))
         .merge(protected)
+        // Any GET that doesn't match an API route or a static asset above is
+        // a client-side dashboard route (`/ui/projects/1`,
+        // `/ui/environments/5?tab=logs`, ...) — the SPA shell handles
+        // routing itself from `location.pathname`/`location.search`, so a
+        // hard refresh or a shared deep link on any of those paths still
+        // has to return `index.html`, not a 404.
+        .fallback(get(dashboard_index))
         .with_state(state)
 }
 
@@ -1552,6 +1559,29 @@ port = 8080
             assert_eq!(status, StatusCode::OK, "{path}");
             let text = String::from_utf8(body).unwrap();
             assert!(text.contains(marker), "{path}: {text:.200}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spa_deep_links_fall_back_to_the_dashboard_shell() {
+        let app = test_app_with_token("s3cr3t").await;
+        // The client-side router owns everything under `/ui/...` — a hard
+        // refresh or a shared link on any of these has to return the same
+        // `index.html` shell, not a 404, so the JS router can take over and
+        // render the right page from `location.pathname`.
+        for path in [
+            "/ui/environments",
+            "/ui/projects/1",
+            "/ui/projects/1/secrets",
+            "/ui/environments/1?tab=logs",
+            "/ui/audit",
+            "/ui/admin",
+            "/this/route/does/not/exist/at/all",
+        ] {
+            let (status, body) = json_request(&app, "GET", path, json!({})).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let text = String::from_utf8(body).unwrap();
+            assert!(text.contains("OXID"), "{path}: {text:.200}");
         }
     }
 

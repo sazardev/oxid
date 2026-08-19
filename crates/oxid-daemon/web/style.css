@@ -34,12 +34,28 @@ code,
   font-family: "Fira Code", "SFMono-Regular", Consolas, monospace;
 }
 
+h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+h2 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ash-gray);
+  margin: 24px 0 10px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
+  gap: 20px;
 }
 
 .brand {
@@ -62,6 +78,32 @@ code,
 .tagline {
   color: var(--ash-gray);
   font-size: 12px;
+}
+
+.nav {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+
+.nav a {
+  color: var(--ash-gray);
+  text-decoration: none;
+  padding: 6px 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border: 1px solid transparent;
+  border-radius: 2px;
+}
+
+.nav a:hover {
+  color: var(--steel-white);
+}
+
+.nav a.active {
+  color: var(--oxid-orange);
+  border-color: var(--oxid-orange);
 }
 
 .conn {
@@ -139,9 +181,16 @@ code,
   border-bottom: 1px solid var(--oxid-orange);
 }
 
+.banner-ok {
+  background: #1a2e26;
+  color: var(--patina-green);
+  border-bottom: 1px solid var(--patina-green);
+  cursor: pointer;
+}
+
 .stats {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   gap: 1px;
   background: var(--border);
   border-bottom: 1px solid var(--border);
@@ -178,58 +227,93 @@ code,
   color: var(--oxid-orange);
 }
 
-.layout {
-  display: grid;
-  grid-template-columns: 2.2fr 1fr;
-  gap: 1px;
-  background: var(--border);
-  min-height: 60vh;
+.page-container {
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
 }
 
-.panel {
-  background: var(--carbon-black);
-  padding: 16px 20px;
-  overflow: auto;
+.page-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
 }
 
-.panel h2 {
-  font-size: 13px;
+.filters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.filters .token-input {
+  width: auto;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs a {
+  color: var(--ash-gray);
+  text-decoration: none;
+  padding: 6px 12px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--ash-gray);
-  margin: 0 0 10px;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 6px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
 }
 
-.panel h2:not(:first-child) {
-  margin-top: 24px;
+.tabs a.active {
+  color: var(--oxid-orange);
+  border-bottom-color: var(--oxid-orange);
+}
+
+.data-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 14px 0;
+  font-size: 12px;
+}
+
+.data-grid dt {
+  color: var(--ash-gray);
+}
+
+.data-grid dd {
+  margin: 0;
 }
 
 .muted {
   color: var(--ash-gray);
 }
 
-.project {
-  margin-bottom: 20px;
-  border: 1px solid var(--border);
-}
-
-.project-head {
+.project-actions {
   display: flex;
-  justify-content: space-between;
-  padding: 8px 12px;
-  background: var(--iron-gray);
+  gap: 4px;
 }
 
-.project-name {
-  font-weight: 600;
+.deploy-form,
+.secret-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 10px 0;
 }
 
-.project-repo {
-  color: var(--ash-gray);
-  font-family: "Fira Code", monospace;
-  font-size: 12px;
+.deploy-form .token-input,
+.secret-form .token-input {
+  width: auto;
+  flex: 1;
+  min-width: 120px;
 }
 
 .env-table {
@@ -328,7 +412,6 @@ code,
   text-align: right;
 }
 
-.queue-list,
 .audit-list {
   list-style: none;
   margin: 0;
@@ -336,7 +419,6 @@ code,
   font-size: 12px;
 }
 
-.queue-list li,
 .audit-list li {
   display: flex;
   gap: 8px;
@@ -345,6 +427,21 @@ code,
   border-bottom: 1px solid var(--border);
 }
 
+.log-output {
+  margin: 0;
+  padding: 12px 14px;
+  background: var(--iron-gray);
+  border: 1px solid var(--border);
+  min-height: 300px;
+  max-height: 65vh;
+  overflow: auto;
+  font-family: "Fira Code", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Custom confirm dialog — replaces the native, page-blocking `confirm()`. */
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -356,32 +453,20 @@ code,
 }
 
 .modal {
-  width: min(900px, 92vw);
-  height: min(600px, 80vh);
+  width: min(420px, 92vw);
   background: var(--iron-gray);
   border: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
 }
 
-.modal-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  font-family: "Fira Code", monospace;
+.modal-body {
+  padding: 16px;
 }
 
-.log-output {
-  flex: 1;
-  margin: 0;
-  padding: 12px 14px;
-  overflow: auto;
-  font-family: "Fira Code", monospace;
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-all;
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
 }
 
 .footer {
@@ -394,10 +479,10 @@ code,
 }
 
 @media (max-width: 900px) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
   .stats {
     grid-template-columns: repeat(3, 1fr);
+  }
+  .nav {
+    flex-wrap: wrap;
   }
 }
