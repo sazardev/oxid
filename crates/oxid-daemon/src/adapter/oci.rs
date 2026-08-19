@@ -81,21 +81,28 @@ impl ContainerPort for DockerClient {
         Ok(())
     }
 
-    async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError> {
+    async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
+        let container_port_key = format!("{}/tcp", spec.container_port);
         let mut exposed_ports = HashMap::new();
-        exposed_ports.insert(format!("{}/tcp", spec.container_port), HashMap::new());
+        exposed_ports.insert(container_port_key.clone(), HashMap::new());
 
         // When a Traefik network is configured, the container is reached
         // directly over that network and no host port is published — two
         // branches of the same project can then run concurrently. Without
-        // it, fall back to publishing `host_port` for direct local access.
+        // it, publish `container_port` on a host port Docker picks itself
+        // (`host_port: None` — an empty `HostPort` is Docker's own way of
+        // saying "any free one") instead of a fixed port that could already
+        // be taken by another branch of this same project (or anything else
+        // on the host): a deploy should never fail just because a specific
+        // port happened to be busy. The actual bound port is read back below
+        // via `inspect_container` once the container is running.
         let port_bindings = spec.network.is_none().then(|| {
             let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
             bindings.insert(
-                format!("{}/tcp", spec.container_port),
+                container_port_key.clone(),
                 Some(vec![PortBinding {
-                    host_port: Some(spec.host_port.to_string()),
-                    ..Default::default()
+                    host_ip: Some("0.0.0.0".to_owned()),
+                    host_port: None,
                 }]),
             );
             bindings
@@ -154,7 +161,30 @@ impl ContainerPort for DockerClient {
             .start_container::<String>(&spec.name, None)
             .await
             .map_err(map_err)?;
-        Ok(())
+
+        if spec.network.is_some() {
+            return Ok(None);
+        }
+        let info = self
+            .docker
+            .inspect_container(&spec.name, None)
+            .await
+            .map_err(map_err)?;
+        let bound_port = info
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .and_then(|ports| ports.get(&container_port_key).cloned().flatten())
+            .and_then(|bindings| bindings.into_iter().next())
+            .and_then(|binding| binding.host_port)
+            .and_then(|port| port.parse::<u16>().ok())
+            .ok_or_else(|| {
+                OciError::Failure(format!(
+                    "container `{}` started but Docker never reported a bound host port for \
+                     `{container_port_key}`",
+                    spec.name
+                ))
+            })?;
+        Ok(Some(bound_port))
     }
 
     async fn start(&self, name: &str) -> Result<(), OciError> {
@@ -382,14 +412,13 @@ mod tests {
             image,
             env: std::collections::BTreeMap::default(),
             container_port: 8080,
-            host_port: 0,
             labels: std::collections::BTreeMap::default(),
             network: None,
             memory_limit_mb: None,
             cpu_limit_millicores: None,
         };
-        // `run` publishes `host_port`; 0 lets Docker pick a free one so this
-        // test doesn't collide with anything else on the machine.
+        // `run` always lets Docker pick the published host port itself now,
+        // so this can never collide with anything else on the machine.
         client.run(&spec).await.unwrap();
 
         let ok = client.exec(name, "exit 0").await;
@@ -403,6 +432,60 @@ mod tests {
         );
 
         client.remove(name).await.unwrap();
+    }
+
+    /// Regression test for the exact real-world complaint that motivated
+    /// this: without Traefik, two branches of the same project both
+    /// wanting the same `container_port` used to mean the second deploy
+    /// failed outright ("port is already allocated") the moment the first
+    /// was still up. `run` now always lets Docker choose the host port
+    /// itself, so both should start successfully with two *different*
+    /// bound ports and no conflict at all.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn run_assigns_distinct_host_ports_for_concurrent_containers_on_the_same_port() {
+        let client = DockerClient::connect().unwrap();
+        let name_a = "oxid-test-dynamic-port-a";
+        let name_b = "oxid-test-dynamic-port-b";
+        let _ = client.remove(name_a).await;
+        let _ = client.remove(name_b).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM alpine\nCMD [\"sleep\", \"3600\"]\n",
+        )
+        .unwrap();
+        let image = "oxid-test/dynamic-port".to_owned();
+        client
+            .build(&BuildSpec {
+                context: dir.path().to_owned(),
+                dockerfile: "Dockerfile".to_owned(),
+                image: image.clone(),
+            })
+            .await
+            .unwrap();
+
+        let spec = |name: &str| ContainerSpec {
+            name: name.to_owned(),
+            image: image.clone(),
+            env: std::collections::BTreeMap::default(),
+            container_port: 8080,
+            labels: std::collections::BTreeMap::default(),
+            network: None,
+            memory_limit_mb: None,
+            cpu_limit_millicores: None,
+        };
+
+        let port_a = client.run(&spec(name_a)).await.unwrap();
+        let port_b = client.run(&spec(name_b)).await.unwrap();
+
+        assert!(port_a.is_some(), "{port_a:?}");
+        assert!(port_b.is_some(), "{port_b:?}");
+        assert_ne!(port_a, port_b, "both containers got the same host port");
+
+        client.remove(name_a).await.unwrap();
+        client.remove(name_b).await.unwrap();
     }
 
     #[test]

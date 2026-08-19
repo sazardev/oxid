@@ -266,6 +266,28 @@ fn api_base(cli_flag: Option<&str>) -> String {
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
 }
 
+/// Builds the address a human should actually open for `env`. Without
+/// Traefik, `env["url"]` is a `branch.base-domain` hostname that only means
+/// anything as a Traefik `Host()` rule — it isn't reachable at all without
+/// DNS/hosts pointing it somewhere. Docker always picks the real published
+/// host port itself now (a busy one should never block a deploy), so when
+/// the daemon reports one back (`env["host_port"]`), that combined with the
+/// daemon's own host is what's actually reachable; falls back to the
+/// Traefik-style `url` when there's no `host_port` (Traefik mode).
+fn env_display_address(base: &str, env: &Value) -> String {
+    let fallback = env["url"].as_str().unwrap_or("?").to_owned();
+    let Some(port) = env["host_port"].as_u64() else {
+        return fallback;
+    };
+    let host = base
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("127.0.0.1");
+    format!("http://{host}:{port}/")
+}
+
 fn api_token(cli_flag: Option<&str>) -> Option<String> {
     cli_flag
         .map(str::to_owned)
@@ -556,8 +578,10 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliErro
         return Ok(());
     }
     if !emit_json(&env) {
-        let url = env["url"].as_str().unwrap_or("?");
-        ok(format!("Environment live at: {url}"));
+        ok(format!(
+            "Environment live at: {}",
+            env_display_address(base, &env)
+        ));
     }
     Ok(())
 }
@@ -592,9 +616,11 @@ async fn cmd_rollback(
     let env: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     if !emit_json(&env) {
-        let url = env["url"].as_str().unwrap_or("?");
         let sha = env["branch"]["commit_sha"].as_str().unwrap_or("?");
-        ok(format!("Rolled back to {sha} — environment live at: {url}"));
+        ok(format!(
+            "Rolled back to {sha} — environment live at: {}",
+            env_display_address(base, &env)
+        ));
     }
     Ok(())
 }
@@ -626,19 +652,19 @@ async fn cmd_status(client: &Client, base: &str) -> Result<(), CliError> {
     // most recent row per branch reflects what's actually live. `envs` is
     // returned in ascending id order, so a later entry always overwrites an
     // earlier one for the same branch here.
-    let mut latest: Vec<(&str, &str, &str)> = Vec::new();
+    let mut latest: Vec<(&str, &str, String)> = Vec::new();
     for env in envs {
         let branch = env["branch"]["name"].as_str().unwrap_or("?");
         let state = env["state"].as_str().unwrap_or("?");
-        let url = env["url"].as_str().unwrap_or("?");
+        let address = env_display_address(base, env);
         match latest.iter_mut().find(|(b, ..)| *b == branch) {
-            Some(entry) => *entry = (branch, state, url),
-            None => latest.push((branch, state, url)),
+            Some(entry) => *entry = (branch, state, address),
+            None => latest.push((branch, state, address)),
         }
     }
     println!("{:<24} {:<24} URL", "BRANCH", "STATE");
-    for (branch, state, url) in latest {
-        println!("{:<24} {:<33} {}", branch, colored_state(state), url);
+    for (branch, state, address) in latest {
+        println!("{:<24} {:<33} {}", branch, colored_state(state), address);
     }
     Ok(())
 }

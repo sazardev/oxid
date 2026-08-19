@@ -39,6 +39,13 @@ pub struct Environment {
     pub updated_at: OffsetDateTime,
     /// Last time traffic hit the URL (drives scale-to-zero).
     pub last_accessed_at: OffsetDateTime,
+    /// Host port this environment's container is actually published on,
+    /// when running in direct-publish mode (`OXID_DOCKER_NETWORK` unset).
+    /// Docker is always asked to pick this port itself (SPEC.md "Eficiencia
+    /// Absoluta" — a busy configured port should never block a deploy), so
+    /// it's only known after the container actually starts. `None` when
+    /// routed through Traefik instead (no host port is published at all).
+    pub host_port: Option<u16>,
 }
 
 impl Environment {
@@ -68,6 +75,7 @@ impl Environment {
             created_at: now,
             updated_at: now,
             last_accessed_at: now,
+            host_port: None,
         })
     }
 

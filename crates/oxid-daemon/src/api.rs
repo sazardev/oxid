@@ -1288,12 +1288,12 @@ mod tests {
                 .push(format!("build:{}", spec.image));
             Ok(())
         }
-        async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError> {
+        async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("run:{}:env={:?}", spec.name, spec.env));
-            Ok(())
+            Ok(spec.network.is_none().then_some(65535))
         }
         async fn start(&self, name: &str) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(format!("start:{name}"));

@@ -393,25 +393,26 @@ function dashboard() {
     // `branch.base-domain` hostname that only means something as a Traefik
     // `Host()` rule — it isn't reachable as a URL at all without DNS/hosts
     // pointing it somewhere. In that mode the real, directly-reachable
-    // address is the project's own `[routing].port` published on whatever
-    // host is running the daemon (the same host this dashboard is being
-    // viewed from).
-    envLink(env, projectId) {
+    // address is `env.host_port` — the host port Docker actually bound for
+    // *this* environment (always dynamically chosen now, so a busy port
+    // never blocks a deploy; see `ControlPlane::run_and_activate`), not the
+    // project's static `[routing].port`, which is just the container's own
+    // internal listening port and no longer says anything about the host
+    // side.
+    envLink(env) {
       if (this.stats.traefik_enabled) {
         return `http://${env.url}`;
       }
-      const port = this.projects.find((p) => p.id === (projectId ?? env.projectId))?.config
-        ?.port;
-      return port ? `${location.protocol}//${location.hostname}:${port}/` : `http://${env.url}`;
+      return env.host_port
+        ? `${location.protocol}//${location.hostname}:${env.host_port}/`
+        : `http://${env.url}`;
     },
 
-    envLinkLabel(env, projectId) {
+    envLinkLabel(env) {
       if (this.stats.traefik_enabled) {
         return env.url;
       }
-      const port = this.projects.find((p) => p.id === (projectId ?? env.projectId))?.config
-        ?.port;
-      return port ? `${location.hostname}:${port}` : env.url;
+      return env.host_port ? `${location.hostname}:${env.host_port}` : env.url;
     },
 
     hostMemoryLabel() {

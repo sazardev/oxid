@@ -99,8 +99,9 @@
       <section class="page" x-show="route.name === 'environments'" x-cloak>
         <p class="muted" x-show="!stats.traefik_enabled">
           [~] No Traefik configured (<code>OXID_DOCKER_NETWORK</code> unset) — URLs below link to
-          this host's own published port for each project, not a subdomain. Only one branch per
-          project can be live at a time in this mode.
+          each environment's own dynamically-assigned host port instead of a subdomain. Docker
+          picks a free port per deploy, so multiple branches of the same project can run
+          simultaneously even without Traefik — the port just isn't stable across redeploys.
         </p>
         <div class="page-head">
           <h1>Environments</h1>
@@ -299,7 +300,7 @@
             </div>
             <p class="mono muted" x-text="currentProject().repo_url"></p>
             <dl class="data-grid mono">
-              <dt>port</dt><dd x-text="currentProject().config.port"></dd>
+              <dt title="What the app listens on inside the container — the host-side published port is chosen dynamically per environment, see each branch's URL below">container port</dt><dd x-text="currentProject().config.port"></dd>
               <dt>pause_after</dt><dd x-text="currentProject().config.pause_after"></dd>
               <dt>destroy_after</dt><dd x-text="currentProject().config.destroy_after"></dd>
               <dt>dockerfile</dt><dd x-text="currentProject().config.build.dockerfile ?? 'Dockerfile'"></dd>
@@ -350,7 +351,7 @@
                     <td>
                       <span class="badge" :class="'badge-' + env.state" x-text="env.state"></span>
                     </td>
-                    <td><a class="mono link" :href="envLink(env, currentProject().id)" target="_blank" rel="noopener" x-text="envLinkLabel(env, currentProject().id)"></a></td>
+                    <td><a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a></td>
                     <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
                     <td class="actions">
                       <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)">open</button>

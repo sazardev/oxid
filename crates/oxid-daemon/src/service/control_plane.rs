@@ -133,8 +133,10 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     oci: O,
     cache_dir: PathBuf,
     /// Docker network shared with Traefik and this daemon. `None` (the
-    /// default) falls back to publishing `host_port` directly, which is
-    /// only safe with a single environment per project at a time.
+    /// default) falls back to publishing the container's port directly on a
+    /// host port Docker picks itself (see [`Self::run_and_activate`]) — safe
+    /// with any number of concurrent environments per project, since no two
+    /// ever fight over the same host port.
     docker_network: Option<String>,
     /// Base URL this daemon is reachable at from inside `docker_network`,
     /// used to build the Traefik `errors`/`forwardAuth` middleware labels
@@ -794,7 +796,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             image,
             env: env_vars,
             container_port: project.config.port,
-            host_port: project.config.port,
             labels,
             network: self.docker_network.clone(),
             memory_limit_mb: project
@@ -808,7 +809,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .cpu_limit_millicores
                 .or(self.default_cpu_limit_millicores),
         };
-        self.oci.run(&spec).await?;
+        env.host_port = self.oci.run(&spec).await?;
 
         for command in &project.config.build.on_start {
             self.oci.exec(&name, command).await?;
@@ -1866,7 +1867,7 @@ mod tests {
             ));
             Ok(())
         }
-        async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError> {
+        async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
             self.calls.lock().unwrap().push(format!(
                 "run:{}:env={:?}:mem={:?}:cpu={:?}",
                 spec.name, spec.env, spec.memory_limit_mb, spec.cpu_limit_millicores
@@ -1876,7 +1877,7 @@ mod tests {
                 *remaining -= 1;
                 return Err(OciError::Failure("simulated transient failure".to_owned()));
             }
-            Ok(())
+            Ok(spec.network.is_none().then_some(65535))
         }
         async fn start(&self, name: &str) -> Result<(), OciError> {
             self.calls.lock().unwrap().push(format!("start:{name}"));

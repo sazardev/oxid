@@ -10,9 +10,11 @@
 //!   Webhooks are rejected while unset.
 //! - `OXID_DOCKER_NETWORK` — docker network shared with Traefik and this
 //!   daemon. When set, deployed containers join it and skip publishing a
-//!   host port (SPEC.md §3.2). Unset by default: containers publish
-//!   `[routing].port` directly, which only supports one live environment per
-//!   project at a time.
+//!   host port, reachable instead via a Traefik `Host()` subdomain
+//!   (SPEC.md §3.2). Unset by default: containers publish `[routing].port`
+//!   directly on a host port Docker picks itself, so a busy port never
+//!   blocks a deploy — every environment's actual address is in
+//!   `oxid status`/the dashboard, not a fixed, predictable one.
 //! - `OXID_DAEMON_URL` — this daemon's own address as reachable from inside
 //!   `OXID_DOCKER_NETWORK` (default `http://oxid-daemon:8080`), used to build
 //!   the Traefik `forwardAuth`/`errors` middleware labels.
