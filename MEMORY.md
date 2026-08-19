@@ -171,7 +171,27 @@ just "where did we leave off and why."
      still work fine. 6 existing sweep tests updated to configure
      `with_traefik(...)` explicitly (the only mode sweep does anything in
      now); new test proves the no-op directly.
-- Full test/clippy/fmt pass green (130 daemon/core tests + 32 CLI tests).
+- **Editable project lifetime policy + push-to-deploy duration metric (this
+  round), backend/API/CLI verified by tests and the dashboard live-verified
+  in a real browser against the playground's real data:** previously
+  `pause_after`/`destroy_after` were parsed from `oxid.toml` once at
+  `register_project()` and frozen forever short of re-registering — asked
+  for explicitly ("Oxid UI pueda configurar esos parametros de tiempo de
+  vida"). New `ProjectStore::update`, `ControlPlane::update_project_ttls`
+  (partial update, omitted fields keep their value), `PATCH
+  /api/v1/projects/{id}`, `oxid configure --pause-after --destroy-after`,
+  and a dashboard "Lifetime policy" form on the project page — live-verified
+  end-to-end: PATCHed `pause_after` to `2700s` from the actual UI, confirmed
+  via a fresh page reload and a direct `GET /api/v1/projects` that it
+  persisted server-side (not just an optimistic UI update). Also added a
+  client-side-only "deploy time" metric (`Environment.created_at` as the
+  push-received proxy vs. the `build_succeeded`/`build_failed` audit event's
+  `occurred_at`, via a `toEpochMs` helper that correctly decodes the `time`
+  crate's `[year, ordinal_day, ...]` serde array) shown as a new column in
+  the audit trail and in each environment's history tab — live-verified
+  against the playground's real build events (values like `1.0s`/`0ms`,
+  `–` for non-build event kinds).
+- Full test/clippy/fmt pass green (131 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
