@@ -59,6 +59,8 @@ function dashboard() {
     tokens: [],
     newTokenName: "",
     deployBranch: "",
+    projectSettingsForm: { pause_after: "", destroy_after: "" },
+    _settingsFormProjectId: null,
     logLines: [],
     historyEvents: [],
     secretsList: [],
@@ -297,6 +299,7 @@ function dashboard() {
             branch: env.branch.name,
             projectId: project.id,
             projectName: project.name,
+            createdAtMs: this.toEpochMs(env.created_at),
           };
         }
         project.environments = this.latestPerBranch(envs);
@@ -432,6 +435,52 @@ function dashboard() {
       return `${pad(year, 4)}-day${pad(day, 3)} ${pad(hour, 2)}:${pad(min, 2)}:${pad(sec, 2)}`;
     },
 
+    // Converts the `[year, ordinal_day, hour, min, sec, ...]` array the
+    // daemon serializes every timestamp as into a real epoch millisecond
+    // value, so push→deploy speed can actually be measured (Date.UTC with
+    // day 1 of the year, then adding `ordinal - 1` days, correctly handles
+    // month boundaries and leap years without reimplementing a calendar).
+    toEpochMs(value) {
+      if (!Array.isArray(value)) {
+        return null;
+      }
+      const [year, day, hour, min, sec] = value;
+      return Date.UTC(year, 0, 1) + (day - 1) * 86_400_000 + hour * 3_600_000 + min * 60_000
+        + sec * 1000;
+    },
+
+    // Human-readable elapsed time for a push→deploy duration, e.g. "1.4s"
+    // or "340ms" — deploys are fast enough that anything coarser than a
+    // second loses the number that actually matters here.
+    formatDuration(ms) {
+      if (ms === null || Number.isNaN(ms) || ms < 0) {
+        return "—";
+      }
+      if (ms < 1000) {
+        return `${ms}ms`;
+      }
+      return `${(ms / 1000).toFixed(1)}s`;
+    },
+
+    // Wall-clock time from an environment's `created_at` (`deploy_at`
+    // creates that row *before* the git clone/build/run pipeline even
+    // starts, so it's an accurate "push received" proxy) to a
+    // `build_succeeded`/`build_failed` audit event closing it out — the
+    // real push→live latency, computed entirely from data already
+    // collected rather than adding new tracking. `null` for any other kind
+    // of event (pause/wake/destroy/idle_timeout have no "duration").
+    auditDuration(event) {
+      if (event.kind !== "build_succeeded" && event.kind !== "build_failed") {
+        return null;
+      }
+      const ref = this.envIndex[event.environment_id];
+      if (!ref?.createdAtMs) {
+        return null;
+      }
+      const finishedMs = this.toEpochMs(event.occurred_at);
+      return finishedMs === null ? null : finishedMs - ref.createdAtMs;
+    },
+
     // ------------------------------------------------------------------
     // actions
     // ------------------------------------------------------------------
@@ -476,6 +525,41 @@ function dashboard() {
       await this.apiSend("DELETE", `/api/v1/projects/${project.id}`);
       this.showNotice(`Deleted project \`${project.name}\`.`);
       this.go("/ui/projects");
+    },
+
+    // Seeds the settings form from the project's current values exactly
+    // once per project (guarded by id, not object identity) — the 5s
+    // auto-refresh replaces `this.projects` with fresh objects constantly,
+    // which would otherwise stomp on whatever the user is mid-typing.
+    // Wired via `x-effect` on the project page, so it re-fires on every
+    // refresh but only actually resets the form the first time.
+    maybeInitProjectSettingsForm(project) {
+      if (!project || this._settingsFormProjectId === project.id) {
+        return;
+      }
+      this._settingsFormProjectId = project.id;
+      this.projectSettingsForm = {
+        pause_after: project.config.pause_after,
+        destroy_after: project.config.destroy_after,
+      };
+    },
+
+    async saveProjectSettings(project) {
+      try {
+        const res = await this.apiSend("PATCH", `/api/v1/projects/${project.id}`, {
+          pause_after: this.projectSettingsForm.pause_after || null,
+          destroy_after: this.projectSettingsForm.destroy_after || null,
+        });
+        const updated = await res.json();
+        this.showNotice(
+          `Updated \`${updated.name}\`: pause_after=${updated.config.pause_after} destroy_after=${updated.config.destroy_after}`,
+        );
+        // Force the next render to re-seed from the just-saved values.
+        this._settingsFormProjectId = null;
+        this.loadForRoute();
+      } catch (err) {
+        this.showNotice(`Updating settings failed: ${err.message}`);
+      }
     },
 
     async deployNew(project) {

@@ -54,6 +54,13 @@ pub trait ProjectStore {
     /// # Errors
     /// Any storage failure.
     async fn list(&self) -> Result<Vec<Project>, RepositoryError>;
+    /// Persists an updated project's config — e.g. `pause_after`/
+    /// `destroy_after` changed via the dashboard/API, which `oxid.toml`
+    /// only ever seeds at first registration otherwise.
+    ///
+    /// # Errors
+    /// [`RepositoryError::NotFound`] if the project does not exist.
+    async fn update(&self, project: &Project) -> Result<(), RepositoryError>;
     /// Deletes a project and its cascading records.
     ///
     /// # Errors

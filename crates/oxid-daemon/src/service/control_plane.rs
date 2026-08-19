@@ -16,7 +16,7 @@ use oxid_core::{
     ContainerStatus, Dependency, DomainError, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime,
     PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore,
-    SecretValue, StateTransition,
+    SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::config::{self, ConfigError};
@@ -379,6 +379,31 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(ProjectStore::delete(&self.store, project_id).await?)
     }
 
+    /// Updates a project's idle/lifetime policy (`pause_after`/
+    /// `destroy_after`) — the two settings `oxid.toml` otherwise only ever
+    /// seeds once, at first registration, with no way to change them again
+    /// short of re-registering. Either can be omitted to leave it as-is;
+    /// takes effect on the *next* GC sweep, no redeploy needed.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn update_project_ttls(
+        &self,
+        project_id: ProjectId,
+        pause_after: Option<Ttl>,
+        destroy_after: Option<Ttl>,
+    ) -> Result<Project, CpError> {
+        let mut project = self.ensure_project(project_id).await?;
+        if let Some(pause_after) = pause_after {
+            project.config.pause_after = pause_after;
+        }
+        if let Some(destroy_after) = destroy_after {
+            project.config.destroy_after = destroy_after;
+        }
+        ProjectStore::update(&self.store, &project).await?;
+        Ok(project)
+    }
+
     /// Deploys `branch` for a project: clone, build, run, then transition to
     /// `Running`. Always deploys immediately, ignoring admission control —
     /// see [`Self::deploy_or_queue`] for the capacity-aware entry point
@@ -622,7 +647,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         {
             let now = OffsetDateTime::now_utc();
             if env.transition(StateTransition::BuildFailed, now).is_ok() {
-                let _ = self.store.update(&env).await;
+                let _ = EnvironmentStore::update(&self.store, &env).await;
                 let _ = self
                     .store
                     .record(&AuditEvent::with_operator(
@@ -818,7 +843,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::BuildSucceeded, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(env).await?;
+        EnvironmentStore::update(&self.store, env).await?;
         self.store
             .record(&AuditEvent::with_operator(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
@@ -980,7 +1005,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::IdleTimeout, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(&env).await?;
+        EnvironmentStore::update(&self.store, &env).await?;
         Ok(())
     }
 
@@ -1026,7 +1051,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // Touching is best-effort bookkeeping; a Destroyed/terminal state
         // simply can't be touched and that's fine to ignore.
         let _ = env.touch(now);
-        self.store.update(&env).await?;
+        EnvironmentStore::update(&self.store, &env).await?;
         Ok(())
     }
 
@@ -1060,7 +1085,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(&env).await?;
+        EnvironmentStore::update(&self.store, &env).await?;
         Ok(())
     }
 
@@ -1124,7 +1149,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Destroy, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(&env).await?;
+        EnvironmentStore::update(&self.store, &env).await?;
         self.store
             .record(&AuditEvent::with_operator(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
@@ -1537,7 +1562,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 && let Ok(Some(port)) = self.oci.published_port(&name, project.config.port).await
             {
                 env.host_port = Some(port);
-                let _ = self.store.update(&env).await;
+                let _ = EnvironmentStore::update(&self.store, &env).await;
             }
 
             let outcome = match (env.state, status) {
@@ -1571,7 +1596,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     async fn mark_destroyed(&self, env: &mut Environment) -> Result<(), CpError> {
         let now = OffsetDateTime::now_utc();
         if env.transition(StateTransition::Destroy, now).is_ok() {
-            self.store.update(env).await?;
+            EnvironmentStore::update(&self.store, env).await?;
         }
         Ok(())
     }
@@ -1615,7 +1640,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         env.transition(transition, now).map_err(|e| state_err(&e))?;
-        self.store.update(&env).await?;
+        EnvironmentStore::update(&self.store, &env).await?;
         self.store
             .record(&AuditEvent::new(
                 u64::try_from(now.unix_timestamp()).unwrap_or_default(),
@@ -1706,7 +1731,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         previous
             .transition(StateTransition::Destroy, now)
             .map_err(|e| state_err(&e))?;
-        self.store.update(&previous).await?;
+        EnvironmentStore::update(&self.store, &previous).await?;
         Ok(())
     }
 

@@ -696,6 +696,38 @@ impl ProjectStore for SqliteStore {
         }
         Ok(())
     }
+
+    async fn update(&self, project: &Project) -> Result<(), RepositoryError> {
+        let binds = project_to_binds(project);
+        let res = sqlx::query(
+            "UPDATE projects SET name = ?, base_domain = ?, pause_after_seconds = ?, \
+             destroy_after_seconds = ?, port = ?, dockerfile = ?, build_context = ?, \
+             on_start_json = ?, dependencies_json = ?, memory_limit_mb = ?, \
+             cpu_limit_millicores = ? WHERE id = ?",
+        )
+        .bind(binds.name)
+        .bind(binds.base_domain)
+        .bind(binds.pause_after)
+        .bind(binds.destroy_after)
+        .bind(binds.port)
+        .bind(binds.dockerfile)
+        .bind(binds.build_context)
+        .bind(binds.on_start_json)
+        .bind(binds.dependencies_json)
+        .bind(binds.memory_limit_mb)
+        .bind(binds.cpu_limit_millicores)
+        .bind(id_as_i64(project.id.0))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "project `{}` does not exist",
+                project.id
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use oxid_core::{
     BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId, EnvironmentState, GitPort,
-    PoolError, Project, ProjectId, RepositoryError,
+    PoolError, Project, ProjectId, RepositoryError, Ttl,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -90,7 +90,10 @@ pub fn router<
         .route("/api/v1/projects/{id}/environments", get(list_environments))
         .route("/api/v1/projects/{id}/deploy", post(deploy))
         .route("/api/v1/projects/{id}/rollback", post(rollback))
-        .route("/api/v1/projects/{id}", delete(delete_project))
+        .route(
+            "/api/v1/projects/{id}",
+            delete(delete_project).patch(update_project),
+        )
         .route("/api/v1/environments/{env_id}", delete(destroy))
         .route(
             "/api/v1/secrets",
@@ -766,6 +769,44 @@ async fn delete_project<
 ) -> ApiResult<StatusCode> {
     state.cp.delete_project(ProjectId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Body for `PATCH /api/v1/projects/{id}` — either field can be omitted to
+/// leave it unchanged, so a client only sends what it's actually changing.
+#[derive(Debug, Deserialize)]
+struct UpdateProjectBody {
+    /// New idle timeout before scale-to-zero pause, e.g. `"45m"`.
+    pause_after: Option<String>,
+    /// New max lifetime before permanent teardown, e.g. `"3d"`.
+    destroy_after: Option<String>,
+}
+
+/// Updates a project's `pause_after`/`destroy_after` policy — the settings
+/// `oxid.toml` only ever seeds once at first registration, with the
+/// dashboard's project settings form as the intended caller.
+async fn update_project<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(id): Path<u64>,
+    Json(body): Json<UpdateProjectBody>,
+) -> ApiResult<Json<Project>> {
+    let pause_after = body
+        .pause_after
+        .map(|raw| Ttl::parse(&raw))
+        .transpose()
+        .map_err(|e| ApiError::from_validation(e.to_string()))?;
+    let destroy_after = body
+        .destroy_after
+        .map(|raw| Ttl::parse(&raw))
+        .transpose()
+        .map_err(|e| ApiError::from_validation(e.to_string()))?;
+    let project = state
+        .cp
+        .update_project_ttls(ProjectId(id), pause_after, destroy_after)
+        .await?;
+    Ok(Json(project))
 }
 
 async fn pause<
@@ -2804,6 +2845,47 @@ port = 8080
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn update_project_changes_ttls_and_rejects_bad_durations() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = json_request(
+            &app,
+            "PATCH",
+            format!("/api/v1/projects/{}", project.id.0).as_str(),
+            json!({ "pause_after": "45m" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let updated: Project = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated.config.pause_after.to_string(), "2700s");
+        // Omitted field stays whatever it already was.
+        assert_eq!(updated.config.destroy_after, project.config.destroy_after);
+
+        let (status, body) = json_request(
+            &app,
+            "PATCH",
+            format!("/api/v1/projects/{}", project.id.0).as_str(),
+            json!({ "destroy_after": "not-a-duration" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     #[tokio::test]

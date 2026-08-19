@@ -130,6 +130,16 @@ enum Command {
     /// List deploys waiting for host capacity (see `oxid up`'s "queued"
     /// response), oldest/highest-priority first.
     Queue,
+    /// Changes the current project's idle/lifetime policy — `oxid.toml`
+    /// only ever seeds these at first registration otherwise.
+    Configure {
+        /// New idle timeout before scale-to-zero pause, e.g. `45m`.
+        #[arg(long)]
+        pause_after: Option<String>,
+        /// New max lifetime before permanent teardown, e.g. `3d`.
+        #[arg(long)]
+        destroy_after: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -453,6 +463,18 @@ async fn main() {
         Command::Doctor => cmd_doctor(&client, &base).await,
         Command::RotateKey => cmd_rotate_key(&client, &base).await,
         Command::Queue => cmd_queue(&client, &base).await,
+        Command::Configure {
+            pause_after,
+            destroy_after,
+        } => {
+            cmd_configure(
+                &client,
+                &base,
+                pause_after.as_deref(),
+                destroy_after.as_deref(),
+            )
+            .await
+        }
     };
 
     if let Err(err) = result {
@@ -891,6 +913,56 @@ async fn cmd_audit(
         let kind = event["kind"].as_str().unwrap_or("?");
         let detail = event["detail"].as_str().unwrap_or("");
         println!("{when:<24} {kind:<14} {detail}");
+    }
+    Ok(())
+}
+
+async fn cmd_configure(
+    client: &Client,
+    base: &str,
+    pause_after: Option<&str>,
+    destroy_after: Option<&str>,
+) -> Result<(), CliError> {
+    if pause_after.is_none() && destroy_after.is_none() {
+        return Err(
+            "nothing to configure — pass --pause-after and/or --destroy-after"
+                .to_owned()
+                .into(),
+        );
+    }
+    let project = register_project(client, base).await?;
+    let project_id = project["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing project id".to_owned())?;
+
+    let url = format!("{base}/api/v1/projects/{project_id}");
+    let response = client
+        .patch(&url)
+        .json(&json!({ "pause_after": pause_after, "destroy_after": destroy_after }))
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(
+            &body,
+            status,
+            "updating project settings failed",
+        ));
+    }
+    let updated: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&updated) {
+        ok(format!(
+            "Updated `{}`: pause_after={} destroy_after={}",
+            updated["name"].as_str().unwrap_or("?"),
+            updated["config"]["pause_after"].as_str().unwrap_or("?"),
+            updated["config"]["destroy_after"].as_str().unwrap_or("?"),
+        ));
     }
     Ok(())
 }

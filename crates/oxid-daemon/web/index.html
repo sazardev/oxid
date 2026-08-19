@@ -244,6 +244,11 @@
                   <li>
                     <span class="mono muted" x-text="formatTime(event.occurred_at)"></span>
                     <span class="badge badge-audit" x-text="event.kind"></span>
+                    <span
+                      class="mono"
+                      x-show="auditDuration(event) !== null"
+                      x-text="formatDuration(auditDuration(event))"
+                    ></span>
                     <span class="muted" x-text="event.operator ?? 'anonymous'"></span>
                     <span class="muted" x-text="event.detail ?? ''"></span>
                   </li>
@@ -288,7 +293,7 @@
       </section>
 
       <!-- ================= PROJECT DETAIL ================= -->
-      <section class="page" x-show="route.name === 'project'" x-cloak>
+      <section class="page" x-show="route.name === 'project'" x-cloak x-effect="maybeInitProjectSettingsForm(currentProject())">
         <template x-if="currentProject()">
           <div>
             <div class="page-head">
@@ -301,8 +306,6 @@
             <p class="mono muted" x-text="currentProject().repo_url"></p>
             <dl class="data-grid mono">
               <dt title="What the app listens on inside the container — the host-side published port is chosen dynamically per environment, see each branch's URL below">container port</dt><dd x-text="currentProject().config.port"></dd>
-              <dt>pause_after</dt><dd x-text="currentProject().config.pause_after"></dd>
-              <dt>destroy_after</dt><dd x-text="currentProject().config.destroy_after"></dd>
               <dt>dockerfile</dt><dd x-text="currentProject().config.build.dockerfile ?? 'Dockerfile'"></dd>
               <dt>context</dt><dd x-text="currentProject().config.build.context"></dd>
               <dt x-show="currentProject().config.build.memory_limit_mb">memory limit</dt>
@@ -316,6 +319,29 @@
                 </template>
               </dd>
             </dl>
+
+            <h2>Lifetime policy</h2>
+            <p class="muted">
+              Idle/scale-to-zero timers — <code>oxid.toml</code> only ever seeds these once, at
+              first registration. Changes here take effect on the next GC sweep, no redeploy.
+            </p>
+            <div class="secret-form">
+              <label class="mono muted">pause_after</label>
+              <input
+                class="token-input mono"
+                type="text"
+                placeholder="e.g. 30m"
+                x-model="projectSettingsForm.pause_after"
+              />
+              <label class="mono muted">destroy_after</label>
+              <input
+                class="token-input mono"
+                type="text"
+                placeholder="e.g. 7d"
+                x-model="projectSettingsForm.destroy_after"
+              />
+              <button class="btn btn-sm" @click="saveProjectSettings(currentProject())">save</button>
+            </div>
 
             <div class="deploy-form">
               <input
@@ -458,6 +484,7 @@
               <th>When</th>
               <th>Kind</th>
               <th>Branch</th>
+              <th title="Wall-clock time from the environment's push/creation to this outcome">Deploy time</th>
               <th>Operator</th>
               <th>Detail</th>
             </tr>
@@ -476,6 +503,7 @@
                     x-text="envRef(event.environment_id)"
                   ></a>
                 </td>
+                <td class="mono" x-text="formatDuration(auditDuration(event))"></td>
                 <td class="muted" x-text="event.operator ?? 'anonymous'"></td>
                 <td class="mono detail-cell" x-text="event.detail ?? ''"></td>
               </tr>
