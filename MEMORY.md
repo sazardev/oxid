@@ -131,11 +131,26 @@ just "where did we leave off and why."
      A real playground daemon instance never exited on `SIGTERM` while a
      browser tab sat open on the dashboard (pooled keep-alive connection),
      needing `SIGKILL`. Now bounded to 10s on both paths.
-  - Single project-wide `[routing].port` (parsed once at registration, not
-    per-branch) means direct-port-publish mode only ever has one live
-    branch per project at a time — confirmed live pushing a second branch
-    while the first was still up (`port already allocated`), which is
-    exactly why item 1 above matters.
+  - Direct-port-publish mode's "only one live branch per project at a time"
+    limitation got called out live as unacceptable ("Oxid debe ser
+    dinámico... no es excusa") — and it wasn't a hard limit, just the
+    fixed-host-port design. Fixed properly, not papered over: see the next
+    item.
+- **Dynamic host-port assignment — the actual fix for the item above, not
+  just a better error message.** `ContainerPort::run` now always lets
+  Docker pick the published host port itself (empty `HostPort` binding) and
+  reports back which one it got; `Environment` gained `host_port:
+  Option<u16>` to store it (migration `0006`). A busy port can never block a
+  deploy again, and — bigger win — multiple branches of the *same* project
+  now run simultaneously even without Traefik, each on its own port; the
+  dashboard/CLI show each environment's real `host:port` instead of a
+  project-wide port or a dead Traefik-style subdomain. Trade-off: the port
+  isn't stable across redeploys of the same branch (acceptable for
+  ephemeral previews). Live-verified on the exact repro: pushed `dev` while
+  `main` was still up (paused, still holding its port) — `dev` deployed on
+  a different port, both simultaneously live and independently reachable.
+  New `#[ignore]`d Docker-integration test proves two containers on the same
+  internal port get distinct host ports.
 - Full test/clippy/fmt pass green (128 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
