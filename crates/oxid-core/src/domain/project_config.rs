@@ -16,6 +16,16 @@ pub struct BuildConfig {
     pub context: String,
     /// Commands to run once the container starts (ephemeral data seeding).
     pub on_start: Vec<String>,
+    /// Memory limit for the deployed container, in megabytes. When unset,
+    /// the daemon's own `OXID_DEFAULT_MEMORY_LIMIT_MB` applies instead
+    /// (SPEC.md "Eficiencia Absoluta" — no environment should be able to
+    /// exhaust the host by default).
+    pub memory_limit_mb: Option<u64>,
+    /// CPU limit for the deployed container, in millicores (1000 = one full
+    /// core). When unset, the daemon's own `OXID_DEFAULT_CPU_LIMIT_MILLICORES`
+    /// applies instead. An integer (rather than a fractional core count) to
+    /// keep `BuildConfig` exactly comparable (`Eq`) without float pitfalls.
+    pub cpu_limit_millicores: Option<u32>,
 }
 
 impl Default for BuildConfig {
@@ -24,6 +34,8 @@ impl Default for BuildConfig {
             dockerfile: None,
             context: ".".to_owned(),
             on_start: Vec::new(),
+            memory_limit_mb: None,
+            cpu_limit_millicores: None,
         }
     }
 }

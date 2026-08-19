@@ -31,6 +31,23 @@
 //!   otherwise for projects declaring a `redis` dependency.
 //! - `OXID_REDIS_POOL_SIZE` — number of Redis logical databases available to
 //!   lease from (default 16, matching Redis's own default `databases 16`).
+//! - `OXID_DEFAULT_MEMORY_LIMIT_MB` — memory limit (megabytes) applied to a
+//!   deployed container when its project's `oxid.toml [build]` doesn't set
+//!   its own `memory_limit_mb` (default `512`). A single misbehaving
+//!   preview environment can otherwise exhaust the whole host's memory —
+//!   set to `0` to disable and leave containers genuinely unbounded.
+//! - `OXID_DEFAULT_CPU_LIMIT_MILLICORES` — same fallback behavior as
+//!   `OXID_DEFAULT_MEMORY_LIMIT_MB`, but for CPU (1000 = one full core,
+//!   default `1000`). Set to `0` to disable.
+//! - `OXID_TLS_CERT` / `OXID_TLS_KEY` — PEM certificate/key file paths. When
+//!   both are set, the daemon serves HTTPS directly instead of plain HTTP.
+//!   Unset by default: most deployments (including the shipped
+//!   `docker-compose.yml`) put Traefik/another reverse proxy in front for
+//!   TLS termination instead — these are for the operators who don't.
+//! - `OXID_ALLOW_RESTORE` — set to `1` to accept `POST
+//!   /api/v1/backup/restore` uploads at all (rejected with `403` otherwise).
+//!   A restore never touches the live database in place — it stages the
+//!   upload and applies it on the *next* startup (see [`apply_staged_restore`]).
 //!
 //! **Network topology note for `OXID_POSTGRES_URL`/`OXID_REDIS_URL`:** the
 //! same URL is used both by this daemon (to run `CREATE`/`DROP DATABASE` as
@@ -85,9 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => Cipher::load_or_create(&PathBuf::from(&data_dir).join("secret.key"))?,
     };
 
-    let db_path = PathBuf::from(&data_dir).join("audit.sqlite");
-    let cache_dir = PathBuf::from(&data_dir).join("git-cache");
+    let data_dir_path = PathBuf::from(&data_dir);
+    let db_path = data_dir_path.join("audit.sqlite");
+    let cache_dir = data_dir_path.join("git-cache");
 
+    apply_staged_restore(&data_dir_path)?;
     let store = SqliteStore::open(db_path, cipher).await?;
     let git = GitClient::new();
     let oci = DockerClient::connect()?;
@@ -105,6 +124,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(16);
     cp = cp.with_resource_pools(postgres_url, redis_url, redis_pool_size);
 
+    let default_memory_limit_mb = std::env::var("OXID_DEFAULT_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(Some(512))
+        .filter(|&mb| mb > 0);
+    let default_cpu_limit_millicores = std::env::var("OXID_DEFAULT_CPU_LIMIT_MILLICORES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .or(Some(1000))
+        .filter(|&mc| mc > 0);
+    cp = cp.with_resource_defaults(default_memory_limit_mb, default_cpu_limit_millicores);
+
     tokio::spawn(oxid_daemon::service::scheduler::run(
         cp.clone(),
         std::time::Duration::from_secs(gc_interval_secs),
@@ -117,15 +148,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[~] OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
         );
     }
+    let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
     let app = router(ApiState {
         cp,
         webhook_secret,
         api_token,
+        data_dir: data_dir_path,
+        allow_restore,
     });
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!(
-        "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
-    );
-    axum::serve(listener, app).await?;
+    let tls = load_tls_config().await?;
+    if let Some(config) = tls {
+        let socket_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+        println!(
+            "[>] oxid daemon listening on https://{addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
+        );
+        axum_server::bind_rustls(socket_addr, config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        println!(
+            "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
+        );
+        axum::serve(listener, app).await?;
+    }
+    Ok(())
+}
+
+/// Loads `OXID_TLS_CERT`/`OXID_TLS_KEY` into a rustls server config when
+/// both are set, installing the `ring` crypto provider on first use.
+/// Returns `None` (serve plain HTTP) when either is unset.
+async fn load_tls_config()
+-> Result<Option<axum_server::tls_rustls::RustlsConfig>, Box<dyn std::error::Error>> {
+    let (Some(cert), Some(key)) = (
+        std::env::var("OXID_TLS_CERT").ok(),
+        std::env::var("OXID_TLS_KEY").ok(),
+    ) else {
+        return Ok(None);
+    };
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+        .await
+        .map_err(|e| {
+            std::io::Error::other(format!("cannot load TLS cert/key ({cert}, {key}): {e}"))
+        })?;
+    Ok(Some(config))
+}
+
+/// If `<data_dir>/.restore-pending.tar` exists (staged by a prior
+/// `POST /api/v1/backup/restore`), extracts `audit.sqlite`/`secret.key`
+/// from it over the real files and removes the marker — applied here,
+/// before `SqliteStore::open` runs, so the restore is never attempted
+/// against an already-open pool.
+fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let staged_path = data_dir.join(".restore-pending.tar");
+    if !staged_path.exists() {
+        return Ok(());
+    }
+    println!("[>] applying staged restore from {}", staged_path.display());
+    let file = std::fs::File::open(&staged_path)?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.to_string_lossy().into_owned();
+        if name == "audit.sqlite" || name == "secret.key" {
+            entry.unpack(data_dir.join(&name))?;
+        }
+    }
+    std::fs::remove_file(&staged_path)?;
+    println!("[+] restore applied; starting normally");
     Ok(())
 }

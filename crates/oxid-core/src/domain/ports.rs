@@ -291,6 +291,13 @@ pub struct ContainerSpec {
     /// container publishes `host_port` for direct local access instead —
     /// the fallback used when no Traefik instance is configured.
     pub network: Option<String>,
+    /// Memory limit in megabytes, already resolved from the project's
+    /// `[build]` config or the daemon's `OXID_DEFAULT_MEMORY_LIMIT_MB`.
+    /// `None` means genuinely unbounded (both were unset).
+    pub memory_limit_mb: Option<u64>,
+    /// CPU limit in millicores (1000 = one full core), same resolution
+    /// order as `memory_limit_mb`.
+    pub cpu_limit_millicores: Option<u32>,
 }
 
 /// Container orchestration contract backed by the Docker socket.

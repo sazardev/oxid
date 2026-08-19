@@ -3,6 +3,7 @@
 //! The CLI, TUI, dashboard and desktop app all consume this router.
 
 use std::convert::Infallible;
+use std::path::PathBuf;
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
@@ -42,6 +43,15 @@ pub struct ApiState<
     /// reachable on localhost/a private network, not for one exposed
     /// beyond that.
     pub api_token: Option<String>,
+    /// Directory holding `audit.sqlite`/`secret.key` — needed by
+    /// `GET /api/v1/backup`/`POST /api/v1/backup/restore` since neither is
+    /// reachable through `ControlPlane`'s narrower port abstractions.
+    pub data_dir: PathBuf,
+    /// Gates `POST /api/v1/backup/restore` (`OXID_ALLOW_RESTORE`). Off by
+    /// default: restoring stages a file for the *next* daemon restart (see
+    /// the handler's doc comment) rather than hot-swapping a live database,
+    /// but accepting the upload at all is still an operator opt-in.
+    pub allow_restore: bool,
 }
 
 /// Builds the API router. Every route except `/health`, `/webhooks/github`,
@@ -60,6 +70,7 @@ pub fn router<
         )
         .route("/api/v1/projects/{id}/environments", get(list_environments))
         .route("/api/v1/projects/{id}/deploy", post(deploy))
+        .route("/api/v1/projects/{id}/rollback", post(rollback))
         .route("/api/v1/projects/{id}", delete(delete_project))
         .route("/api/v1/environments/{env_id}", delete(destroy))
         .route(
@@ -77,6 +88,13 @@ pub fn router<
         )
         .route("/api/v1/environments/{env_id}/pause", post(pause))
         .route("/api/v1/environments/{env_id}/wake", post(wake))
+        .route("/api/v1/audit", get(recent_audit))
+        .route("/api/v1/backup", get(backup))
+        .route("/api/v1/backup/restore", post(restore))
+        .route(
+            "/api/v1/environments/{env_id}/audit",
+            get(environment_audit),
+        )
         .route("/api/v1/environments/{env_id}/logs", get(logs))
         .route(
             "/api/v1/environments/{env_id}/logs/stream",
@@ -152,6 +170,23 @@ pub struct RegisterBody {
 pub struct DeployBody {
     /// Branch to deploy.
     pub branch: String,
+}
+
+/// Query for `GET /api/v1/audit`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AuditQuery {
+    /// Maximum number of events to return (default 50).
+    pub limit: Option<u64>,
+}
+
+/// Body for `POST /api/v1/projects/{id}/rollback`.
+#[derive(Debug, Deserialize)]
+pub struct RollbackBody {
+    /// Branch to roll back.
+    pub branch: String,
+    /// Specific commit to roll back to. When omitted, rolls back to the
+    /// deploy immediately before the current live one.
+    pub to_sha: Option<String>,
 }
 
 /// Query for `GET /api/v1/projects/{id}/environments`.
@@ -310,6 +345,132 @@ async fn deploy<
 ) -> ApiResult<(StatusCode, Json<Environment>)> {
     let branch = parse_branch(&body.branch)?;
     let env = state.cp.deploy(ProjectId(id), branch).await?;
+    Ok((StatusCode::CREATED, Json(env)))
+}
+
+const DEFAULT_AUDIT_LIMIT: u64 = 50;
+
+async fn recent_audit<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<oxid_core::AuditEvent>>> {
+    let limit = query.limit.unwrap_or(DEFAULT_AUDIT_LIMIT);
+    Ok(Json(state.cp.recent_audit_events(limit).await?))
+}
+
+async fn environment_audit<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(env_id): Path<u64>,
+) -> ApiResult<Json<Vec<oxid_core::AuditEvent>>> {
+    Ok(Json(
+        state.cp.audit_events_for(EnvironmentId(env_id)).await?,
+    ))
+}
+
+/// Streams a `.tar` snapshot of `/data`: a consistent point-in-time copy of
+/// `audit.sqlite` (via `VACUUM INTO`, safe against the live pool) plus
+/// `secret.key`. `git-cache/` is deliberately excluded — it's re-clonable
+/// and can be large; restoring just re-clones on the next deploy.
+async fn backup<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Response> {
+    let snapshot_path = state
+        .data_dir
+        .join(format!(".backup-snapshot-{}.sqlite", std::process::id()));
+    // `VACUUM INTO` fails if the destination already exists — a leftover
+    // from a prior crashed backup attempt would otherwise wedge every
+    // future one permanently.
+    let _ = std::fs::remove_file(&snapshot_path);
+    state.cp.backup_database(&snapshot_path).await?;
+
+    let secret_key_path = state.data_dir.join("secret.key");
+    let tar_bytes = (|| -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            builder.append_path_with_name(&snapshot_path, "audit.sqlite")?;
+            if secret_key_path.exists() {
+                builder.append_path_with_name(&secret_key_path, "secret.key")?;
+            }
+            builder.finish()?;
+        }
+        Ok(buf)
+    })();
+    let _ = std::fs::remove_file(&snapshot_path);
+    let tar_bytes = tar_bytes.map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot build backup archive: {e}"),
+        )
+    })?;
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-tar")],
+        tar_bytes,
+    )
+        .into_response())
+}
+
+/// Accepts a `.tar` produced by [`backup`] and stages it as
+/// `<data_dir>/.restore-pending.tar` for the *next* daemon restart to pick
+/// up (see `main.rs`'s startup check) — swapping `audit.sqlite` out from
+/// under an already-open `SqlitePool` live would be undefined behavior, so
+/// this deliberately does not attempt a hot restore. Gated by
+/// `OXID_ALLOW_RESTORE` (off by default) since accepting an arbitrary
+/// uploaded database is a meaningfully different risk than the read-only
+/// `backup` endpoint.
+async fn restore<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    if !state.allow_restore {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "restore is disabled; set OXID_ALLOW_RESTORE=1 on the daemon to enable it",
+        ));
+    }
+    let staged_path = state.data_dir.join(".restore-pending.tar");
+    std::fs::write(&staged_path, &body).map_err(|e| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot stage restore archive: {e}"),
+        )
+    })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "staged",
+            "message": "restore staged; restart the daemon to apply it"
+        })),
+    ))
+}
+
+async fn rollback<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(id): Path<u64>,
+    Json(body): Json<RollbackBody>,
+) -> ApiResult<(StatusCode, Json<Environment>)> {
+    let branch = parse_branch(&body.branch)?;
+    let env = state
+        .cp
+        .rollback(ProjectId(id), branch, body.to_sha)
+        .await?;
     Ok((StatusCode::CREATED, Json(env)))
 }
 
@@ -781,6 +942,7 @@ mod tests {
     use oxid_core::{BuildSpec, ContainerSpec, GitError, OciError, RepoUrl};
     use tower::ServiceExt;
 
+    use crate::adapter::crypto::Cipher;
     use crate::adapter::store::SqliteStore;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -889,6 +1051,15 @@ mod tests {
         }
     }
 
+    /// A data dir with a dummy `secret.key`, for backup-endpoint tests.
+    /// `.keep()` leaks it (no auto-delete on drop) since it must outlive
+    /// the individual request(s) a test makes against the returned router.
+    fn test_data_dir() -> PathBuf {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::fs::write(dir.join("secret.key"), b"test-key-material").unwrap();
+        dir
+    }
+
     async fn test_app() -> (Router, FakeOci) {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -899,6 +1070,8 @@ mod tests {
                 cp,
                 webhook_secret: Some("test-secret".to_owned()),
                 api_token: None,
+                data_dir: test_data_dir(),
+                allow_restore: true,
             }),
             oci,
         )
@@ -912,6 +1085,8 @@ mod tests {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
             api_token: Some(token.to_owned()),
+            data_dir: test_data_dir(),
+            allow_restore: true,
         })
     }
 
@@ -962,6 +1137,32 @@ port = 8080
             .unwrap();
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    /// Like `json_request`, but for endpoints that consume/produce raw
+    /// bytes instead of JSON (`/backup`, `/backup/restore`).
+    async fn raw_request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 10_000_000)
             .await
             .unwrap();
         (status, bytes.to_vec())
@@ -1105,6 +1306,200 @@ port = 8080
                 .any(|c| c.starts_with("run:oxid-app-feature-login")),
             "{calls:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key() {
+        // `VACUUM INTO` (what `backup_to` uses) doesn't work against a
+        // `:memory:` source — a real file-backed store is needed here,
+        // matching how the daemon always runs in production.
+        let data_dir = test_data_dir();
+        let store = SqliteStore::open(data_dir.join("audit.sqlite"), Cipher::from_key([1u8; 32]))
+            .await
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let app = router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: data_dir.clone(),
+            allow_restore: true,
+        });
+        // Give the backup something real to capture.
+        json_request(
+            &app,
+            "POST",
+            "/api/v1/secrets",
+            json!({ "name": "GLOBAL_X", "scope": "global", "value": "v" }),
+        )
+        .await;
+
+        let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut archive = tar::Archive::new(body.as_slice());
+        archive.unpack(dir.path()).unwrap();
+        assert!(dir.path().join("secret.key").exists());
+        let snapshot = dir.path().join("audit.sqlite");
+        assert!(snapshot.exists());
+
+        let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&snapshot);
+        let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM secrets WHERE name = 'GLOBAL_X'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 1);
+    }
+
+    #[tokio::test]
+    async fn restore_is_rejected_when_not_allowed() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let app = router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: test_data_dir(),
+            allow_restore: false,
+        });
+
+        let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", vec![1, 2, 3]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn restore_stages_the_upload_without_touching_the_live_database() {
+        let data_dir = test_data_dir();
+        let store = SqliteStore::open(data_dir.join("audit.sqlite"), Cipher::from_key([1u8; 32]))
+            .await
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let app = router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: data_dir.clone(),
+            allow_restore: true,
+        });
+
+        let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", body).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // Staged for the next restart to pick up, not applied in place —
+        // the running daemon's own database is left untouched.
+        assert!(data_dir.join(".restore-pending.tar").exists());
+        let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn audit_endpoints_expose_the_previously_write_only_trail() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!events.is_empty(), "expected at least the Deploy event");
+        assert_eq!(events[0]["environment_id"], env.id.0);
+
+        let (status, body) = json_request(&app, "GET", "/api/v1/audit", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let recent: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            recent.iter().any(|e| e["environment_id"] == env.id.0),
+            "{recent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_endpoint_is_wired_and_errors_clearly_with_no_prior_deploy() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        // No deploy yet: rollback has nothing to roll back to.
+        let (status, _) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // One deploy: still nothing *prior* to roll back to.
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let (status, _) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A second deploy gives rollback something to redeploy.
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        let (status, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+            json!({ "branch": "feature-login" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+        assert_eq!(env.state.to_string(), "running");
     }
 
     #[tokio::test]

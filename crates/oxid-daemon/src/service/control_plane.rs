@@ -12,7 +12,7 @@ use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
-    AuditEvent, AuditStore, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec,
+    AuditEvent, AuditStore, Branch, BranchName, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
     Dependency, DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState,
     EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime, PoolError, PoolKind,
     Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore, SecretValue,
@@ -115,6 +115,15 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// Number of logical Redis databases available to lease from
     /// (`OXID_REDIS_POOL_SIZE`, default matches Redis's own default of 16).
     redis_pool_size: u32,
+    /// Memory limit (megabytes) applied to a deployed container when its
+    /// project's `[build]` doesn't specify its own
+    /// (`OXID_DEFAULT_MEMORY_LIMIT_MB`). `None` means genuinely unbounded —
+    /// not the recommended default, but preserved for anyone who explicitly
+    /// unsets it.
+    default_memory_limit_mb: Option<u64>,
+    /// CPU limit (millicores) applied the same way as
+    /// `default_memory_limit_mb` (`OXID_DEFAULT_CPU_LIMIT_MILLICORES`).
+    default_cpu_limit_millicores: Option<u32>,
 }
 
 const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
@@ -138,6 +147,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             postgres_url: None,
             redis_url: None,
             redis_pool_size: DEFAULT_REDIS_POOL_SIZE,
+            default_memory_limit_mb: None,
+            default_cpu_limit_millicores: None,
         }
     }
 
@@ -152,6 +163,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ) -> Self {
         self.docker_network = Some(network.into());
         self.daemon_url = daemon_url.into();
+        self
+    }
+
+    /// Sets the daemon-wide fallback memory/CPU limits applied to a
+    /// deployed container when its project's `[build]` doesn't specify its
+    /// own (SPEC.md "Eficiencia Absoluta" — an environment should never be
+    /// able to exhaust the host by default, only by explicit configuration).
+    #[must_use]
+    pub fn with_resource_defaults(
+        mut self,
+        default_memory_limit_mb: Option<u64>,
+        default_cpu_limit_millicores: Option<u32>,
+    ) -> Self {
+        self.default_memory_limit_mb = default_memory_limit_mb;
+        self.default_cpu_limit_millicores = default_cpu_limit_millicores;
         self
     }
 
@@ -279,6 +305,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         project_id: ProjectId,
         branch: BranchName,
     ) -> Result<Environment, CpError> {
+        self.deploy_at(project_id, branch, None).await
+    }
+
+    /// Deploys `branch`, pinned to `sha_override` instead of the branch's
+    /// current head when given — the mechanism [`Self::rollback`] reuses to
+    /// redeploy a prior commit. Otherwise identical to [`Self::deploy`].
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on any pipeline step failure.
+    async fn deploy_at(
+        &self,
+        project_id: ProjectId,
+        branch: BranchName,
+        sha_override: Option<String>,
+    ) -> Result<Environment, CpError> {
         // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
         // comment for the two race conditions this closes).
         let _guard = self.lifecycle_lock.lock().await;
@@ -294,12 +335,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self.replace_previous_deployment(&project, project_id, &branch)
             .await?;
 
-        // 1. Clone cache + resolve + checkout the branch.
+        // 1. Clone cache + resolve (or reuse an explicit rollback target)
+        // + checkout the commit.
         let repo_dir = self
             .git
             .ensure_repo(&project.repo_url, &self.cache_dir)
             .await?;
-        let commit = self.git.resolve_branch_head(&repo_dir, &branch).await?;
+        let commit = match sha_override {
+            Some(sha) => CommitRef {
+                branch: branch.clone(),
+                sha,
+            },
+            None => self.git.resolve_branch_head(&repo_dir, &branch).await?,
+        };
         self.git.checkout_commit(&repo_dir, &commit.sha).await?;
 
         // 2. Build the image.
@@ -366,6 +414,58 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         Ok(env)
+    }
+
+    /// Redeploys `branch` at a prior commit instead of its current head —
+    /// the safety net for a bad deploy, since `oxid up` always rebuilds from
+    /// HEAD with no way back otherwise. Reuses `environments`' existing
+    /// per-deploy history (a new row per deploy, the prior one marked
+    /// `Destroyed` — see `replace_previous_deployment`) rather than needing
+    /// any new storage: every past deploy's commit is already sitting in
+    /// `Environment.branch.commit_sha`.
+    ///
+    /// Without `to_sha`, rolls back to the commit immediately before the
+    /// current live one. With `to_sha`, rolls back to that specific commit —
+    /// but only if it actually appears in this branch's history, so a typo
+    /// or an unrelated sha can't be deployed under the guise of "rollback".
+    ///
+    /// # Errors
+    /// [`CpError::NotFound`] if the branch has no prior deploy to roll back
+    /// to (or `to_sha` doesn't match one), plus anything [`Self::deploy`]
+    /// can fail with.
+    pub async fn rollback(
+        &self,
+        project_id: ProjectId,
+        branch: BranchName,
+        to_sha: Option<String>,
+    ) -> Result<Environment, CpError> {
+        let mut history = self.store.list_by_project(project_id).await?;
+        history.retain(|e| e.branch.name == branch);
+        history.sort_by_key(|e| std::cmp::Reverse(e.id.0));
+
+        let target_sha = match to_sha {
+            Some(sha) => history
+                .iter()
+                .find(|e| e.branch.commit_sha == sha)
+                .map(|e| e.branch.commit_sha.clone())
+                .ok_or_else(|| {
+                    CpError::NotFound(format!(
+                        "commit `{sha}` in branch `{branch}`'s deploy history"
+                    ))
+                })?,
+            None => history
+                .iter()
+                .skip(1) // the current live deploy
+                .map(|e| e.branch.commit_sha.clone())
+                .next()
+                .ok_or_else(|| {
+                    CpError::NotFound(format!(
+                        "a prior deploy of branch `{branch}` to roll back to"
+                    ))
+                })?,
+        };
+
+        self.deploy_at(project_id, branch, Some(target_sha)).await
     }
 
     /// Resolves secrets, runs the container, runs `[build].on_start` hooks,
@@ -449,6 +549,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             host_port: project.config.port,
             labels,
             network: self.docker_network.clone(),
+            memory_limit_mb: project
+                .config
+                .build
+                .memory_limit_mb
+                .or(self.default_memory_limit_mb),
+            cpu_limit_millicores: project
+                .config
+                .build
+                .cpu_limit_millicores
+                .or(self.default_cpu_limit_millicores),
         };
         self.oci.run(&spec).await?;
 
@@ -820,6 +930,42 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?)
     }
 
+    /// Writes a consistent database snapshot to `dest` (see
+    /// [`SqliteStore::backup_to`]). Backs `GET /api/v1/backup`.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn backup_database(&self, dest: &std::path::Path) -> Result<(), CpError> {
+        self.store
+            .backup_to(dest)
+            .await
+            .map_err(|e| CpError::Store(RepositoryError::Storage(e.to_string())))
+    }
+
+    /// Returns the most recent audit events across every project, newest
+    /// first — an operator-facing view of `AuditStore`, which until now was
+    /// write-only (recorded on every deploy/pause/wake/destroy but never
+    /// exposed over the API).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn recent_audit_events(&self, limit: u64) -> Result<Vec<AuditEvent>, CpError> {
+        Ok(AuditStore::list_recent(&self.store, limit).await?)
+    }
+
+    /// Returns an environment's full audit history, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the environment doesn't exist, plus
+    /// anything storage can fail with.
+    pub async fn audit_events_for(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<Vec<AuditEvent>, CpError> {
+        self.ensure_environment(environment_id).await?;
+        Ok(AuditStore::list_by_environment(&self.store, environment_id).await?)
+    }
+
     /// Stores or replaces a secret at the given scope
     /// (`Global` when `project_id` is `None`).
     ///
@@ -1179,10 +1325,10 @@ mod tests {
             Ok(())
         }
         async fn run(&self, spec: &ContainerSpec) -> Result<(), OciError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("run:{}:env={:?}", spec.name, spec.env));
+            self.calls.lock().unwrap().push(format!(
+                "run:{}:env={:?}:mem={:?}:cpu={:?}",
+                spec.name, spec.env, spec.memory_limit_mb, spec.cpu_limit_millicores
+            ));
             let mut remaining = self.fail_run_times.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
@@ -1241,6 +1387,38 @@ mod tests {
 
     async fn store() -> SqliteStore {
         SqliteStore::open_in_memory().await.unwrap()
+    }
+
+    /// A `GitPort` whose `resolve_branch_head` returns a fresh, incrementing
+    /// sha on every call — unlike `FakeGit`'s fixed `SHA`, needed to tell
+    /// apart successive deploys of the same branch by commit (rollback
+    /// tests).
+    #[derive(Clone, Default)]
+    struct SequentialGit(Arc<std::sync::atomic::AtomicU32>);
+
+    impl GitPort for SequentialGit {
+        async fn remote_url(&self, repo_dir: &Path) -> Result<RepoUrl, GitError> {
+            let _ = repo_dir;
+            RepoUrl::parse("https://github.com/org/app.git")
+                .map_err(|e| GitError::Failure(e.to_string()))
+        }
+        async fn ensure_repo(&self, _url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError> {
+            Ok(cache_dir.join("app"))
+        }
+        async fn resolve_branch_head(
+            &self,
+            _repo_dir: &Path,
+            branch: &BranchName,
+        ) -> Result<oxid_core::CommitRef, GitError> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(oxid_core::CommitRef {
+                branch: branch.clone(),
+                sha: format!("{n:040}"),
+            })
+        }
+        async fn checkout_commit(&self, _repo_dir: &Path, _sha: &str) -> Result<(), GitError> {
+            Ok(())
+        }
     }
 
     fn repo_dir_with_config() -> tempfile::TempDir {
@@ -1565,6 +1743,95 @@ port = 8080
         );
     }
 
+    #[tokio::test]
+    async fn rollback_without_to_sha_redeploys_the_immediately_prior_commit() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            SequentialGit::default(),
+            oci,
+            cache.path().to_owned(),
+        );
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch = BranchName::parse("main").unwrap();
+
+        let first = cp.deploy(project.id, branch.clone()).await.unwrap();
+        let second = cp.deploy(project.id, branch.clone()).await.unwrap();
+        assert_ne!(first.branch.commit_sha, second.branch.commit_sha);
+
+        let rolled_back = cp.rollback(project.id, branch, None).await.unwrap();
+        assert_eq!(rolled_back.branch.commit_sha, first.branch.commit_sha);
+        assert_eq!(rolled_back.state, EnvironmentState::Running);
+    }
+
+    #[tokio::test]
+    async fn rollback_with_explicit_to_sha_uses_that_commit() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            SequentialGit::default(),
+            oci,
+            cache.path().to_owned(),
+        );
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch = BranchName::parse("main").unwrap();
+
+        let first = cp.deploy(project.id, branch.clone()).await.unwrap();
+        cp.deploy(project.id, branch.clone()).await.unwrap();
+        cp.deploy(project.id, branch.clone()).await.unwrap();
+
+        let rolled_back = cp
+            .rollback(project.id, branch, Some(first.branch.commit_sha.clone()))
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.branch.commit_sha, first.branch.commit_sha);
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_a_sha_not_in_the_branchs_history() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            SequentialGit::default(),
+            oci,
+            cache.path().to_owned(),
+        );
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch = BranchName::parse("main").unwrap();
+        cp.deploy(project.id, branch.clone()).await.unwrap();
+
+        let err = cp
+            .rollback(project.id, branch, Some("not-a-real-sha".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CpError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn rollback_with_no_prior_deploy_is_not_found() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cache = tempfile::tempdir().unwrap();
+        let cp = ControlPlane::new(
+            store().await,
+            SequentialGit::default(),
+            oci,
+            cache.path().to_owned(),
+        );
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let branch = BranchName::parse("main").unwrap();
+        cp.deploy(project.id, branch.clone()).await.unwrap();
+
+        let err = cp.rollback(project.id, branch, None).await.unwrap_err();
+        assert!(matches!(err, CpError::NotFound(_)));
+    }
+
     /// Regression test for a real bricking bug: a transient failure in
     /// `run()` (Docker error, bad secret, failing `on_start` hook) happening
     /// *after* the `Environment` row was persisted as `Building` used to
@@ -1683,6 +1950,64 @@ port = 8080
         let mut stream = cp.stream_logs(env.id).await.unwrap();
         let first = futures_util::StreamExt::next(&mut stream).await;
         assert_eq!(first, Some(Ok("build log".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn deploy_applies_daemon_default_resource_limits_when_project_sets_none() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone())
+            .await
+            .with_resource_defaults(Some(512), Some(1000));
+        let project = cp.register_project(repo.path()).await.unwrap();
+        cp.deploy(project.id, BranchName::parse("main").unwrap())
+            .await
+            .unwrap();
+
+        let calls = oci.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("run:")
+                && c.contains("mem=Some(512)")
+                && c.contains("cpu=Some(1000)")),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_lets_a_projects_own_resource_limits_win_over_the_daemon_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("oxid.toml"),
+            r#"
+[project]
+name = "app"
+
+[routing]
+base_domain = "app.local.dev"
+port = 8080
+
+[build]
+memory_limit_mb = 128
+cpu_limit_millicores = 250
+"#,
+        )
+        .unwrap();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone())
+            .await
+            .with_resource_defaults(Some(512), Some(1000));
+        let project = cp.register_project(dir.path()).await.unwrap();
+        cp.deploy(project.id, BranchName::parse("main").unwrap())
+            .await
+            .unwrap();
+
+        let calls = oci.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|c| c.starts_with("run:")
+                && c.contains("mem=Some(128)")
+                && c.contains("cpu=Some(250)")),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]

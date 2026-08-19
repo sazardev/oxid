@@ -114,6 +114,12 @@ impl ContainerPort for DockerClient {
             ),
             host_config: Some(HostConfig {
                 port_bindings,
+                memory: spec
+                    .memory_limit_mb
+                    .map(|mb| (mb * 1_048_576).cast_signed()),
+                nano_cpus: spec
+                    .cpu_limit_millicores
+                    .map(|millicores| i64::from(millicores) * 1_000_000),
                 ..Default::default()
             }),
             networking_config,
@@ -336,6 +342,8 @@ mod tests {
             host_port: 0,
             labels: std::collections::BTreeMap::default(),
             network: None,
+            memory_limit_mb: None,
+            cpu_limit_millicores: None,
         };
         // `run` publishes `host_port`; 0 lets Docker pick a free one so this
         // test doesn't collide with anything else on the machine.

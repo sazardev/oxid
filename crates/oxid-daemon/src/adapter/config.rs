@@ -88,6 +88,8 @@ struct BuildBlock {
     context: Option<String>,
     #[serde(default)]
     on_start: Vec<String>,
+    memory_limit_mb: Option<u64>,
+    cpu_limit_millicores: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -131,6 +133,8 @@ impl Config {
                 .context
                 .unwrap_or_else(|| DEFAULT_CONTEXT.to_owned()),
             on_start: self.build.on_start,
+            memory_limit_mb: self.build.memory_limit_mb,
+            cpu_limit_millicores: self.build.cpu_limit_millicores,
         };
 
         let mut dependencies = Vec::with_capacity(self.dependencies.len());
@@ -262,6 +266,8 @@ fn zero_config_project(
         dockerfile,
         context,
         on_start: Vec::new(),
+        memory_limit_mb: None,
+        cpu_limit_millicores: None,
     };
     let config = ProjectConfig::new(
         base_domain,
@@ -329,6 +335,8 @@ destroy_after = "7d"
 dockerfile = "deploy/Dockerfile.dev"
 context = "deploy"
 on_start = ["npm run db:migrate", "npm run db:seed"]
+memory_limit_mb = 256
+cpu_limit_millicores = 500
 
 [routing]
 base_domain = "my-awesome-api.local.dev"
@@ -360,6 +368,8 @@ inject_url_as = "REDIS_URL"
         );
         assert_eq!(parsed.config.build.context, "deploy");
         assert_eq!(parsed.config.build.on_start.len(), 2);
+        assert_eq!(parsed.config.build.memory_limit_mb, Some(256));
+        assert_eq!(parsed.config.build.cpu_limit_millicores, Some(500));
 
         assert_eq!(parsed.config.dependencies.len(), 2);
         let db = parsed
@@ -398,6 +408,8 @@ port = 3000
         assert_eq!(parsed.config.build.context, ".");
         assert!(parsed.config.build.on_start.is_empty());
         assert!(parsed.config.build.dockerfile.is_none());
+        assert!(parsed.config.build.memory_limit_mb.is_none());
+        assert!(parsed.config.build.cpu_limit_millicores.is_none());
         assert!(parsed.config.dependencies.is_empty());
     }
 

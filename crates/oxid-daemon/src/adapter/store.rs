@@ -76,6 +76,26 @@ impl SqliteStore {
         Self::open_with(opts, Cipher::from_key([1u8; 32])).await
     }
 
+    /// Writes a consistent point-in-time snapshot of the database to
+    /// `dest` via `SQLite`'s `VACUUM INTO` — safe to run against a live,
+    /// already-open pool (unlike copying the `.sqlite`/`-wal`/`-shm` files
+    /// directly, which can capture an inconsistent mid-write state). Backs
+    /// the `GET /api/v1/backup` endpoint.
+    ///
+    /// # Errors
+    /// Returns [`StoreError`] on query failure (e.g. `dest` already exists).
+    pub async fn backup_to(&self, dest: &Path) -> Result<(), StoreError> {
+        // `VACUUM INTO` doesn't accept a bound parameter for the filename
+        // (silently no-ops instead of erroring) — it needs a string literal,
+        // hence the manual escaping instead of `.bind(...)`.
+        let escaped = dest.to_string_lossy().replace('\'', "''");
+        sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+            .persistent(false)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn open_with(opts: SqliteConnectOptions, cipher: Cipher) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -298,6 +318,8 @@ fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
             .expect("serializing Vec<String> cannot fail"),
         dependencies_json: serde_json::to_string(&project.config.dependencies)
             .expect("serializing Vec<Dependency> cannot fail"),
+        memory_limit_mb: project.config.build.memory_limit_mb.map(u64::cast_signed),
+        cpu_limit_millicores: project.config.build.cpu_limit_millicores.map(i64::from),
     }
 }
 
@@ -312,13 +334,17 @@ struct ProjectBinds<'a> {
     build_context: &'a str,
     on_start_json: String,
     dependencies_json: String,
+    memory_limit_mb: Option<i64>,
+    cpu_limit_millicores: Option<i64>,
 }
 
 const PROJECT_COLUMNS: &str = "id, name, repo_url, base_domain, pause_after_seconds, \
-     destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json";
+     destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
+     memory_limit_mb, cpu_limit_millicores";
 
 const PROJECT_COLUMNS_NO_ID: &str = "name, repo_url, base_domain, pause_after_seconds, \
-     destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json";
+     destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
+     memory_limit_mb, cpu_limit_millicores";
 
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -332,6 +358,8 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
     let build_context: String = row.try_get("build_context").map_err(storage)?;
     let on_start_json: String = row.try_get("on_start_json").map_err(storage)?;
     let dependencies_json: String = row.try_get("dependencies_json").map_err(storage)?;
+    let memory_limit_mb: Option<i64> = row.try_get("memory_limit_mb").map_err(storage)?;
+    let cpu_limit_millicores: Option<i64> = row.try_get("cpu_limit_millicores").map_err(storage)?;
 
     let on_start: Vec<String> =
         serde_json::from_str(&on_start_json).map_err(|e| storage(e.to_string()))?;
@@ -342,6 +370,10 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
         dockerfile,
         context: build_context,
         on_start,
+        memory_limit_mb: memory_limit_mb.map(i64::cast_unsigned),
+        cpu_limit_millicores: cpu_limit_millicores
+            .map(|v| u32::try_from(v).map_err(|_| storage("cpu_limit_millicores overflowed u32")))
+            .transpose()?,
     };
     let config = ProjectConfig::new(
         base_domain,
@@ -362,7 +394,7 @@ impl ProjectStore for SqliteStore {
         let binds = project_to_binds(project);
         let row = sqlx::query(&format!(
             "INSERT INTO projects ({PROJECT_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.name)
         .bind(binds.repo_url)
@@ -374,6 +406,8 @@ impl ProjectStore for SqliteStore {
         .bind(binds.build_context)
         .bind(binds.on_start_json)
         .bind(binds.dependencies_json)
+        .bind(binds.memory_limit_mb)
+        .bind(binds.cpu_limit_millicores)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -813,6 +847,18 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    #[tokio::test]
+    async fn backup_to_writes_a_real_sqlite_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.sqlite");
+        let store = SqliteStore::open(&src, Cipher::from_key([1u8; 32]))
+            .await
+            .unwrap();
+        let dest = dir.path().join("snapshot.sqlite");
+        store.backup_to(&dest).await.unwrap();
+        assert!(dest.exists(), "expected {} to exist", dest.display());
+    }
+
     fn project(id: u64) -> Project {
         let config = ProjectConfig::new(
             "app.local.dev",
@@ -823,6 +869,8 @@ mod tests {
                 dockerfile: Some("Dockerfile.dev".to_owned()),
                 context: "deploy".to_owned(),
                 on_start: vec!["db:migrate".to_owned()],
+                memory_limit_mb: Some(256),
+                cpu_limit_millicores: Some(500),
             },
             vec![Dependency {
                 kind: PoolKind::Postgres,

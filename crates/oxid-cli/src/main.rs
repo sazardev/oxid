@@ -5,10 +5,11 @@
 //! per-invocation with `--api`.
 
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 
 /// Ephemeral environments that breathe. Ferrous performance, invisible footprint.
@@ -22,6 +23,11 @@ struct Cli {
     /// `OXID_TOKEN` when set.
     #[arg(long, global = true)]
     token: Option<String>,
+    /// Print machine-readable JSON instead of formatted text. Errors still
+    /// go to stderr as plain text; use the process exit code to distinguish
+    /// failure kinds in scripts.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -32,6 +38,15 @@ enum Command {
     Up {
         /// Branch to deploy.
         branch: String,
+    },
+    /// Redeploy a branch at a prior commit instead of its current head.
+    Rollback {
+        /// Branch to roll back.
+        branch: String,
+        /// Specific commit to roll back to. Defaults to the deploy
+        /// immediately before the current live one.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// List environments for the project in the current directory.
     Status,
@@ -79,6 +94,27 @@ enum Command {
         /// one-shot snapshot.
         #[arg(long, short)]
         follow: bool,
+    },
+    /// Show the audit trail (deploy/pause/wake/destroy history).
+    Audit {
+        /// Branch to show the full history of. Omit for the most recent
+        /// events across every project the daemon knows about.
+        branch: Option<String>,
+        /// Maximum number of events to show (default 50, only applies
+        /// without `branch`).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Download a consistent snapshot of the daemon's database + secret key.
+    Backup {
+        /// File to write the `.tar` archive to.
+        file: String,
+    },
+    /// Upload a `.tar` produced by `oxid backup` to restore on the daemon's
+    /// next restart (requires `OXID_ALLOW_RESTORE=1` on the daemon).
+    Restore {
+        /// The `.tar` archive to upload.
+        file: String,
     },
 }
 
@@ -137,16 +173,43 @@ const RED: &str = "\x1b[31m";
 const DIM_ITALIC: &str = "\x1b[3;90m";
 const RESET: &str = "\x1b[0m";
 
+/// Set once at the top of `main()` from `--json`, read everywhere output is
+/// produced. A CLI process runs exactly one command per invocation on a
+/// single thread, so a global here is simpler and just as correct as
+/// threading a `json: bool` through every `cmd_*`/helper signature.
+static JSON_MODE: AtomicBool = AtomicBool::new(false);
+
+fn json_mode() -> bool {
+    JSON_MODE.load(Ordering::Relaxed)
+}
+
+/// Prints a JSON value to stdout when `--json` is set. Returns whether it
+/// did, so callers can skip their normal formatted-text output.
+fn emit_json(value: &Value) -> bool {
+    if json_mode() {
+        println!("{value}");
+        true
+    } else {
+        false
+    }
+}
+
 fn ok(msg: impl std::fmt::Display) {
-    println!("{GREEN}[+]{RESET} {msg}");
+    if !json_mode() {
+        println!("{GREEN}[+]{RESET} {msg}");
+    }
 }
 
 fn bg(msg: impl std::fmt::Display) {
-    println!("{GRAY}[~]{RESET} {msg}");
+    if !json_mode() {
+        println!("{GRAY}[~]{RESET} {msg}");
+    }
 }
 
 fn action(msg: impl std::fmt::Display) {
-    println!("{ORANGE}[>]{RESET} {msg}");
+    if !json_mode() {
+        println!("{ORANGE}[>]{RESET} {msg}");
+    }
 }
 
 fn error(msg: impl std::fmt::Display) {
@@ -197,12 +260,68 @@ fn build_client(token: Option<&str>) -> Result<Client, String> {
         .map_err(|e| format!("cannot build HTTP client: {e}"))
 }
 
-fn report_error(body: &str, status: reqwest::StatusCode) {
+// ---------------------------------------------------------------------------
+// Errors — a message plus an exit code a script can branch on, instead of
+// every failure exiting `1` indistinguishably.
+// ---------------------------------------------------------------------------
+
+const EXIT_GENERIC: i32 = 1;
+const EXIT_NOT_FOUND: i32 = 2;
+const EXIT_UNREACHABLE: i32 = 3;
+const EXIT_UNAUTHORIZED: i32 = 4;
+
+#[derive(Debug)]
+struct CliError {
+    message: String,
+    code: i32,
+}
+
+impl CliError {
+    fn new(message: impl Into<String>, code: i32) -> Self {
+        Self {
+            message: message.into(),
+            code,
+        }
+    }
+}
+
+/// Any existing `.map_err(|e| format!(...))?` site keeps compiling
+/// unchanged and gets the generic exit code — only the handful of call
+/// sites that need a *specific* code (a daemon response with a real status,
+/// or a connection failure) build a [`CliError`] explicitly.
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::new(message, EXIT_GENERIC)
+    }
+}
+
+fn classify_status(status: StatusCode) -> i32 {
+    match status {
+        StatusCode::NOT_FOUND => EXIT_NOT_FOUND,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => EXIT_UNAUTHORIZED,
+        _ => EXIT_GENERIC,
+    }
+}
+
+/// Prints the daemon's error response and returns a [`CliError`] carrying
+/// `context` and a code classified from `status`.
+fn response_error(body: &str, status: StatusCode, context: &str) -> CliError {
     let message = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v["error"].as_str().map(str::to_owned))
         .unwrap_or_else(|| body.to_owned());
     error(format!("{status}: {message}"));
+    CliError::new(context, classify_status(status))
+}
+
+/// Builds a [`CliError`] for a request that never reached the daemon at
+/// all (connection refused, DNS failure, timeout) — distinct from the
+/// daemon replying with an error status.
+fn connect_error(url: &str, e: &reqwest::Error) -> CliError {
+    CliError::new(
+        format!("cannot reach daemon at {url}: {e}"),
+        EXIT_UNREACHABLE,
+    )
 }
 
 // The CLI is a short-lived process making a handful of sequential HTTP
@@ -212,18 +331,22 @@ fn report_error(body: &str, status: reqwest::StatusCode) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
+    JSON_MODE.store(cli.json, Ordering::Relaxed);
     let base = api_base(cli.api.as_deref());
     let token = api_token(cli.token.as_deref());
     let client = match build_client(token.as_deref()) {
         Ok(client) => client,
         Err(message) => {
             error(message);
-            std::process::exit(1);
+            std::process::exit(EXIT_GENERIC);
         }
     };
 
     let result = match cli.command {
         Command::Up { branch } => cmd_up(&client, &base, &branch).await,
+        Command::Rollback { branch, to } => {
+            cmd_rollback(&client, &base, &branch, to.as_deref()).await
+        }
         Command::Status => cmd_status(&client, &base).await,
         Command::Down {
             branch,
@@ -264,11 +387,16 @@ async fn main() {
             } => cmd_env_delete(&client, &base, &name, &scope, project, branch.as_deref()).await,
         },
         Command::Logs { branch, follow } => cmd_logs(&client, &base, &branch, follow).await,
+        Command::Audit { branch, limit } => {
+            cmd_audit(&client, &base, branch.as_deref(), limit).await
+        }
+        Command::Backup { file } => cmd_backup(&client, &base, &file).await,
+        Command::Restore { file } => cmd_restore(&client, &base, &file).await,
     };
 
-    if let Err(message) = result {
-        error(message);
-        std::process::exit(1);
+    if let Err(err) = result {
+        error(err.message);
+        std::process::exit(err.code);
     }
 }
 
@@ -276,44 +404,43 @@ async fn main() {
 ///
 /// Idempotent on the daemon side: repeated registrations return the existing
 /// project.
-async fn register_project(client: &Client, base: &str) -> Result<Value, String> {
+async fn register_project(client: &Client, base: &str) -> Result<Value, CliError> {
     let repo_dir = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
+    let url = format!("{base}/api/v1/projects");
     let response = client
-        .post(format!("{base}/api/v1/projects"))
+        .post(&url)
         .json(&json!({ "repo_dir": repo_dir.display().to_string() }))
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("project registration failed".to_owned());
+        return Err(response_error(&body, status, "project registration failed"));
     }
     let project: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     Ok(project)
 }
 
-async fn get_json(client: &Client, url: String) -> Result<Value, String> {
+async fn get_json(client: &Client, url: String) -> Result<Value, CliError> {
     let response = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {url}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("request failed".to_owned());
+        return Err(response_error(&body, status, "request failed"));
     }
-    serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))
+    serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}").into())
 }
 
 /// Registers the project for `cwd`, then resolves `branch` to its single
@@ -323,7 +450,7 @@ async fn resolve_environment(
     client: &Client,
     base: &str,
     branch: &str,
-) -> Result<(u64, Value), String> {
+) -> Result<(u64, Value), CliError> {
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
@@ -337,7 +464,12 @@ async fn resolve_environment(
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
     let env = envs.first().ok_or_else(|| {
-        format!("no environment found for branch `{branch}`; run `oxid status` to see what's live")
+        CliError::new(
+            format!(
+                "no environment found for branch `{branch}`; run `oxid status` to see what's live"
+            ),
+            EXIT_NOT_FOUND,
+        )
     })?;
     let env_id = env["id"]
         .as_u64()
@@ -345,7 +477,7 @@ async fn resolve_environment(
     Ok((env_id, env.clone()))
 }
 
-async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), String> {
+async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliError> {
     action(format!("oxid up {branch}"));
     let project = register_project(client, base).await?;
     let project_id = project["id"]
@@ -358,29 +490,68 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), String>
     ));
 
     action(format!("Building image for {branch}..."));
+    let url = format!("{base}/api/v1/projects/{project_id}/deploy");
     let response = client
-        .post(format!("{base}/api/v1/projects/{project_id}/deploy"))
+        .post(&url)
         .json(&json!({ "branch": branch }))
         .send()
         .await
-        .map_err(|e| format!("deploy request failed: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("deployment failed".to_owned());
+        return Err(response_error(&body, status, "deployment failed"));
     }
     let env: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
-    let url = env["url"].as_str().unwrap_or("?");
-    ok(format!("Environment live at: {url}"));
+    if !emit_json(&env) {
+        let url = env["url"].as_str().unwrap_or("?");
+        ok(format!("Environment live at: {url}"));
+    }
     Ok(())
 }
 
-async fn cmd_status(client: &Client, base: &str) -> Result<(), String> {
+async fn cmd_rollback(
+    client: &Client,
+    base: &str,
+    branch: &str,
+    to_sha: Option<&str>,
+) -> Result<(), CliError> {
+    action(format!("oxid rollback {branch}"));
+    let project = register_project(client, base).await?;
+    let project_id = project["id"]
+        .as_u64()
+        .ok_or_else(|| "daemon response missing project id".to_owned())?;
+
+    let url = format!("{base}/api/v1/projects/{project_id}/rollback");
+    let response = client
+        .post(&url)
+        .json(&json!({ "branch": branch, "to_sha": to_sha }))
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "rollback failed"));
+    }
+    let env: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&env) {
+        let url = env["url"].as_str().unwrap_or("?");
+        let sha = env["branch"]["commit_sha"].as_str().unwrap_or("?");
+        ok(format!("Rolled back to {sha} — environment live at: {url}"));
+    }
+    Ok(())
+}
+
+async fn cmd_status(client: &Client, base: &str) -> Result<(), CliError> {
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
@@ -390,6 +561,9 @@ async fn cmd_status(client: &Client, base: &str) -> Result<(), String> {
         format!("{base}/api/v1/projects/{project_id}/environments"),
     )
     .await?;
+    if emit_json(&envs) {
+        return Ok(());
+    }
     let envs = envs
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
@@ -427,7 +601,7 @@ async fn cmd_down(
     branch: &str,
     force: bool,
     purge_secrets: bool,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     if !force
         && !confirm(&format!(
@@ -443,22 +617,27 @@ async fn cmd_down(
         format!("{base}/api/v1/environments/{env_id}")
     };
     let response = client
-        .delete(url)
+        .delete(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("destroying environment failed".to_owned());
+        return Err(response_error(
+            &body,
+            status,
+            "destroying environment failed",
+        ));
     }
-    ok(format!("Environment `{branch}` destroyed"));
-    if purge_secrets {
-        bg(format!("Branch `{branch}` secrets purged"));
+    if !emit_json(&json!({ "status": "destroyed", "branch": branch })) {
+        ok(format!("Environment `{branch}` destroyed"));
+        if purge_secrets {
+            bg(format!("Branch `{branch}` secrets purged"));
+        }
     }
     Ok(())
 }
@@ -474,7 +653,7 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), String> {
+async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), CliError> {
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
@@ -488,52 +667,57 @@ async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), 
         bg("Aborted (re-run with --force to skip this prompt).");
         return Ok(());
     }
+    let url = format!("{base}/api/v1/projects/{project_id}");
     let response = client
-        .delete(format!("{base}/api/v1/projects/{project_id}"))
+        .delete(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("deleting project failed".to_owned());
+        return Err(response_error(&body, status, "deleting project failed"));
     }
-    ok(format!("Project `{name}` deleted"));
+    if !emit_json(&json!({ "status": "deleted", "project": name })) {
+        ok(format!("Project `{name}` deleted"));
+    }
     Ok(())
 }
 
-async fn cmd_pause(client: &Client, base: &str, branch: &str) -> Result<(), String> {
+async fn cmd_pause(client: &Client, base: &str, branch: &str) -> Result<(), CliError> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     post_empty(client, format!("{base}/api/v1/environments/{env_id}/pause")).await?;
-    bg(format!("Environment `{branch}` paused"));
+    if !emit_json(&json!({ "status": "paused", "branch": branch })) {
+        bg(format!("Environment `{branch}` paused"));
+    }
     Ok(())
 }
 
-async fn cmd_wake(client: &Client, base: &str, branch: &str) -> Result<(), String> {
+async fn cmd_wake(client: &Client, base: &str, branch: &str) -> Result<(), CliError> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     post_empty(client, format!("{base}/api/v1/environments/{env_id}/wake")).await?;
-    ok(format!("Environment `{branch}` woken"));
+    if !emit_json(&json!({ "status": "woken", "branch": branch })) {
+        ok(format!("Environment `{branch}` woken"));
+    }
     Ok(())
 }
 
-async fn post_empty(client: &Client, url: String) -> Result<(), String> {
+async fn post_empty(client: &Client, url: String) -> Result<(), CliError> {
     let response = client
         .post(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {url}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("request failed".to_owned());
+        return Err(response_error(&body, status, "request failed"));
     }
     Ok(())
 }
@@ -541,12 +725,15 @@ async fn post_empty(client: &Client, url: String) -> Result<(), String> {
 /// Fetches an environment's logs. Without `follow`, a one-shot snapshot;
 /// with `follow`, consumes the daemon's SSE `/logs/stream` endpoint and
 /// prints each `data:` line as it arrives — a real live stream, not polling.
-async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Result<(), String> {
+async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Result<(), CliError> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
 
     if !follow {
         let url = format!("{base}/api/v1/environments/{env_id}/logs");
         let value = get_json(client, url).await?;
+        if emit_json(&value) {
+            return Ok(());
+        }
         let logs = value["logs"].as_str().unwrap_or("");
         for line in logs.lines() {
             println!("{line}");
@@ -559,9 +746,11 @@ async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Re
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     if !response.status().is_success() {
-        return Err(format!("request failed with status {}", response.status()));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(response_error(&body, status, "request failed"));
     }
 
     let mut stream = response.bytes_stream();
@@ -581,23 +770,129 @@ async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Re
     Ok(())
 }
 
-async fn cmd_ps(client: &Client, base: &str) -> Result<(), String> {
+/// Formats an `AuditEvent.occurred_at` (`time::OffsetDateTime`'s default,
+/// non-human-readable serde array: `[year, ordinal_day, hour, min, sec, ...]`)
+/// into a compact, readable timestamp without pulling in a formatting crate
+/// on the CLI side.
+fn format_occurred_at(value: &Value) -> String {
+    let parts = value.as_array().map_or(&[][..], Vec::as_slice);
+    let get = |i: usize| parts.get(i).and_then(Value::as_i64).unwrap_or(0);
+    format!(
+        "{:04}-day{:03} {:02}:{:02}:{:02}",
+        get(0),
+        get(1),
+        get(2),
+        get(3),
+        get(4)
+    )
+}
+
+async fn cmd_audit(
+    client: &Client,
+    base: &str,
+    branch: Option<&str>,
+    limit: Option<u64>,
+) -> Result<(), CliError> {
+    let url = if let Some(branch) = branch {
+        let (env_id, _) = resolve_environment(client, base, branch).await?;
+        format!("{base}/api/v1/environments/{env_id}/audit")
+    } else {
+        let limit = limit.unwrap_or(50);
+        format!("{base}/api/v1/audit?limit={limit}")
+    };
+    let value = get_json(client, url).await?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    let events = value
+        .as_array()
+        .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
+    if events.is_empty() {
+        bg("No audit events yet.");
+        return Ok(());
+    }
+    println!("{:<24} {:<14} DETAIL", "WHEN", "EVENT");
+    for event in events {
+        let when = format_occurred_at(&event["occurred_at"]);
+        let kind = event["kind"].as_str().unwrap_or("?");
+        let detail = event["detail"].as_str().unwrap_or("");
+        println!("{when:<24} {kind:<14} {detail}");
+    }
+    Ok(())
+}
+
+async fn cmd_backup(client: &Client, base: &str, file: &str) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/backup");
     let response = client
-        .get(format!("{base}/api/v1/projects"))
+        .get(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(response_error(&body, status, "backup failed"));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    std::fs::write(file, &bytes).map_err(|e| format!("cannot write `{file}`: {e}"))?;
+    if !emit_json(&json!({ "status": "backed-up", "file": file, "bytes": bytes.len() })) {
+        ok(format!(
+            "Backup written to `{file}` ({} bytes)",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
+async fn cmd_restore(client: &Client, base: &str, file: &str) -> Result<(), CliError> {
+    let bytes = std::fs::read(file).map_err(|e| format!("cannot read `{file}`: {e}"))?;
+    let url = format!("{base}/api/v1/backup/restore");
+    let response = client
+        .post(&url)
+        .body(bytes)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("listing projects failed".to_owned());
+        return Err(response_error(&body, status, "restore failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&value) {
+        let message = value["message"].as_str().unwrap_or("restore staged");
+        ok(message);
+    }
+    Ok(())
+}
+
+async fn cmd_ps(client: &Client, base: &str) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/projects");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "listing projects failed"));
     }
     let projects: Vec<Value> =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if emit_json(&Value::Array(projects.clone())) {
+        return Ok(());
+    }
     if projects.is_empty() {
         bg("No projects registered yet.");
         return Ok(());
@@ -621,12 +916,14 @@ fn scope_context(
     scope: &str,
     project: Option<u64>,
     branch: Option<&str>,
-) -> Result<(Option<u64>, Option<String>), String> {
+) -> Result<(Option<u64>, Option<String>), CliError> {
     match scope {
         "global" => Ok((None, None)),
         "project" => {
             if branch.is_some() {
-                return Err("`--branch` is only allowed with `--scope branch`".to_owned());
+                return Err("`--branch` is only allowed with `--scope branch`"
+                    .to_owned()
+                    .into());
             }
             Ok((project, None))
         }
@@ -636,9 +933,9 @@ fn scope_context(
                 .ok_or_else(|| "`--branch` is required for `--scope branch`".to_owned())?;
             Ok((project, Some(branch)))
         }
-        other => Err(format!(
-            "invalid scope `{other}`; expected `global`, `project` or `branch`"
-        )),
+        other => {
+            Err(format!("invalid scope `{other}`; expected `global`, `project` or `branch`").into())
+        }
     }
 }
 
@@ -646,23 +943,23 @@ async fn ensure_project_id(
     client: &Client,
     base: &str,
     project: Option<u64>,
-) -> Result<u64, String> {
+) -> Result<u64, CliError> {
     if let Some(id) = project {
         Ok(id)
     } else {
         let project = register_project(client, base).await?;
         project["id"]
             .as_u64()
-            .ok_or_else(|| "daemon response missing project id".to_owned())
+            .ok_or_else(|| "daemon response missing project id".to_owned().into())
     }
 }
 
-fn parse_assignment(assignment: &str) -> Result<(&str, &str), String> {
+fn parse_assignment(assignment: &str) -> Result<(&str, &str), CliError> {
     let (name, value) = assignment
         .split_once('=')
         .ok_or_else(|| format!("expected `KEY=VALUE`, got `{assignment}`"))?;
     if name.trim().is_empty() {
-        return Err("secret name cannot be empty".to_owned());
+        return Err("secret name cannot be empty".to_owned().into());
     }
     Ok((name, value))
 }
@@ -674,7 +971,7 @@ async fn cmd_env_set(
     scope: &str,
     project: Option<u64>,
     branch: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let (name, value) = parse_assignment(assignment)?;
     let (project_id, branch) = scope_context(scope, project, branch)?;
 
@@ -697,23 +994,24 @@ async fn cmd_env_set(
     };
 
     let response = client
-        .post(url)
+        .post(&url)
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("setting secret failed".to_owned());
+        return Err(response_error(&body, status, "setting secret failed"));
     }
-    match branch {
-        Some(b) => ok(format!("Secret `{name}` set for branch `{b}`")),
-        None => ok(format!("Secret `{name}` set ({scope})")),
+    if !emit_json(&json!({ "status": "set", "name": name, "scope": scope })) {
+        match branch {
+            Some(b) => ok(format!("Secret `{name}` set for branch `{b}`")),
+            None => ok(format!("Secret `{name}` set ({scope})")),
+        }
     }
     Ok(())
 }
@@ -724,7 +1022,7 @@ async fn cmd_env_list(
     scope: &str,
     project: Option<u64>,
     branch: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let (project_id, branch) = scope_context(scope, project, branch)?;
     let project_id = ensure_project_id(client, base, project_id).await?;
 
@@ -738,22 +1036,24 @@ async fn cmd_env_list(
         format!("{base}/api/v1/projects/{project_id}/secrets{branch_qs}")
     };
     let response = client
-        .get(url)
+        .get(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("listing secrets failed".to_owned());
+        return Err(response_error(&body, status, "listing secrets failed"));
     }
     let value: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     let secrets = value["secrets"].as_array().cloned().unwrap_or_default();
+    if emit_json(&Value::Array(secrets.clone())) {
+        return Ok(());
+    }
     if secrets.is_empty() {
         bg("No secrets in this scope.");
         return Ok(());
@@ -776,7 +1076,7 @@ async fn cmd_env_delete(
     scope: &str,
     project: Option<u64>,
     branch: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let (project_id, branch) = scope_context(scope, project, branch)?;
 
     let url = if scope == "global" {
@@ -791,20 +1091,21 @@ async fn cmd_env_delete(
     };
 
     let response = client
-        .delete(url)
+        .delete(&url)
         .send()
         .await
-        .map_err(|e| format!("cannot reach daemon at {base}: {e}"))?;
+        .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
     let body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        report_error(&body, status);
-        return Err("deleting secret failed".to_owned());
+        return Err(response_error(&body, status, "deleting secret failed"));
     }
-    ok(format!("Secret `{name}` deleted"));
+    if !emit_json(&json!({ "status": "deleted", "name": name })) {
+        ok(format!("Secret `{name}` deleted"));
+    }
     Ok(())
 }
 
@@ -818,6 +1119,68 @@ mod tests {
         match cli.command {
             Command::Up { branch } => assert_eq!(branch, "feature-login"),
             other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_without_branch() {
+        let cli = Cli::try_parse_from(["oxid", "audit"]).unwrap();
+        match cli.command {
+            Command::Audit { branch, limit } => {
+                assert_eq!(branch, None);
+                assert_eq!(limit, None);
+            }
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_with_branch_and_limit() {
+        let cli = Cli::try_parse_from(["oxid", "audit", "main", "--limit", "10"]).unwrap();
+        match cli.command {
+            Command::Audit { branch, limit } => {
+                assert_eq!(branch.as_deref(), Some("main"));
+                assert_eq!(limit, Some(10));
+            }
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backup_and_restore() {
+        let cli = Cli::try_parse_from(["oxid", "backup", "out.tar"]).unwrap();
+        match cli.command {
+            Command::Backup { file } => assert_eq!(file, "out.tar"),
+            other => panic!("expected Backup, got {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["oxid", "restore", "out.tar"]).unwrap();
+        match cli.command {
+            Command::Restore { file } => assert_eq!(file, "out.tar"),
+            other => panic!("expected Restore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rollback_without_to() {
+        let cli = Cli::try_parse_from(["oxid", "rollback", "main"]).unwrap();
+        match cli.command {
+            Command::Rollback { branch, to } => {
+                assert_eq!(branch, "main");
+                assert_eq!(to, None);
+            }
+            other => panic!("expected Rollback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_rollback_with_to() {
+        let cli = Cli::try_parse_from(["oxid", "rollback", "main", "--to", "abc123"]).unwrap();
+        match cli.command {
+            Command::Rollback { branch, to } => {
+                assert_eq!(branch, "main");
+                assert_eq!(to.as_deref(), Some("abc123"));
+            }
+            other => panic!("expected Rollback, got {other:?}"),
         }
     }
 
@@ -909,6 +1272,14 @@ mod tests {
     fn parses_global_token_flag() {
         let cli = Cli::try_parse_from(["oxid", "--token", "s3cr3t", "ps"]).unwrap();
         assert_eq!(cli.token.as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn parses_global_json_flag() {
+        let cli = Cli::try_parse_from(["oxid", "--json", "ps"]).unwrap();
+        assert!(cli.json);
+        let cli = Cli::try_parse_from(["oxid", "ps"]).unwrap();
+        assert!(!cli.json);
     }
 
     #[test]
@@ -1012,7 +1383,26 @@ mod tests {
 
     #[test]
     fn parses_assignments() {
-        assert_eq!(parse_assignment("A=1").unwrap(), ("A", "1"));
+        assert_eq!(parse_assignment("A=1").unwrap().0, "A");
+        assert_eq!(parse_assignment("A=1").unwrap().1, "1");
         assert!(parse_assignment("missing-equals").is_err());
+    }
+
+    #[test]
+    fn classify_status_distinguishes_error_kinds() {
+        assert_eq!(classify_status(StatusCode::NOT_FOUND), EXIT_NOT_FOUND);
+        assert_eq!(classify_status(StatusCode::UNAUTHORIZED), EXIT_UNAUTHORIZED);
+        assert_eq!(classify_status(StatusCode::FORBIDDEN), EXIT_UNAUTHORIZED);
+        assert_eq!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            EXIT_GENERIC
+        );
+    }
+
+    #[test]
+    fn string_errors_default_to_the_generic_exit_code() {
+        let err: CliError = "boom".to_owned().into();
+        assert_eq!(err.code, EXIT_GENERIC);
+        assert_eq!(err.message, "boom");
     }
 }
