@@ -1611,6 +1611,10 @@ port = 8080
         assert_eq!(node_stats["projects"], 1);
         assert_eq!(node_stats["environments_running"], 1);
         assert!(node_stats["host_total_memory_bytes"].as_u64().unwrap() > 0);
+        // No `with_traefik(...)` call in `test_app()` — the dashboard relies
+        // on this to know an environment's `url` isn't a reachable link
+        // without Traefik fronting it (SPEC.md's direct-port-publish mode).
+        assert_eq!(node_stats["traefik_enabled"], false);
     }
 
     #[tokio::test]

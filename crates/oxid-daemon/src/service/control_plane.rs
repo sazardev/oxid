@@ -89,6 +89,13 @@ pub struct NodeStats {
     pub host_total_memory_bytes: u64,
     /// Host CPU count Docker reports.
     pub host_cpu_count: u32,
+    /// Whether `with_traefik` was configured (`OXID_DOCKER_NETWORK` set) —
+    /// when `false`, an environment's `url` (a `branch.project-base-domain`
+    /// hostname, meaningful only to a Traefik `Host()` rule) isn't reachable
+    /// as a URL at all; the real address is the project's own
+    /// `[routing].port` published directly on whatever host is running the
+    /// daemon. The dashboard uses this to decide which one to link to.
+    pub traefik_enabled: bool,
 }
 
 /// Result of a capacity-aware deploy attempt (see
@@ -1311,6 +1318,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let host = self.oci.host_capacity().await?;
         stats.host_total_memory_bytes = host.total_memory_bytes;
         stats.host_cpu_count = host.cpu_count;
+        stats.traefik_enabled = self.docker_network.is_some();
         Ok(stats)
     }
 

@@ -97,6 +97,11 @@
     <main class="page-container">
       <!-- ================= ENVIRONMENTS (home) ================= -->
       <section class="page" x-show="route.name === 'environments'" x-cloak>
+        <p class="muted" x-show="!stats.traefik_enabled">
+          [~] No Traefik configured (<code>OXID_DOCKER_NETWORK</code> unset) — URLs below link to
+          this host's own published port for each project, not a subdomain. Only one branch per
+          project can be live at a time in this mode.
+        </p>
         <div class="page-head">
           <h1>Environments</h1>
           <div class="filters">
@@ -154,7 +159,7 @@
                   </span>
                 </td>
                 <td>
-                  <a class="mono link" :href="'http://' + env.url" target="_blank" rel="noopener" x-text="env.url"></a>
+                  <a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a>
                 </td>
                 <td class="mono muted" x-text="formatTime(env.created_at)"></td>
                 <td class="mono muted" x-text="formatTime(env.last_accessed_at)"></td>
@@ -211,7 +216,11 @@
 
             <dl class="data-grid mono">
               <dt>id</dt><dd x-text="currentEnvironment().id"></dd>
-              <dt>url</dt><dd><a class="link" :href="'http://' + currentEnvironment().url" target="_blank" rel="noopener" x-text="currentEnvironment().url"></a></dd>
+              <dt>url</dt><dd><a class="link" :href="envLink(currentEnvironment())" target="_blank" rel="noopener" x-text="envLinkLabel(currentEnvironment())"></a></dd>
+              <dt x-show="!stats.traefik_enabled" class="muted">note</dt>
+              <dd x-show="!stats.traefik_enabled" class="muted">
+                no Traefik configured — this is the host's own published port, not <span x-text="currentEnvironment().url"></span>
+              </dd>
               <dt>commit sha</dt><dd x-text="currentEnvironment().branch.commit_sha"></dd>
               <dt>created</dt><dd x-text="formatTime(currentEnvironment().created_at)"></dd>
               <dt>last seen</dt><dd x-text="formatTime(currentEnvironment().last_accessed_at)"></dd>
@@ -341,7 +350,7 @@
                     <td>
                       <span class="badge" :class="'badge-' + env.state" x-text="env.state"></span>
                     </td>
-                    <td><a class="mono link" :href="'http://' + env.url" target="_blank" rel="noopener" x-text="env.url"></a></td>
+                    <td><a class="mono link" :href="envLink(env, currentProject().id)" target="_blank" rel="noopener" x-text="envLinkLabel(env, currentProject().id)"></a></td>
                     <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
                     <td class="actions">
                       <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)">open</button>

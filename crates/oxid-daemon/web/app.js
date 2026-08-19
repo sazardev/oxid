@@ -359,6 +359,31 @@ function dashboard() {
       return this.projects.find((p) => p.id === id)?.name ?? `#${id}`;
     },
 
+    // Without Traefik (`OXID_DOCKER_NETWORK` unset), `env.url` is a
+    // `branch.base-domain` hostname that only means something as a Traefik
+    // `Host()` rule — it isn't reachable as a URL at all without DNS/hosts
+    // pointing it somewhere. In that mode the real, directly-reachable
+    // address is the project's own `[routing].port` published on whatever
+    // host is running the daemon (the same host this dashboard is being
+    // viewed from).
+    envLink(env, projectId) {
+      if (this.stats.traefik_enabled) {
+        return `http://${env.url}`;
+      }
+      const port = this.projects.find((p) => p.id === (projectId ?? env.projectId))?.config
+        ?.port;
+      return port ? `${location.protocol}//${location.hostname}:${port}/` : `http://${env.url}`;
+    },
+
+    envLinkLabel(env, projectId) {
+      if (this.stats.traefik_enabled) {
+        return env.url;
+      }
+      const port = this.projects.find((p) => p.id === (projectId ?? env.projectId))?.config
+        ?.port;
+      return port ? `${location.hostname}:${port}` : env.url;
+    },
+
     hostMemoryLabel() {
       if (!this.stats.host_total_memory_bytes) {
         return "—";
