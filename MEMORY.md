@@ -34,7 +34,20 @@ just "where did we leave off and why."
   for the next restart, never a live hot-swap); direct TLS on the daemon
   (`OXID_TLS_CERT`/`OXID_TLS_KEY`, `axum-server`+rustls with the `ring`
   backend specifically, to avoid pulling in `aws-lc-sys`'s cmake build).
-- Full test/clippy/fmt pass green (109 daemon/core tests + 28 CLI tests).
+- **Lightweight multi-user + ops follow-up pass (this round), all
+  live-verified:** database-backed named API tokens (`oxid token
+  create/list/revoke`, master-token-only) — the bearer-auth middleware
+  accepts the master `OXID_API_TOKEN` or any non-revoked named token,
+  attributing `deploy`/`rollback`/`destroy` audit events to the operator's
+  name instead of leaving everything anonymous; rate limiting on the
+  protected routes only (`OXID_RATE_LIMIT_PER_SECOND`/`_BURST`, a single
+  global bucket via `tower_governor` — deliberately not per-client, and
+  never applied to `/health`/`/wake`/`/heartbeat`/webhooks); `oxid doctor`
+  (reachability/latency/version/auth preflight, 3 distinct exit codes);
+  hot master-key rotation (`oxid rotate-key` — `ArcSwap`-wrapped `Cipher`,
+  transactional re-encryption of every secret, zero downtime, verified
+  surviving a real daemon restart under the new key).
+- Full test/clippy/fmt pass green (115 daemon/core tests + 31 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
@@ -42,7 +55,9 @@ No TUI, no web dashboard, no Tauri desktop app. Single-host only, no HA.
 API is open by default if `OXID_API_TOKEN` is unset (warned, not enforced).
 Traefik auto-wake-on-request without any manual config still needs the
 operator to wire the `errors` middleware themselves (documented, not
-automated by Oxid's code — see `control_plane.rs::traefik_labels`).
+automated by Oxid's code — see `control_plane.rs::traefik_labels`). Named
+API tokens are flat (no roles/permissions beyond "master" vs "operator") —
+real RBAC (scoping a token to specific projects) doesn't exist yet.
 
 ## Operational lesson learned (read before running heavy builds here)
 
