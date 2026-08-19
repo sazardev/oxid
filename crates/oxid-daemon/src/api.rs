@@ -26,7 +26,7 @@ use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::GlobalKeyExtractor;
 
-use crate::{ControlPlane, CpError};
+use crate::{ControlPlane, CpError, DeployOutcome};
 
 /// Shared state injected into every handler.
 #[derive(Clone)]
@@ -111,6 +111,7 @@ pub fn router<
         .route("/api/v1/tokens/{id}", delete(revoke_token))
         .route("/api/v1/rotate-key", post(rotate_key))
         .route("/api/v1/audit", get(recent_audit))
+        .route("/api/v1/queue", get(list_queue))
         .route("/api/v1/backup", get(backup))
         .route("/api/v1/backup/restore", post(restore))
         .route(
@@ -352,6 +353,9 @@ impl From<CpError> for ApiError {
             CpError::Git(_) | CpError::Oci(_) | CpError::Pool(PoolError::Failure(_)) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
             }
+            CpError::InsufficientCapacity(_) => {
+                Self::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+            }
         }
     }
 }
@@ -431,13 +435,20 @@ async fn deploy<
     Path(id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<DeployBody>,
-) -> ApiResult<(StatusCode, Json<Environment>)> {
+) -> ApiResult<Response> {
     let branch = parse_branch(&body.branch)?;
-    let env = state
+    match state
         .cp
-        .deploy_with_operator(ProjectId(id), branch, operator_name(authed.as_ref()))
-        .await?;
-    Ok((StatusCode::CREATED, Json(env)))
+        .deploy_or_queue(ProjectId(id), branch, operator_name(authed.as_ref()))
+        .await?
+    {
+        DeployOutcome::Deployed(env) => Ok((StatusCode::CREATED, Json(env)).into_response()),
+        DeployOutcome::Queued { position } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "queued", "position": position })),
+        )
+            .into_response()),
+    }
 }
 
 /// Body for `POST /api/v1/tokens`.
@@ -558,6 +569,17 @@ async fn recent_audit<
 ) -> ApiResult<Json<Vec<oxid_core::AuditEvent>>> {
     let limit = query.limit.unwrap_or(DEFAULT_AUDIT_LIMIT);
     Ok(Json(state.cp.recent_audit_events(limit).await?))
+}
+
+/// Lists deploys currently waiting for host capacity (see
+/// [`ControlPlane::deploy_or_queue`]), oldest first.
+async fn list_queue<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Json<Vec<crate::adapter::store::QueuedDeploy>>> {
+    Ok(Json(state.cp.list_deploy_queue().await?))
 }
 
 async fn environment_audit<
@@ -1109,11 +1131,16 @@ async fn github_webhook<
         };
     }
 
-    let env = state.cp.deploy(project.id, branch).await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(json!({ "status": "deployed", "environment_id": env.id.0 })),
-    ))
+    match state.cp.deploy_or_queue(project.id, branch, None).await? {
+        DeployOutcome::Deployed(env) => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "deployed", "environment_id": env.id.0 })),
+        )),
+        DeployOutcome::Queued { position } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({ "status": "queued", "position": position })),
+        )),
+    }
 }
 
 /// Verifies `X-Hub-Signature-256` (`sha256=<hex hmac>`) against the raw body.
@@ -1259,6 +1286,18 @@ mod tests {
                 .push(format!("exec:{name}:{command}"));
             Ok(())
         }
+        async fn container_status(
+            &self,
+            _name: &str,
+        ) -> Result<oxid_core::ContainerStatus, OciError> {
+            Ok(oxid_core::ContainerStatus::Running)
+        }
+        async fn host_capacity(&self) -> Result<oxid_core::HostCapacity, OciError> {
+            Ok(oxid_core::HostCapacity {
+                total_memory_bytes: 8 * 1_073_741_824,
+                cpu_count: 4,
+            })
+        }
     }
 
     /// A data dir with a dummy `secret.key`, for backup-endpoint tests.
@@ -1300,6 +1339,34 @@ mod tests {
             allow_restore: true,
             rate_limit: None,
         })
+    }
+
+    /// A router whose `ControlPlane` has admission control enabled with an
+    /// 8GB host (`FakeOci::host_capacity`'s fixed value) minus
+    /// `reserved_mb`, and `default_mem_mb` as the daemon-default memory
+    /// request for any project that doesn't set its own — for exercising
+    /// `/api/v1/projects/{id}/deploy`'s queued-response path end to end.
+    async fn test_app_with_admission_control(
+        reserved_mb: u64,
+        default_mem_mb: u64,
+    ) -> (Router, FakeOci) {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let oci = FakeOci::default();
+        let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+            .with_resource_defaults(Some(default_mem_mb), None)
+            .with_admission_control(Some(reserved_mb));
+        (
+            router(ApiState {
+                cp,
+                webhook_secret: Some("test-secret".to_owned()),
+                api_token: None,
+                data_dir: test_data_dir(),
+                allow_restore: true,
+                rate_limit: None,
+            }),
+            oci,
+        )
     }
 
     fn repo_dir_with_config() -> tempfile::TempDir {
@@ -1903,6 +1970,49 @@ port = 8080
             recent.iter().any(|e| e["environment_id"] == env.id.0),
             "{recent:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deploy_queues_past_capacity_and_the_queue_endpoint_reports_it() {
+        // 8GB host (FakeOci's fixed `host_capacity`) minus 8000MB reserved
+        // leaves 192MB usable; two 100MB deploys can't both fit.
+        let (app, _) = test_app_with_admission_control(8000, 100).await;
+        let repo = repo_dir_with_config();
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        let (status, _) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "main" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, body) = json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": "other" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let queued: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(queued["status"], "queued");
+        assert_eq!(queued["position"], 1);
+
+        let (status, body) = json_request(&app, "GET", "/api/v1/queue", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["branch"], "other");
     }
 
     #[tokio::test]

@@ -127,6 +127,9 @@ enum Command {
     /// Rotates the master encryption key: re-encrypts every secret under a
     /// fresh key with zero downtime (requires the master `OXID_API_TOKEN`).
     RotateKey,
+    /// List deploys waiting for host capacity (see `oxid up`'s "queued"
+    /// response), oldest/highest-priority first.
+    Queue,
 }
 
 #[derive(Debug, Subcommand)]
@@ -427,6 +430,7 @@ async fn main() {
         },
         Command::Doctor => cmd_doctor(&client, &base).await,
         Command::RotateKey => cmd_rotate_key(&client, &base).await,
+        Command::Queue => cmd_queue(&client, &base).await,
     };
 
     if let Err(err) = result {
@@ -542,6 +546,15 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliErro
     }
     let env: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if env["status"].as_str() == Some("queued") {
+        if !emit_json(&env) {
+            let position = env["position"].as_u64().unwrap_or(0);
+            ok(format!(
+                "Queued, waiting for host capacity (position {position}) — run `oxid queue` to check, or `oxid status` once it deploys"
+            ));
+        }
+        return Ok(());
+    }
     if !emit_json(&env) {
         let url = env["url"].as_str().unwrap_or("?");
         ok(format!("Environment live at: {url}"));
@@ -852,6 +865,28 @@ async fn cmd_audit(
         let kind = event["kind"].as_str().unwrap_or("?");
         let detail = event["detail"].as_str().unwrap_or("");
         println!("{when:<24} {kind:<14} {detail}");
+    }
+    Ok(())
+}
+
+async fn cmd_queue(client: &Client, base: &str) -> Result<(), CliError> {
+    let value = get_json(client, format!("{base}/api/v1/queue")).await?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
+    if entries.is_empty() {
+        bg("Queue is empty — every deploy has capacity.");
+        return Ok(());
+    }
+    println!("{:<5} {:<24} {:<20} OPERATOR", "POS", "REQUESTED", "BRANCH");
+    for (i, entry) in entries.iter().enumerate() {
+        let when = format_occurred_at(&entry["requested_at"]);
+        let branch = entry["branch"].as_str().unwrap_or("?");
+        let operator = entry["operator"].as_str().unwrap_or("-");
+        println!("{:<5} {when:<24} {branch:<20} {operator}", i + 1);
     }
     Ok(())
 }
@@ -1317,6 +1352,12 @@ mod tests {
             Command::Up { branch } => assert_eq!(branch, "feature-login"),
             other => panic!("expected Up, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_queue_command() {
+        let cli = Cli::try_parse_from(["oxid", "queue"]).unwrap();
+        assert!(matches!(cli.command, Command::Queue), "{:?}", cli.command);
     }
 
     #[test]

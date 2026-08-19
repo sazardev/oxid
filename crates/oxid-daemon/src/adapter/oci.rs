@@ -13,10 +13,14 @@ use bollard::container::{
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::{BuildImageOptions, RemoveImageOptions};
-use bollard::models::{EndpointSettings, HostConfig, PortBinding};
+use bollard::models::{
+    EndpointSettings, HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
-use oxid_core::{BuildSpec, ContainerPort, ContainerSpec, LogStream, OciError};
+use oxid_core::{
+    BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream, OciError,
+};
 
 /// Backed by a Docker connection (default socket).
 #[derive(Debug, Clone)]
@@ -120,6 +124,18 @@ impl ContainerPort for DockerClient {
                 nano_cpus: spec
                     .cpu_limit_millicores
                     .map(|millicores| i64::from(millicores) * 1_000_000),
+                // `unless-stopped`: Docker brings the container back on its
+                // own after a crash, an OOM-kill, or the host rebooting —
+                // without this, a restarted host left every preview
+                // environment `Exited` until someone noticed and ran
+                // `oxid wake`/redeployed by hand. Doesn't fight an
+                // intentional `oxid down`/`pause`, which stop it via the
+                // Docker API directly (the "unless the user has manually
+                // stopped it" carve-out).
+                restart_policy: Some(RestartPolicy {
+                    name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
                 ..Default::default()
             }),
             networking_config,
@@ -274,6 +290,33 @@ impl ContainerPort for DockerClient {
                 captured.trim_end()
             ))),
         }
+    }
+
+    async fn container_status(&self, name: &str) -> Result<ContainerStatus, OciError> {
+        match self.docker.inspect_container(name, None).await {
+            Ok(info) => {
+                let state = info.state.unwrap_or_default();
+                if state.paused.unwrap_or(false) {
+                    Ok(ContainerStatus::Paused)
+                } else if state.running.unwrap_or(false) {
+                    Ok(ContainerStatus::Running)
+                } else {
+                    Ok(ContainerStatus::Stopped)
+                }
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(ContainerStatus::Missing),
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
+    async fn host_capacity(&self) -> Result<HostCapacity, OciError> {
+        let info = self.docker.info().await.map_err(map_err)?;
+        Ok(HostCapacity {
+            total_memory_bytes: info.mem_total.unwrap_or(0).max(0).cast_unsigned(),
+            cpu_count: u32::try_from(info.ncpu.unwrap_or(0).max(0)).unwrap_or(0),
+        })
     }
 }
 

@@ -256,6 +256,36 @@ pub enum OciError {
 /// written rather than gathered into a single bounded snapshot.
 pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, OciError>> + Send>>;
 
+/// A container's actual state, as Docker reports it — independent of
+/// whatever `EnvironmentState` the database believes. Backs startup
+/// reconciliation: the daemon can be down for a while (crash, restart, a
+/// host reboot) during which a container's real state can drift from the
+/// last thing the database recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerStatus {
+    /// Exists and is actively running (not paused).
+    Running,
+    /// Exists, running, but frozen (`docker pause`).
+    Paused,
+    /// Exists but is not running (`docker stop`, a crash, or an
+    /// exhausted restart policy).
+    Stopped,
+    /// No container by that name exists at all.
+    Missing,
+}
+
+/// Total host resources Docker itself reports (`docker info`) — the
+/// admission-control source of truth for whether a new deploy actually
+/// fits, since Docker already knows the real host capacity whether this
+/// daemon runs on bare metal or inside its own container on the same host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HostCapacity {
+    /// Total host memory, in bytes.
+    pub total_memory_bytes: u64,
+    /// Number of host CPUs.
+    pub cpu_count: u32,
+}
+
 /// Inputs for a container image build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildSpec {
@@ -367,4 +397,19 @@ pub trait ContainerPort {
     /// [`OciError::NotFound`] if the container does not exist,
     /// [`OciError::Failure`] if the command exits non-zero.
     async fn exec(&self, name: &str, command: &str) -> Result<(), OciError>;
+    /// Reports a container's actual current state — used at daemon startup
+    /// to reconcile the database against reality after a restart, rather
+    /// than trusting a potentially stale `EnvironmentState`.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure (distinct
+    /// from the container simply not existing, which is
+    /// [`ContainerStatus::Missing`], not an error).
+    async fn container_status(&self, name: &str) -> Result<ContainerStatus, OciError>;
+    /// Total host memory/CPU Docker reports — the source of truth for
+    /// admission control before a new deploy.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure.
+    async fn host_capacity(&self) -> Result<HostCapacity, OciError>;
 }

@@ -399,6 +399,94 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    /// Queues a deploy that didn't currently fit in host capacity.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn enqueue_deploy(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+        operator: Option<&str>,
+    ) -> Result<u64, RepositoryError> {
+        let row = sqlx::query(
+            "INSERT INTO deploy_queue (project_id, branch, operator, requested_at) \
+             VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch.as_str())
+        .bind(operator)
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let id: i64 = row.try_get("id").map_err(storage)?;
+        u64::try_from(id).map_err(|_| storage("queue id overflowed u64"))
+    }
+
+    /// Lists queued deploys oldest-first — the order they're retried in.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn list_deploy_queue(&self) -> Result<Vec<QueuedDeploy>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, branch, operator, requested_at \
+             FROM deploy_queue ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                let id: i64 = r.try_get("id").map_err(storage)?;
+                let project_id: i64 = r.try_get("project_id").map_err(storage)?;
+                let branch: String = r.try_get("branch").map_err(storage)?;
+                let operator: Option<String> = r.try_get("operator").map_err(storage)?;
+                let requested_at = ts_from_row(r, "requested_at")?;
+                Ok(QueuedDeploy {
+                    id: u64::try_from(id).map_err(|_| storage("queue id overflowed u64"))?,
+                    project_id: ProjectId(
+                        u64::try_from(project_id)
+                            .map_err(|_| storage("project id overflowed u64"))?,
+                    ),
+                    branch,
+                    operator,
+                    requested_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Removes a queued deploy — called once it's either been dequeued for
+    /// a retry attempt or its project was deleted out from under it.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn remove_from_deploy_queue(&self, id: u64) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM deploy_queue WHERE id = ?")
+            .bind(id_as_i64(id))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+}
+
+/// A deploy request queued because it didn't fit host capacity at request
+/// time.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueuedDeploy {
+    /// Queue entry id (used to remove it once retried).
+    pub id: u64,
+    /// Project to deploy.
+    pub project_id: ProjectId,
+    /// Branch to deploy.
+    pub branch: String,
+    /// Operator who requested it, if authenticated with a named token.
+    pub operator: Option<String>,
+    /// When it was queued.
+    pub requested_at: OffsetDateTime,
 }
 
 /// Non-secret view of an `api_tokens` row (no hash, no raw token).

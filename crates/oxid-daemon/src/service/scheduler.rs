@@ -35,5 +35,14 @@ where
             }
             Err(err) => eprintln!("[gc] sweep failed: {err}"),
         }
+
+        match cp.retry_queued_deploys().await {
+            Ok(failures) => {
+                for (id, err) in &failures {
+                    eprintln!("[queue] queued deploy `{id}` failed to redeploy: {err}");
+                }
+            }
+            Err(err) => eprintln!("[queue] retry pass failed: {err}"),
+        }
     }
 }

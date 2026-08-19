@@ -18,8 +18,9 @@ pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
 pub use ports::{
-    AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, EnvironmentStore, GitError,
-    GitPort, LogStream, OciError, ProjectStore, RepositoryError, SecretStore,
+    AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, ContainerStatus,
+    EnvironmentStore, GitError, GitPort, HostCapacity, LogStream, OciError, ProjectStore,
+    RepositoryError, SecretStore,
 };
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};

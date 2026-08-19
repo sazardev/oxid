@@ -13,10 +13,10 @@ use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
     AuditEvent, AuditStore, Branch, BranchName, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
-    Dependency, DomainError, EnvVarScope, Environment, EnvironmentId, EnvironmentState,
-    EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime, PoolError, PoolKind,
-    Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore, SecretValue,
-    StateTransition,
+    ContainerStatus, Dependency, DomainError, EnvVarScope, Environment, EnvironmentId,
+    EnvironmentState, EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime,
+    PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore,
+    SecretValue, StateTransition,
 };
 
 use crate::adapter::config::{self, ConfigError};
@@ -47,6 +47,11 @@ pub enum CpError {
     /// A requested record does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+    /// A deploy's own resource request exceeds the host's total usable
+    /// capacity — no amount of waiting in the queue would ever make this
+    /// one fit, so it's rejected immediately instead of queued forever.
+    #[error("insufficient host capacity: {0}")]
+    InsufficientCapacity(String),
 }
 
 /// Outcome of one [`ControlPlane::sweep`] pass across all environments.
@@ -60,6 +65,33 @@ pub struct GcSummary {
     pub destroyed: u64,
     /// Per-environment failures; the sweep continues past these.
     pub errors: Vec<(EnvironmentId, String)>,
+}
+
+/// Result of a capacity-aware deploy attempt (see
+/// [`ControlPlane::deploy_or_queue`]).
+#[derive(Debug, Clone)]
+pub enum DeployOutcome {
+    /// The deploy ran immediately and is now live.
+    Deployed(Environment),
+    /// The host doesn't currently have room; the request was persisted to
+    /// `deploy_queue` (see [`SqliteStore::enqueue_deploy`]) at this 1-based
+    /// position and will be retried automatically as capacity frees up.
+    Queued {
+        /// 1-based position in the queue at the moment of enqueueing.
+        position: u64,
+    },
+}
+
+/// Whether a new deploy should proceed now or wait for capacity — see
+/// [`ControlPlane::check_admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Enough host memory is free (after `reserved_memory_mb` and every
+    /// other live environment's own reservation) for this request too.
+    Fits,
+    /// Not enough room right now, but the request could fit once other
+    /// environments free memory — queue it rather than fail or overcommit.
+    Queue,
 }
 
 /// Orchestrates registration, deployment and lifecycle of environments.
@@ -124,6 +156,12 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// CPU limit (millicores) applied the same way as
     /// `default_memory_limit_mb` (`OXID_DEFAULT_CPU_LIMIT_MILLICORES`).
     default_cpu_limit_millicores: Option<u32>,
+    /// Memory (megabytes) reserved for the host OS + this daemon,
+    /// subtracted from what `docker info` reports before deciding whether
+    /// a new deploy fits (`OXID_RESERVED_MEMORY_MB`). `None` disables
+    /// admission control entirely — every deploy proceeds immediately
+    /// regardless of host capacity, the behavior before this existed.
+    reserved_memory_mb: Option<u64>,
 }
 
 const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
@@ -149,6 +187,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             redis_pool_size: DEFAULT_REDIS_POOL_SIZE,
             default_memory_limit_mb: None,
             default_cpu_limit_millicores: None,
+            reserved_memory_mb: None,
         }
     }
 
@@ -178,6 +217,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ) -> Self {
         self.default_memory_limit_mb = default_memory_limit_mb;
         self.default_cpu_limit_millicores = default_cpu_limit_millicores;
+        self
+    }
+
+    /// Enables admission control: a deploy whose resolved memory request,
+    /// added to every other currently `Running`/`Paused` environment's,
+    /// would exceed `docker info`'s reported host memory (minus
+    /// `reserved_memory_mb`) is queued instead of deployed immediately —
+    /// see [`Self::deploy_or_queue`]. `None` (the default) leaves every
+    /// deploy going through immediately regardless of host capacity.
+    #[must_use]
+    pub fn with_admission_control(mut self, reserved_memory_mb: Option<u64>) -> Self {
+        self.reserved_memory_mb = reserved_memory_mb;
         self
     }
 
@@ -296,7 +347,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     }
 
     /// Deploys `branch` for a project: clone, build, run, then transition to
-    /// `Running`.
+    /// `Running`. Always deploys immediately, ignoring admission control —
+    /// see [`Self::deploy_or_queue`] for the capacity-aware entry point
+    /// `oxid up`/the API actually use.
     ///
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
@@ -305,7 +358,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         project_id: ProjectId,
         branch: BranchName,
     ) -> Result<Environment, CpError> {
-        self.deploy_at(project_id, branch, None, None).await
+        match self
+            .deploy_at(project_id, branch, None, None, false)
+            .await?
+        {
+            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Queued { .. } => {
+                unreachable!("admission control is off, so this never queues")
+            }
+        }
     }
 
     /// Identical to [`Self::deploy`], but attributes the resulting audit
@@ -320,12 +381,104 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         operator: Option<String>,
     ) -> Result<Environment, CpError> {
-        self.deploy_at(project_id, branch, None, operator).await
+        match self
+            .deploy_at(project_id, branch, None, operator, false)
+            .await?
+        {
+            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Queued { .. } => {
+                unreachable!("admission control is off, so this never queues")
+            }
+        }
+    }
+
+    /// The capacity-aware entry point: deploys `branch` immediately if it
+    /// fits the host's currently free memory (see
+    /// [`Self::with_admission_control`]), or queues it (persisted — see
+    /// [`SqliteStore::enqueue_deploy`]) to be retried automatically as
+    /// capacity frees up, rather than either failing outright or piling
+    /// onto an already-strained host. If the request alone could *never*
+    /// fit (it exceeds total usable capacity by itself), it's rejected
+    /// immediately instead of queued forever.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on any pipeline step failure, or
+    /// [`CpError::InsufficientCapacity`] if the request can never fit.
+    pub async fn deploy_or_queue(
+        &self,
+        project_id: ProjectId,
+        branch: BranchName,
+        operator: Option<String>,
+    ) -> Result<DeployOutcome, CpError> {
+        self.deploy_at(project_id, branch, None, operator, true)
+            .await
+    }
+
+    /// Retries queued deploys (oldest first) that now fit the host's
+    /// currently free capacity — meant to be driven by the scheduler
+    /// alongside [`Self::sweep`], so capacity freed by a GC pause/hibernate
+    /// or a manual `destroy` gets handed to whoever has been waiting
+    /// longest instead of sitting idle until the next manual `oxid up`.
+    ///
+    /// Stops at the first entry that still doesn't fit rather than skipping
+    /// ahead to a smaller one further back in the queue — preserves FIFO
+    /// fairness (SPEC.md "Eficiencia Absoluta": queue and wait, don't let a
+    /// small request cut in line ahead of one that's been waiting longer).
+    ///
+    /// Returns the queue ids that failed to redeploy once retried (e.g. the
+    /// branch was deleted upstream in the meantime); the queue continues
+    /// past these rather than stalling on one bad entry.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the queue or host capacity itself can't be
+    /// read at all.
+    pub async fn retry_queued_deploys(&self) -> Result<Vec<(u64, CpError)>, CpError> {
+        let mut failures = Vec::new();
+        for queued in self.store.list_deploy_queue().await? {
+            let project = match self.ensure_project(queued.project_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    failures.push((queued.id, e));
+                    continue;
+                }
+            };
+            match self.check_admission(&project).await {
+                Ok(Admission::Fits) => {}
+                Ok(Admission::Queue) => break,
+                Err(e) => {
+                    failures.push((queued.id, e));
+                    continue;
+                }
+            }
+
+            self.store.remove_from_deploy_queue(queued.id).await?;
+            let branch = match BranchName::parse(&queued.branch) {
+                Ok(b) => b,
+                Err(e) => {
+                    failures.push((queued.id, e.into()));
+                    continue;
+                }
+            };
+            match self
+                .deploy_at(queued.project_id, branch, None, queued.operator, false)
+                .await
+            {
+                Ok(DeployOutcome::Deployed(_)) => {}
+                Ok(DeployOutcome::Queued { .. }) => {
+                    unreachable!("check_admission is off, so this never queues")
+                }
+                Err(e) => failures.push((queued.id, e)),
+            }
+        }
+        Ok(failures)
     }
 
     /// Deploys `branch`, pinned to `sha_override` instead of the branch's
     /// current head when given — the mechanism [`Self::rollback`] reuses to
     /// redeploy a prior commit. Otherwise identical to [`Self::deploy`].
+    /// When `check_admission` is set, may return
+    /// [`DeployOutcome::Queued`] instead of deploying — see
+    /// [`Self::deploy_or_queue`].
     ///
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
@@ -335,12 +488,34 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         sha_override: Option<String>,
         operator: Option<String>,
-    ) -> Result<Environment, CpError> {
+        check_admission: bool,
+    ) -> Result<DeployOutcome, CpError> {
         // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
-        // comment for the two race conditions this closes).
+        // comment for the two race conditions this closes) — admission
+        // control is decided under the same lock as the deploy it gates,
+        // so two concurrent requests can't both see room and both proceed.
         let _guard = self.lifecycle_lock.lock().await;
 
         let project = self.ensure_project(project_id).await?;
+
+        if check_admission && let Admission::Queue = self.check_admission(&project).await? {
+            let queue_id = self
+                .store
+                .enqueue_deploy(project_id, &branch, operator.as_deref())
+                .await?;
+            // `enqueue_deploy` returns the row's own id, not its rank among
+            // still-pending entries (earlier ones may already have been
+            // retried and removed) — look it up so `position` reports what
+            // it documents.
+            let position = self
+                .store
+                .list_deploy_queue()
+                .await?
+                .iter()
+                .position(|q| q.id == queue_id)
+                .map_or(1, |i| i as u64 + 1);
+            return Ok(DeployOutcome::Queued { position });
+        }
 
         // 0. A redeploy of an already-live branch (a webhook firing on a
         // new push, or a second `oxid up`) reuses the same container name,
@@ -430,7 +605,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Err(err);
         }
 
-        Ok(env)
+        Ok(DeployOutcome::Deployed(env))
     }
 
     /// Redeploys `branch` at a prior commit instead of its current head —
@@ -498,8 +673,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 })?,
         };
 
-        self.deploy_at(project_id, branch, Some(target_sha), operator)
-            .await
+        match self
+            .deploy_at(project_id, branch, Some(target_sha), operator, false)
+            .await?
+        {
+            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Queued { .. } => {
+                unreachable!("admission control is off, so this never queues")
+            }
+        }
     }
 
     /// Resolves secrets, runs the container, runs `[build].on_start` hooks,
@@ -1068,6 +1250,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(AuditStore::list_recent(&self.store, limit).await?)
     }
 
+    /// Lists every deploy currently waiting for host capacity, oldest
+    /// (highest-priority) first — see [`Self::deploy_or_queue`] and
+    /// [`Self::retry_queued_deploys`].
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence failures.
+    pub async fn list_deploy_queue(
+        &self,
+    ) -> Result<Vec<crate::adapter::store::QueuedDeploy>, CpError> {
+        Ok(self.store.list_deploy_queue().await?)
+    }
+
     /// Returns an environment's full audit history, oldest first.
     ///
     /// # Errors
@@ -1175,6 +1369,101 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         Ok(summary)
+    }
+
+    /// Reconciles the database's belief about each live environment
+    /// against Docker's actual state — meant to be called once at daemon
+    /// startup, since the daemon can be down for a while (crash, restart,
+    /// a host reboot) during which reality drifts from whatever was last
+    /// recorded:
+    /// - the container is missing entirely (removed while the daemon was
+    ///   down) → the environment is marked `Destroyed`, since there's
+    ///   nothing left to recover.
+    /// - the database says `Paused` but the container is actually
+    ///   `Running` → a paused container doesn't survive a host reboot as
+    ///   paused (the cgroup freezer state doesn't persist, so
+    ///   `unless-stopped` brings it back fully running); it's re-paused
+    ///   to honor the original intent — don't run what wasn't supposed to
+    ///   be running.
+    /// - the database says `Running` but the container is `Stopped` → try
+    ///   to start it back up (the restart policy should normally have
+    ///   already done this once Docker itself came back, but this covers
+    ///   the case where it hasn't caught up yet, or gave up); if that
+    ///   fails too, mark it `Destroyed` rather than leaving a permanently
+    ///   wrong "Running" row behind.
+    ///
+    /// A failure reconciling one environment doesn't abort the pass —
+    /// errors are collected and returned, matching [`Self::sweep`]'s
+    /// "one bad apple doesn't block the rest" behavior.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] only if listing environments/projects fails;
+    /// per-environment reconciliation failures are returned in the `Vec`.
+    pub async fn reconcile_startup_state(&self) -> Result<Vec<(EnvironmentId, String)>, CpError> {
+        let mut errors = Vec::new();
+        let mut projects: std::collections::HashMap<ProjectId, Project> =
+            std::collections::HashMap::new();
+
+        for mut env in self.store.list_all_environments().await? {
+            if matches!(
+                env.state,
+                EnvironmentState::Destroyed | EnvironmentState::Building
+            ) {
+                continue;
+            }
+            let project = match projects.get(&env.project_id) {
+                Some(project) => project.clone(),
+                None => match ProjectStore::get(&self.store, env.project_id).await? {
+                    Some(project) => {
+                        projects.insert(env.project_id, project.clone());
+                        project
+                    }
+                    None => continue,
+                },
+            };
+            let name = container_name(&project, &env.branch.name);
+            let status = match self.oci.container_status(&name).await {
+                Ok(status) => status,
+                Err(e) => {
+                    errors.push((env.id, e.to_string()));
+                    continue;
+                }
+            };
+
+            let outcome = match (env.state, status) {
+                (
+                    EnvironmentState::Running | EnvironmentState::Paused,
+                    ContainerStatus::Missing,
+                ) => self.mark_destroyed(&mut env).await,
+                (EnvironmentState::Paused, ContainerStatus::Running) => {
+                    self.oci.pause(&name).await.map_err(CpError::from)
+                }
+                (EnvironmentState::Running, ContainerStatus::Stopped) => {
+                    match self.oci.start(&name).await {
+                        Ok(()) => Ok(()),
+                        Err(_) => self.mark_destroyed(&mut env).await,
+                    }
+                }
+                // Already consistent, or a benign drift not worth
+                // correcting (e.g. `Hibernating` found `Running` because
+                // someone manually `docker start`ed it).
+                _ => Ok(()),
+            };
+            if let Err(e) = outcome {
+                errors.push((env.id, e.to_string()));
+            }
+        }
+        Ok(errors)
+    }
+
+    /// Transitions `env` to `Destroyed` and persists it — the reconciler's
+    /// fallback when a container can't be recovered.
+    async fn mark_destroyed(&self, env: &mut Environment) -> Result<(), CpError> {
+        let now = OffsetDateTime::now_utc();
+        if env.transition(StateTransition::Destroy, now).is_ok() {
+            self.store.update(env).await?;
+        }
+        Ok(())
     }
 
     async fn apply_gc_action(
@@ -1329,6 +1618,69 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .ok_or_else(|| CpError::NotFound(format!("project `{project_id}`")))
     }
 
+    /// Decides whether a deploy of `project` can proceed immediately given
+    /// the host's currently reported capacity (`docker info`, via
+    /// [`ContainerPort::host_capacity`]) and every other environment
+    /// currently holding memory (`Running` or `Paused` — a paused container
+    /// still reserves its memory limit in Docker's accounting, it just isn't
+    /// spending CPU). Disabled (`Admission::Fits` unconditionally) unless
+    /// [`Self::with_admission_control`] set a `reserved_memory_mb`, and for
+    /// any project whose resolved memory request is unbounded (no
+    /// `[build].memory_limit_mb` and no daemon default) — there's nothing to
+    /// gate against without a number.
+    ///
+    /// # Errors
+    /// [`CpError::InsufficientCapacity`] if the request alone exceeds total
+    /// usable capacity (queuing it would never help), plus whatever
+    /// [`ContainerPort::host_capacity`] or the store can fail with.
+    async fn check_admission(&self, project: &Project) -> Result<Admission, CpError> {
+        let Some(reserved_mb) = self.reserved_memory_mb else {
+            return Ok(Admission::Fits);
+        };
+        let Some(request_mb) = project
+            .config
+            .build
+            .memory_limit_mb
+            .or(self.default_memory_limit_mb)
+        else {
+            return Ok(Admission::Fits);
+        };
+
+        let host = self.oci.host_capacity().await?;
+        let total_mb = host.total_memory_bytes / 1_048_576;
+        let usable_mb = total_mb.saturating_sub(reserved_mb);
+
+        if request_mb > usable_mb {
+            return Err(CpError::InsufficientCapacity(format!(
+                "project `{}` requests {request_mb}MB but the host only has \
+                 {usable_mb}MB usable ({total_mb}MB total minus {reserved_mb}MB reserved)",
+                project.name
+            )));
+        }
+
+        let mut committed_mb: u64 = 0;
+        for state in [EnvironmentState::Running, EnvironmentState::Paused] {
+            for env in self.store.list_by_state(state).await? {
+                let Some(env_project) = ProjectStore::get(&self.store, env.project_id).await?
+                else {
+                    continue;
+                };
+                committed_mb += env_project
+                    .config
+                    .build
+                    .memory_limit_mb
+                    .or(self.default_memory_limit_mb)
+                    .unwrap_or(0);
+            }
+        }
+
+        if committed_mb + request_mb > usable_mb {
+            Ok(Admission::Queue)
+        } else {
+            Ok(Admission::Fits)
+        }
+    }
+
     async fn ensure_environment(
         &self,
         environment_id: EnvironmentId,
@@ -1401,6 +1753,7 @@ fn lowest_free_index(used: &std::collections::BTreeSet<u32>, capacity: u32) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxid_core::HostCapacity;
     use std::sync::{Arc, Mutex};
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -1437,6 +1790,10 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         /// When > 0, `run` fails and decrements this instead of succeeding.
         fail_run_times: Arc<Mutex<u32>>,
+        /// Per-container overrides for `container_status`; anything not
+        /// listed here defaults to `Running`.
+        container_statuses: Arc<Mutex<std::collections::HashMap<String, ContainerStatus>>>,
+        host_capacity: Arc<Mutex<HostCapacity>>,
     }
 
     impl ContainerPort for FakeOci {
@@ -1507,6 +1864,18 @@ mod tests {
                 .unwrap()
                 .push(format!("exec:{name}:{command}"));
             Ok(())
+        }
+        async fn container_status(&self, name: &str) -> Result<ContainerStatus, OciError> {
+            Ok(self
+                .container_statuses
+                .lock()
+                .unwrap()
+                .get(name)
+                .copied()
+                .unwrap_or(ContainerStatus::Running))
+        }
+        async fn host_capacity(&self) -> Result<HostCapacity, OciError> {
+            Ok(*self.host_capacity.lock().unwrap())
         }
     }
 
@@ -2606,5 +2975,256 @@ cpu_limit_millicores = 250
         let calls = oci.calls.lock().unwrap();
         assert!(calls.iter().any(|c| c.starts_with("stop:")), "{calls:?}");
         assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_marks_a_missing_container_destroyed() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        oci.container_statuses
+            .lock()
+            .unwrap()
+            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Missing);
+
+        let errors = cp.reconcile_startup_state().await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let loaded = EnvironmentStore::get(&cp.store, env.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Destroyed);
+    }
+
+    #[tokio::test]
+    async fn reconcile_re_pauses_a_container_a_reboot_brought_back_running() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        cp.pause(env.id).await.unwrap();
+
+        // A reboot doesn't preserve the cgroup-freezer "paused" state —
+        // `unless-stopped` brings the container back fully running.
+        oci.container_statuses
+            .lock()
+            .unwrap()
+            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Running);
+
+        let errors = cp.reconcile_startup_state().await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "pause:oxid-app-feature-a"),
+            "{:?}",
+            oci.calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restarts_a_running_environment_whose_container_stopped() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+        cp.deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+
+        oci.container_statuses
+            .lock()
+            .unwrap()
+            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Stopped);
+
+        let errors = cp.reconcile_startup_state().await.unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "start:oxid-app-feature-a"),
+            "{:?}",
+            oci.calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_or_queue_deploys_immediately_when_capacity_is_available() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.host_capacity.lock().unwrap() = HostCapacity {
+            total_memory_bytes: 1024 * 1_048_576,
+            cpu_count: 4,
+        };
+        let cp = cp(oci)
+            .await
+            .with_resource_defaults(Some(200), None)
+            .with_admission_control(Some(100));
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let outcome = cp
+            .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DeployOutcome::Deployed(_)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn deploy_or_queue_queues_when_the_host_is_already_committed() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.host_capacity.lock().unwrap() = HostCapacity {
+            total_memory_bytes: 300 * 1_048_576,
+            cpu_count: 4,
+        };
+        let cp = cp(oci)
+            .await
+            .with_resource_defaults(Some(200), None)
+            .with_admission_control(Some(50));
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        // First deploy fits alone (200MB request <= 250MB usable) and stays
+        // Running, committing its 200MB.
+        cp.deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap();
+
+        // A second branch's 200MB request would push committed usage to
+        // 400MB against only 250MB usable — must queue, not overcommit.
+        let outcome = cp
+            .deploy_or_queue(project.id, BranchName::parse("other").unwrap(), None)
+            .await
+            .unwrap();
+        let DeployOutcome::Queued { position } = outcome else {
+            panic!("expected Queued, got {outcome:?}");
+        };
+        assert_eq!(position, 1);
+
+        let queued = cp.store.list_deploy_queue().await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].branch, "other");
+    }
+
+    #[tokio::test]
+    async fn deploy_or_queue_rejects_a_request_that_could_never_fit() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.host_capacity.lock().unwrap() = HostCapacity {
+            total_memory_bytes: 1024 * 1_048_576,
+            cpu_count: 4,
+        };
+        let cp = cp(oci)
+            .await
+            .with_resource_defaults(Some(2000), None)
+            .with_admission_control(Some(1000));
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let err = cp
+            .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CpError::InsufficientCapacity(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn deploy_or_queue_always_deploys_when_admission_control_is_disabled() {
+        let repo = repo_dir_with_config();
+        // Zero capacity by default — if admission control were mistakenly
+        // active this would queue or reject, not deploy.
+        let cp = cp(FakeOci::default()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let outcome = cp
+            .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, DeployOutcome::Deployed(_)), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn retry_queued_deploys_leaves_the_queue_untouched_when_nothing_fits_yet() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.host_capacity.lock().unwrap() = HostCapacity {
+            total_memory_bytes: 300 * 1_048_576,
+            cpu_count: 4,
+        };
+        let cp = cp(oci)
+            .await
+            .with_resource_defaults(Some(200), None)
+            .with_admission_control(Some(50));
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        cp.deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap();
+        cp.deploy_or_queue(project.id, BranchName::parse("other").unwrap(), None)
+            .await
+            .unwrap();
+
+        let failures = cp.retry_queued_deploys().await.unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        let queued = cp.store.list_deploy_queue().await.unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].branch, "other");
+    }
+
+    #[tokio::test]
+    async fn retry_queued_deploys_deploys_once_capacity_frees_up() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        *oci.host_capacity.lock().unwrap() = HostCapacity {
+            total_memory_bytes: 300 * 1_048_576,
+            cpu_count: 4,
+        };
+        let cp = cp(oci.clone())
+            .await
+            .with_resource_defaults(Some(200), None)
+            .with_admission_control(Some(50));
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let main_env = match cp
+            .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
+            .await
+            .unwrap()
+        {
+            DeployOutcome::Deployed(env) => env,
+            other @ DeployOutcome::Queued { .. } => panic!("expected Deployed, got {other:?}"),
+        };
+        cp.deploy_or_queue(project.id, BranchName::parse("other").unwrap(), None)
+            .await
+            .unwrap();
+
+        // Freeing `main`'s 200MB should let `other`'s queued 200MB request
+        // through on the next retry pass.
+        cp.destroy(main_env.id, false).await.unwrap();
+
+        let failures = cp.retry_queued_deploys().await.unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(cp.store.list_deploy_queue().await.unwrap().is_empty());
+        assert!(
+            oci.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("run:oxid-app-other")),
+            "{:?}",
+            oci.calls.lock().unwrap()
+        );
     }
 }

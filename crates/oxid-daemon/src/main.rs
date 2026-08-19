@@ -39,6 +39,15 @@
 //! - `OXID_DEFAULT_CPU_LIMIT_MILLICORES` — same fallback behavior as
 //!   `OXID_DEFAULT_MEMORY_LIMIT_MB`, but for CPU (1000 = one full core,
 //!   default `1000`). Set to `0` to disable.
+//! - `OXID_RESERVED_MEMORY_MB` — memory (megabytes) reserved for the host OS
+//!   and this daemon itself, subtracted from `docker info`'s reported total
+//!   before deciding whether a new deploy fits (default `1024`). A deploy
+//!   whose resolved memory request would push total committed usage past
+//!   what's left is queued (persisted — survives a daemon restart) and
+//!   retried automatically as other environments free capacity, instead of
+//!   either failing outright or overcommitting the host. Set to `0` to
+//!   disable admission control entirely and deploy immediately regardless of
+//!   host capacity (the behavior before this existed).
 //! - `OXID_TLS_CERT` / `OXID_TLS_KEY` — PEM certificate/key file paths. When
 //!   both are set, the daemon serves HTTPS directly instead of plain HTTP.
 //!   Unset by default: most deployments (including the shipped
@@ -55,6 +64,18 @@
 //!   default (unlimited) — it's a single global bucket, not per-client, so
 //!   it only matters once the token is handed to more than one trusted
 //!   party.
+//!
+//! **Resilience notes:** deployed containers carry Docker's
+//! `unless-stopped` restart policy — they come back on their own after a
+//! crash, an OOM-kill, or the host rebooting, without needing this daemon
+//! to be up to notice. On its own startup, the daemon reconciles its
+//! database against Docker's actual state before serving any request (see
+//! [`apply_staged_restore`] for the restore side of this and
+//! [`oxid_daemon::ControlPlane::reconcile_startup_state`] for the
+//! container-drift side). It also drains in-flight requests for up to 10s
+//! on `SIGTERM`/`Ctrl+C` instead of dying mid-request, and lowers its own
+//! OOM score so the kernel prefers killing a disposable preview container
+//! over the daemon itself under memory pressure.
 //!
 //! **Network topology note for `OXID_POSTGRES_URL`/`OXID_REDIS_URL`:** the
 //! same URL is used both by this daemon (to run `CREATE`/`DROP DATABASE` as
@@ -143,6 +164,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&mc| mc > 0);
     cp = cp.with_resource_defaults(default_memory_limit_mb, default_cpu_limit_millicores);
 
+    let reserved_memory_mb = std::env::var("OXID_RESERVED_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or(Some(1024))
+        .filter(|&mb| mb > 0);
+    cp = cp.with_admission_control(reserved_memory_mb);
+
+    // Reconciles the database against Docker's actual state before serving
+    // any request — the daemon may have been down for a while (crash,
+    // restart, a host reboot), during which containers can drift from
+    // whatever was last recorded (see `ControlPlane::reconcile_startup_state`).
+    match cp.reconcile_startup_state().await {
+        Ok(errors) if errors.is_empty() => {}
+        Ok(errors) => {
+            for (env_id, message) in errors {
+                println!("[~] startup reconciliation issue for environment {env_id}: {message}");
+            }
+        }
+        Err(e) => println!("[~] startup reconciliation failed: {e}"),
+    }
+
     tokio::spawn(oxid_daemon::service::scheduler::run(
         cp.clone(),
         std::time::Duration::from_secs(gc_interval_secs),
@@ -165,6 +207,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allow_restore,
         rate_limit,
     });
+    lower_oom_score();
+    serve(app, &addr, &data_dir, gc_interval_secs).await
+}
+
+/// Binds `addr` and serves `app` — plain HTTP, or HTTPS if
+/// `OXID_TLS_CERT`/`OXID_TLS_KEY` are set — draining in-flight requests
+/// for up to 10s on `SIGTERM`/`Ctrl+C` either way.
+async fn serve(
+    app: axum::Router,
+    addr: &str,
+    data_dir: &str,
+    gc_interval_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     let tls = load_tls_config().await?;
     if let Some(config) = tls {
         let socket_addr: std::net::SocketAddr = addr
@@ -173,7 +228,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[>] oxid daemon listening on https://{addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
         );
+        let handle = axum_server::Handle::new();
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            // Give in-flight requests (a deploy, a log stream) up to 10s to
+            // finish before the connection is cut regardless.
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+        });
         axum_server::bind_rustls(socket_addr, config)
+            .handle(handle)
             .serve(app.into_make_service())
             .await?;
     } else {
@@ -181,9 +245,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
         );
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
     }
     Ok(())
+}
+
+/// Waits for `SIGTERM` (what `docker stop`/a service manager sends) or
+/// `Ctrl+C`, whichever comes first — without this, either signal killed
+/// the process immediately mid-request (a deploy half-applied, a log
+/// stream cut off) instead of letting `axum`/`axum-server` drain
+/// in-flight work first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        signal.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    println!("[~] shutdown signal received, draining in-flight requests...");
+}
+
+/// Best-effort: makes the Linux OOM killer less likely to pick this
+/// process over the ephemeral preview containers it manages. Without
+/// this, the daemon (unbounded memory, unlike deployed containers which
+/// now always carry a `memory_limit_mb`) has no signal telling the kernel
+/// it's comparatively more important to keep alive than a disposable
+/// preview environment. Silently does nothing if `/proc` isn't writable
+/// (non-Linux, or lacking permission) — this is a nice-to-have, not load
+/// -bearing for correctness.
+fn lower_oom_score() {
+    let _ = std::fs::write("/proc/self/oom_score_adj", "-500");
 }
 
 /// Reads `OXID_RATE_LIMIT_PER_SECOND`/`OXID_RATE_LIMIT_BURST`. `None`
