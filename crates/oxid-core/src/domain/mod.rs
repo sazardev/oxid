@@ -4,6 +4,7 @@ mod audit;
 mod branch;
 mod environment;
 mod error;
+pub mod infra;
 pub mod ports;
 mod project;
 mod project_config;
@@ -17,6 +18,7 @@ pub use audit::AuditEvent;
 pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
+pub use infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
 pub use ports::{
     AuditFilter, AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, ContainerStatus,
     EnvironmentStore, GitError, GitPort, HostCapacity, LogStream, OciError, ProjectStore,

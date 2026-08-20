@@ -16,6 +16,7 @@ use futures_core::Stream;
 use crate::domain::audit::AuditEvent;
 use crate::domain::branch::BranchName;
 use crate::domain::environment::{Environment, EnvironmentId};
+use crate::domain::infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
 use crate::domain::project::{Project, ProjectId};
 use crate::domain::secret_context::{EnvVarScope, SecretContext, SecretValue};
 use crate::domain::state::EnvironmentState;
@@ -312,7 +313,8 @@ pub type LogStream = Pin<Box<dyn Stream<Item = Result<String, OciError>> + Send>
 /// reconciliation: the daemon can be down for a while (crash, restart, a
 /// host reboot) during which a container's real state can drift from the
 /// last thing the database recorded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContainerStatus {
     /// Exists and is actively running (not paused).
     Running,
@@ -481,4 +483,37 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::Failure`] on a Docker communication failure.
     async fn host_capacity(&self) -> Result<HostCapacity, OciError>;
+    /// Read-only: reports whether a Docker network named `name` exists,
+    /// without creating anything. Backs `oxid infra status`, which must
+    /// never mutate infrastructure just by being asked about it.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure.
+    async fn network_exists(&self, name: &str) -> Result<bool, OciError>;
+    /// Idempotently ensures a Docker network named `name` exists — step 1 of
+    /// the manual Traefik bootstrap an operator otherwise has to run by hand
+    /// (`docker network create`). A no-op reporting
+    /// [`NetworkStatus::AlreadyExisted`] if it's already there.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure.
+    async fn ensure_network(&self, name: &str) -> Result<NetworkStatus, OciError>;
+    /// Idempotently ensures the built-in Traefik container described by
+    /// `spec` exists and is running — step 2 of the manual bootstrap
+    /// (`docker run traefik:v3.3 ...`). Creates and starts it if missing,
+    /// starts it if it exists but is stopped, and is a no-op if it's already
+    /// running.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure.
+    async fn ensure_traefik(&self, spec: TraefikSpec) -> Result<TraefikStatus, OciError>;
+    /// Read-only: detects whether *this daemon's own* running container is
+    /// joined to `network` and labeled for wake-on-request. Never creates,
+    /// modifies or recreates anything — see [`SelfWiringStatus`] for why.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure other than
+    /// "container not found", which is reported as
+    /// [`SelfWiringStatus::Unknown`] rather than an error.
+    async fn self_wiring_status(&self, network: &str) -> Result<SelfWiringStatus, OciError>;
 }

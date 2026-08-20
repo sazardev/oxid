@@ -16,7 +16,7 @@ use oxid_core::{
     ContainerSpec, ContainerStatus, Dependency, DomainError, EnvVarScope, Environment,
     EnvironmentId, EnvironmentState, EnvironmentStore, GitError, GitPort, LogStream, OciError,
     OffsetDateTime, PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl,
-    RepositoryError, SecretStore, SecretValue, StateTransition, Ttl,
+    RepositoryError, SecretStore, SecretValue, SelfWiringStatus, StateTransition, TraefikSpec, Ttl,
 };
 
 use crate::adapter::config::{self, ConfigError};
@@ -106,6 +106,73 @@ pub struct NodeStats {
     /// `[routing].port` published directly on whatever host is running the
     /// daemon. The dashboard uses this to decide which one to link to.
     pub traefik_enabled: bool,
+}
+
+/// Bundled result of [`ControlPlane::infra_status`]/[`ControlPlane::infra_bootstrap`]
+/// — whether the manual Traefik bootstrap an operator would otherwise have
+/// to do by hand (`docker network create`, `docker run traefik:v3.3 ...`,
+/// then hand-label the daemon's own container) is actually done.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InfraStatus {
+    /// The configured Docker network name (`OXID_DOCKER_NETWORK`).
+    pub network: String,
+    /// Whether `network` already exists.
+    pub network_exists: bool,
+    /// The built-in Traefik container's actual Docker state.
+    pub traefik_status: ContainerStatus,
+    /// Whether this daemon's own container is joined to `network` and
+    /// labeled for wake-on-request — detection only, see
+    /// [`SelfWiringStatus`].
+    pub self_wiring: SelfWiringStatus,
+    /// Human-readable, actionable instructions for whatever's missing.
+    /// Empty when everything is fully wired.
+    pub next_steps: Vec<String>,
+}
+
+impl InfraStatus {
+    fn new(
+        network: String,
+        network_exists: bool,
+        traefik_status: ContainerStatus,
+        self_wiring: SelfWiringStatus,
+    ) -> Self {
+        let mut next_steps = Vec::new();
+        if !network_exists {
+            next_steps.push(format!(
+                "Docker network `{network}` doesn't exist yet — run `oxid infra setup` to \
+                 create it."
+            ));
+        }
+        match traefik_status {
+            ContainerStatus::Running => {}
+            ContainerStatus::Paused | ContainerStatus::Stopped | ContainerStatus::Missing => {
+                next_steps.push(
+                    "Traefik isn't running — run `oxid infra setup` to create/start it.".to_owned(),
+                );
+            }
+        }
+        if !self_wiring.is_fully_wired() {
+            next_steps.push(format!(
+                "This daemon's own container isn't fully wired for wake-on-request. Docker \
+                 can't relabel a running container without recreating it, so this can't be \
+                 automated — recreate the daemon's container/compose entry with:\n\
+                 \x20\x20networks:\n\
+                 \x20\x20\x20\x20- {network}\n\
+                 \x20\x20labels:\n\
+                 \x20\x20\x20\x20- \"traefik.enable=true\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.services.oxid-wake.loadbalancer.server.port=8080\"\n\
+                 (plus the per-router `errors` middleware labels documented on \
+                 `ControlPlane::traefik_labels`)."
+            ));
+        }
+        Self {
+            network,
+            network_exists,
+            traefik_status,
+            self_wiring,
+            next_steps,
+        }
+    }
 }
 
 /// Result of a capacity-aware deploy attempt (see
@@ -1589,6 +1656,83 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(stats)
     }
 
+    /// Read-only report of the manual-bootstrap steps described in
+    /// `traefik_labels`'s doc comment: does the Docker network exist, is
+    /// Traefik running, and is this daemon's own container wired for
+    /// wake-on-request. Never creates or changes anything — see
+    /// [`Self::infra_bootstrap`] to actually fix the first two.
+    ///
+    /// # Errors
+    /// [`CpError::NotFound`] if `with_traefik` was never called (no
+    /// `OXID_DOCKER_NETWORK` configured) — there's no network name to check
+    /// against, so guessing one would be worse than a clear error.
+    #[tracing::instrument(skip(self))]
+    pub async fn infra_status(&self) -> Result<InfraStatus, CpError> {
+        let network = self
+            .docker_network
+            .as_deref()
+            .ok_or_else(Self::no_network_configured)?;
+        tracing::info!(network, "checking infra bootstrap status");
+
+        let network_exists = self.oci.network_exists(network).await?;
+        let traefik_spec = TraefikSpec::new(network.to_owned());
+        let traefik_status = self
+            .oci
+            .container_status(&traefik_spec.container_name)
+            .await?;
+        let self_wiring = self.oci.self_wiring_status(network).await?;
+
+        Ok(InfraStatus::new(
+            network.to_owned(),
+            network_exists,
+            traefik_status,
+            self_wiring,
+        ))
+    }
+
+    /// Idempotently creates the Docker network and starts the built-in
+    /// Traefik container if either is missing, then re-queries
+    /// [`Self::infra_status`] so the response always reflects reality
+    /// afterward. Safe to call repeatedly — running it twice in a row
+    /// changes nothing the second time.
+    ///
+    /// Deliberately does **not** attempt to wire this daemon's own
+    /// container onto the network or label it: Docker cannot relabel a
+    /// running container without recreating it, and recreating the very
+    /// process executing this call is unsafe to automate. See
+    /// [`InfraStatus::next_steps`] for what to do about that instead.
+    ///
+    /// # Errors
+    /// Same as [`Self::infra_status`], plus any Docker failure creating the
+    /// network or the Traefik container.
+    #[tracing::instrument(skip(self))]
+    pub async fn infra_bootstrap(&self) -> Result<InfraStatus, CpError> {
+        let network = self
+            .docker_network
+            .clone()
+            .ok_or_else(Self::no_network_configured)?;
+        tracing::info!(network = %network, "bootstrapping infra: network + traefik");
+
+        let network_status = self.oci.ensure_network(&network).await?;
+        tracing::info!(network = %network, ?network_status, "network ensured");
+
+        let traefik_status = self
+            .oci
+            .ensure_traefik(TraefikSpec::new(network.clone()))
+            .await?;
+        tracing::info!(?traefik_status, "traefik ensured");
+
+        self.infra_status().await
+    }
+
+    fn no_network_configured() -> CpError {
+        CpError::NotFound(
+            "OXID_DOCKER_NETWORK is not set on this daemon — set it first, then restart, \
+             before running `oxid infra status`/`setup`"
+                .to_owned(),
+        )
+    }
+
     /// Returns an environment's full audit history, oldest first. `filter`'s
     /// `since`/`until`/`kind` narrow it further; its `project_id`/`branch`/
     /// `limit` are ignored (see [`AuditFilter`] and
@@ -2190,6 +2334,10 @@ mod tests {
         /// listed here defaults to `Running`.
         container_statuses: Arc<Mutex<std::collections::HashMap<String, ContainerStatus>>>,
         host_capacity: Arc<Mutex<HostCapacity>>,
+        /// Docker networks `ensure_network`/`network_exists` believe exist.
+        network_exists: Arc<Mutex<std::collections::HashSet<String>>>,
+        /// Whether `ensure_traefik` believes its container is already up.
+        traefik_running: Arc<Mutex<bool>>,
     }
 
     impl ContainerPort for FakeOci {
@@ -2284,6 +2432,53 @@ mod tests {
         async fn host_capacity(&self) -> Result<HostCapacity, OciError> {
             Ok(*self.host_capacity.lock().unwrap())
         }
+        async fn network_exists(&self, name: &str) -> Result<bool, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("network_exists:{name}"));
+            Ok(self.network_exists.lock().unwrap().contains(name))
+        }
+        async fn ensure_network(&self, name: &str) -> Result<oxid_core::NetworkStatus, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ensure_network:{name}"));
+            if self.network_exists.lock().unwrap().insert(name.to_owned()) {
+                Ok(oxid_core::NetworkStatus::Created)
+            } else {
+                Ok(oxid_core::NetworkStatus::AlreadyExisted)
+            }
+        }
+        async fn ensure_traefik(
+            &self,
+            spec: oxid_core::TraefikSpec,
+        ) -> Result<oxid_core::TraefikStatus, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ensure_traefik:{}", spec.container_name));
+            let mut running = self.traefik_running.lock().unwrap();
+            // Keep `container_status(&spec.container_name)` (used by
+            // `infra_status`, which never calls `ensure_traefik` itself) in
+            // sync with what this fake believes it just created/started.
+            self.container_statuses
+                .lock()
+                .unwrap()
+                .insert(spec.container_name.clone(), ContainerStatus::Running);
+            if *running {
+                Ok(oxid_core::TraefikStatus::AlreadyRunning)
+            } else {
+                *running = true;
+                Ok(oxid_core::TraefikStatus::Created)
+            }
+        }
+        async fn self_wiring_status(
+            &self,
+            _network: &str,
+        ) -> Result<oxid_core::SelfWiringStatus, OciError> {
+            Ok(oxid_core::SelfWiringStatus::NotContainerized)
+        }
     }
 
     async fn store() -> SqliteStore {
@@ -2352,6 +2547,78 @@ port = 8080
         // `ControlPlane::with_readiness_check`'s doc comment.
         ControlPlane::new(store().await, FakeGit, oci, cache.path().to_owned())
             .with_readiness_check(false)
+    }
+
+    #[tokio::test]
+    async fn infra_status_requires_traefik_configured() {
+        // No `with_traefik(...)` call — there's no network name to check
+        // against, so this must be a clear error, not a guess.
+        let cp = cp(FakeOci::default()).await;
+        let err = cp.infra_status().await.unwrap_err();
+        assert!(matches!(err, CpError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn infra_bootstrap_requires_traefik_configured() {
+        let cp = cp(FakeOci::default()).await;
+        let err = cp.infra_bootstrap().await.unwrap_err();
+        assert!(matches!(err, CpError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn infra_status_reports_missing_network_and_traefik_before_bootstrap() {
+        let oci = FakeOci::default();
+        let cp = cp(oci).await.with_traefik("oxid-net", "http://daemon");
+
+        let status = cp.infra_status().await.unwrap();
+        assert_eq!(status.network, "oxid-net");
+        assert!(!status.network_exists);
+        assert_eq!(status.traefik_status, ContainerStatus::Running);
+        // `FakeOci::container_status` defaults every unlisted name to
+        // `Running` (see its impl above) — this asserts the current
+        // baseline so a future change to that default doesn't silently
+        // break this test's assumptions; the "Missing" case is exercised
+        // separately below.
+        assert!(!status.next_steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn infra_bootstrap_is_idempotent() {
+        let oci = FakeOci::default();
+        oci.container_statuses
+            .lock()
+            .unwrap()
+            .insert("oxid-traefik".to_owned(), ContainerStatus::Missing);
+        let cp = cp(oci.clone())
+            .await
+            .with_traefik("oxid-net", "http://daemon");
+
+        let first = cp.infra_bootstrap().await.unwrap();
+        assert!(first.network_exists);
+        assert_eq!(first.traefik_status, ContainerStatus::Running);
+        assert!(
+            first
+                .next_steps
+                .iter()
+                .any(|s| s.contains("wake-on-request"))
+        );
+
+        // Running it again must not fail or duplicate anything — both
+        // `ensure_network`/`ensure_traefik` calls should now be pure no-ops.
+        let second = cp.infra_bootstrap().await.unwrap();
+        assert_eq!(second.network, first.network);
+        assert!(second.network_exists);
+        assert_eq!(second.traefik_status, ContainerStatus::Running);
+
+        let calls = oci.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("ensure_network"))
+                .count()
+                >= 2,
+            "{calls:?}"
+        );
     }
 
     /// A project declaring one `redis` dependency — deliberately no

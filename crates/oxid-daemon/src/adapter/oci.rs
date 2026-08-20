@@ -16,10 +16,12 @@ use bollard::image::{BuildImageOptions, RemoveImageOptions};
 use bollard::models::{
     EndpointSettings, HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
+use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use oxid_core::{
-    BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream, OciError,
+    BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream,
+    NetworkStatus, OciError, SelfWiringStatus, TraefikSpec, TraefikStatus,
 };
 
 /// Backed by a Docker connection (default socket).
@@ -359,6 +361,170 @@ impl ContainerPort for DockerClient {
             cpu_count: u32::try_from(info.ncpu.unwrap_or(0).max(0)).unwrap_or(0),
         })
     }
+
+    async fn network_exists(&self, name: &str) -> Result<bool, OciError> {
+        // The `name` filter is a substring match, so an exact-name check on
+        // the results is still needed — otherwise `oxid-net` would report
+        // "already exists" just because `oxid-net-2` does.
+        let filters = HashMap::from([("name".to_owned(), vec![name.to_owned()])]);
+        let existing = self
+            .docker
+            .list_networks(Some(ListNetworksOptions { filters }))
+            .await
+            .map_err(map_err)?;
+        Ok(existing.iter().any(|n| n.name.as_deref() == Some(name)))
+    }
+
+    async fn ensure_network(&self, name: &str) -> Result<NetworkStatus, OciError> {
+        if self.network_exists(name).await? {
+            return Ok(NetworkStatus::AlreadyExisted);
+        }
+        self.docker
+            .create_network(CreateNetworkOptions {
+                name: name.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map_err(map_err)?;
+        Ok(NetworkStatus::Created)
+    }
+
+    async fn ensure_traefik(&self, spec: TraefikSpec) -> Result<TraefikStatus, OciError> {
+        match self
+            .docker
+            .inspect_container(&spec.container_name, None)
+            .await
+        {
+            Ok(info) => {
+                let running = info.state.and_then(|s| s.running).unwrap_or(false);
+                if running {
+                    return Ok(TraefikStatus::AlreadyRunning);
+                }
+                self.docker
+                    .start_container::<String>(&spec.container_name, None)
+                    .await
+                    .map_err(map_err)?;
+                Ok(TraefikStatus::StartedFromStopped)
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                self.create_and_start_traefik(&spec).await?;
+                Ok(TraefikStatus::Created)
+            }
+            Err(e) => Err(map_err(e)),
+        }
+    }
+
+    async fn self_wiring_status(&self, network: &str) -> Result<SelfWiringStatus, OciError> {
+        // Docker sets `HOSTNAME` to the short container id by default when
+        // nothing overrides it — the same trick `docker inspect $HOSTNAME`
+        // uses from inside a container to identify itself.
+        let hostname = match std::env::var("HOSTNAME") {
+            Ok(hostname) if !hostname.trim().is_empty() => hostname,
+            _ => return Ok(SelfWiringStatus::NotContainerized),
+        };
+        // Not found (hostname doesn't resolve to a real container, e.g.
+        // running Docker-in-Docker or a non-Docker container runtime) or any
+        // other inspection failure: this is diagnostics, not a correctness
+        // gate, so report "can't tell" rather than erroring the whole
+        // status/bootstrap call.
+        let Ok(info) = self.docker.inspect_container(&hostname, None).await else {
+            return Ok(SelfWiringStatus::Unknown);
+        };
+
+        let joined_network = info
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .is_some_and(|networks| networks.contains_key(network));
+
+        let labels = info
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        let has_traefik_enable_label =
+            labels.get("traefik.enable").map(String::as_str) == Some("true");
+        let references_oxid_wake = labels
+            .iter()
+            .any(|(k, v)| k.contains("oxid-wake") || v.contains("oxid-wake"));
+
+        Ok(SelfWiringStatus::Detected {
+            container_id: hostname,
+            joined_network,
+            has_traefik_enable_label,
+            references_oxid_wake,
+        })
+    }
+}
+
+impl DockerClient {
+    /// Creates and starts a brand-new Traefik container from `spec`. Only
+    /// called by `ensure_traefik` when no container by that name exists yet.
+    async fn create_and_start_traefik(&self, spec: &TraefikSpec) -> Result<(), OciError> {
+        let port_key = format!("{}/tcp", spec.http_port);
+        let mut exposed_ports = HashMap::new();
+        // Docker's API represents "expose this port" as a mapping to an
+        // empty JSON object (`{"80/tcp": {}}`) — same shape `run` above uses
+        // for environment containers.
+        #[allow(clippy::zero_sized_map_values)]
+        exposed_ports.insert(port_key.clone(), HashMap::<(), ()>::new());
+
+        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+        port_bindings.insert(
+            port_key,
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_owned()),
+                host_port: Some(spec.http_port.to_string()),
+            }]),
+        );
+
+        let config = Config {
+            image: Some(spec.image.clone()),
+            exposed_ports: Some(exposed_ports),
+            cmd: Some(vec![
+                "--providers.docker=true".to_owned(),
+                format!("--providers.docker.network={}", spec.network),
+                "--providers.docker.exposedbydefault=false".to_owned(),
+                "--entrypoints.web.address=:80".to_owned(),
+            ]),
+            host_config: Some(HostConfig {
+                port_bindings: Some(port_bindings),
+                binds: Some(vec![format!(
+                    "{}:/var/run/docker.sock:ro",
+                    spec.docker_socket_path
+                )]),
+                // Same rationale as environment containers (see `run`):
+                // Traefik should come back on its own after a crash or host
+                // reboot without anyone noticing.
+                restart_policy: Some(RestartPolicy {
+                    name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                }),
+                ..Default::default()
+            }),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: HashMap::from([(
+                    spec.network.clone(),
+                    EndpointSettings::default(),
+                )]),
+            }),
+            ..Default::default()
+        };
+
+        let options = CreateContainerOptions {
+            name: spec.container_name.clone(),
+            ..Default::default()
+        };
+        self.docker
+            .create_container(Some(options), config)
+            .await
+            .map_err(map_err)?;
+        self.docker
+            .start_container::<String>(&spec.container_name, None)
+            .await
+            .map_err(map_err)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -515,5 +681,52 @@ mod tests {
             entries >= 2,
             "expected Dockerfile + sub/file.txt, got {entries}"
         );
+    }
+
+    /// Exercises `ensure_network`/`ensure_traefik`/`network_exists` against
+    /// a real Docker daemon, asserting the idempotency `oxid infra setup`
+    /// depends on: running either twice in a row must be a no-op the second
+    /// time, not a failure or a duplicate.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn ensure_network_and_traefik_are_idempotent() {
+        let client = DockerClient::connect().unwrap();
+        let network = "oxid-test-infra-net";
+        let container_name = "oxid-test-infra-traefik";
+
+        // Clean up anything left over from a prior failed run before
+        // asserting a clean starting state.
+        let _ = client.remove(container_name).await;
+        let _ = client.docker.remove_network(network).await;
+
+        assert!(!client.network_exists(network).await.unwrap());
+
+        let first_network = client.ensure_network(network).await.unwrap();
+        assert_eq!(first_network, NetworkStatus::Created);
+        assert!(client.network_exists(network).await.unwrap());
+
+        let second_network = client.ensure_network(network).await.unwrap();
+        assert_eq!(second_network, NetworkStatus::AlreadyExisted);
+
+        let spec = TraefikSpec {
+            network: network.to_owned(),
+            image: "traefik:v3.3".to_owned(),
+            container_name: container_name.to_owned(),
+            http_port: 18_080,
+            docker_socket_path: "/var/run/docker.sock".to_owned(),
+        };
+
+        let first_traefik = client.ensure_traefik(spec.clone()).await.unwrap();
+        assert_eq!(first_traefik, TraefikStatus::Created);
+        assert_eq!(
+            client.container_status(container_name).await.unwrap(),
+            ContainerStatus::Running
+        );
+
+        let second_traefik = client.ensure_traefik(spec).await.unwrap();
+        assert_eq!(second_traefik, TraefikStatus::AlreadyRunning);
+
+        client.remove(container_name).await.unwrap();
+        client.docker.remove_network(network).await.unwrap();
     }
 }

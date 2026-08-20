@@ -204,6 +204,29 @@ enum Command {
         /// Shell to generate completions for.
         shell: Shell,
     },
+    /// Inspect or automate the Docker network + Traefik container real
+    /// scale-to-zero (wake-on-request) needs — see `oxid infra status` and
+    /// `oxid infra setup`.
+    Infra {
+        #[command(subcommand)]
+        action: InfraAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InfraAction {
+    /// Read-only: reports whether the Docker network, the built-in Traefik
+    /// container, and this daemon's own wake-on-request wiring are in
+    /// place. Never creates or changes anything.
+    Status,
+    /// Idempotently creates the Docker network and starts the built-in
+    /// Traefik container if either is missing. Safe to re-run — an
+    /// already-satisfied step is left untouched, not recreated.
+    ///
+    /// This never touches the daemon's own container/labels: Docker can't
+    /// relabel a running container without recreating it, so that step is
+    /// only ever detected and reported, never automated.
+    Setup,
 }
 
 #[derive(Debug, Subcommand)]
@@ -654,6 +677,10 @@ async fn main() {
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
         }
+        Command::Infra { action } => match action {
+            InfraAction::Status => cmd_infra_status(&client, &base).await,
+            InfraAction::Setup => cmd_infra_setup(&client, &base).await,
+        },
     };
 
     if let Err(err) = result {
@@ -1582,10 +1609,10 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
         Err(err) => return Err(err),
     };
 
-    // Best-effort: `/api/v1/stats` needs the same auth as everything else,
-    // and predates on daemons old enough to 404 it, so its failure never
-    // fails `doctor` outright — it's capacity/version diagnostics, not a
-    // correctness gate.
+    // Best-effort: `/api/v1/stats` and `/api/v1/infra/status` need the same
+    // auth as everything else, and predate on daemons old enough to 404
+    // them, so their failure never fails `doctor` outright — they're
+    // capacity/config diagnostics, not a correctness gate.
     let node_stats = if auth_ok {
         match get_json(client, format!("{base}/api/v1/stats")).await {
             Ok(node_stats) => Some(Ok(node_stats)),
@@ -1594,6 +1621,12 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
     } else {
         None
     };
+    let infra = if auth_ok {
+        Some(get_json(client, format!("{base}/api/v1/infra/status")).await)
+    } else {
+        None
+    };
+
     if !emit_json(&json!({
         "reachable": true,
         "version": daemon_version,
@@ -1605,6 +1638,10 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
             Ok(node_stats) => node_stats.clone(),
             Err(e) => json!({ "error": e }),
         }),
+        "infra": infra.as_ref().map(|r| match r {
+            Ok(value) => value.clone(),
+            Err(e) => json!({ "error": e.message }),
+        }),
     })) {
         print_doctor_report(
             base,
@@ -1615,6 +1652,19 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
             auth_ok,
             node_stats.as_ref(),
         );
+        match infra.as_ref() {
+            Some(Ok(value)) => print_infra_report(value),
+            Some(Err(err)) if err.code == EXIT_NOT_FOUND => bg(
+                "OXID_DOCKER_NETWORK is not configured on this daemon — real scale-to-zero is \
+                 not active, using direct host-port publishing instead",
+            ),
+            Some(Err(err)) => bg(format!(
+                "Could not fetch infra status ({}) — the daemon may predate \
+                 `/api/v1/infra/status`; upgrade it to enable this check",
+                err.message
+            )),
+            None => {}
+        }
     }
     if !auth_ok {
         return Err(CliError::new(
@@ -1706,6 +1756,87 @@ async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// Read-only: `GET /api/v1/infra/status`. Never creates or changes
+/// anything on the daemon.
+async fn cmd_infra_status(client: &Client, base: &str) -> Result<(), CliError> {
+    let value = get_json(client, format!("{base}/api/v1/infra/status")).await?;
+    if !emit_json(&value) {
+        print_infra_report(&value);
+    }
+    Ok(())
+}
+
+/// `POST /api/v1/infra/bootstrap` — idempotent: creates the Docker network
+/// and/or starts the built-in Traefik container only if either is missing,
+/// otherwise reports what was already there. Safe to run repeatedly.
+async fn cmd_infra_setup(client: &Client, base: &str) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/infra/bootstrap");
+    let response = client
+        .post(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "infra setup failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&value) {
+        print_infra_report(&value);
+    }
+    Ok(())
+}
+
+/// Shared formatted-text rendering of an `InfraStatus` JSON body, used by
+/// both `oxid infra status` and `oxid infra setup` (their responses have
+/// the same shape).
+fn print_infra_report(value: &Value) {
+    let network = value["network"].as_str().unwrap_or("?");
+    if value["network_exists"].as_bool().unwrap_or(false) {
+        ok(format!("Docker network `{network}` exists"));
+    } else {
+        bg(format!("Docker network `{network}` does not exist"));
+    }
+
+    match value["traefik_status"].as_str().unwrap_or("missing") {
+        "running" => ok("Traefik is running"),
+        "paused" => bg("Traefik container exists but is paused"),
+        "stopped" => bg("Traefik container exists but is stopped"),
+        _ => bg("Traefik is not running"),
+    }
+
+    match value["self_wiring"]["state"].as_str().unwrap_or("unknown") {
+        "not_containerized" => bg("Daemon isn't running inside Docker — self-wiring check skipped"),
+        "detected" => {
+            let wiring = &value["self_wiring"];
+            let joined = wiring["joined_network"].as_bool().unwrap_or(false);
+            let labeled = wiring["has_traefik_enable_label"]
+                .as_bool()
+                .unwrap_or(false);
+            let wake = wiring["references_oxid_wake"].as_bool().unwrap_or(false);
+            if joined && labeled && wake {
+                ok("This daemon's own container is fully wired for wake-on-request");
+            } else {
+                bg("This daemon's own container is NOT fully wired for wake-on-request");
+            }
+        }
+        _ => bg("Could not determine this daemon's own container wiring"),
+    }
+
+    if let Some(steps) = value["next_steps"].as_array() {
+        for step in steps {
+            if let Some(step) = step.as_str() {
+                action(step);
+            }
+        }
+    }
 }
 
 async fn cmd_ps(
@@ -2166,6 +2297,28 @@ mod tests {
             Command::Completions { shell } => assert_eq!(shell, Shell::Zsh),
             other => panic!("expected Completions, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_infra_status_command() {
+        let cli = Cli::try_parse_from(["oxid", "infra", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Infra {
+                action: InfraAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_infra_setup_command() {
+        let cli = Cli::try_parse_from(["oxid", "infra", "setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Infra {
+                action: InfraAction::Setup
+            }
+        ));
     }
 
     #[test]

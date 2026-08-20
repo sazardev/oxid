@@ -129,6 +129,11 @@ pub fn router<
         .route("/api/v1/audit", get(recent_audit))
         .route("/api/v1/queue", get(list_queue))
         .route("/api/v1/stats", get(stats))
+        .route("/api/v1/infra/status", get(infra_status))
+        // Idempotent and safe to re-run: creates the Docker network/Traefik
+        // container only if missing, otherwise a no-op that just reports
+        // current status (see `ControlPlane::infra_bootstrap`).
+        .route("/api/v1/infra/bootstrap", post(infra_bootstrap))
         .route("/api/v1/backup", get(backup))
         .route("/api/v1/backup/restore", post(restore))
         .route(
@@ -590,6 +595,30 @@ async fn stats<
     State(state): State<ApiState<G, O>>,
 ) -> ApiResult<Json<crate::NodeStats>> {
     Ok(Json(state.cp.node_stats().await?))
+}
+
+/// Read-only: never creates or changes anything, just reports whether the
+/// Docker network/Traefik container/self-wiring the operator would
+/// otherwise have to set up by hand are actually in place.
+async fn infra_status<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Json<crate::InfraStatus>> {
+    Ok(Json(state.cp.infra_status().await?))
+}
+
+/// Idempotent and safe to re-run: creates the Docker network/Traefik
+/// container only if missing, then reports the same shape as
+/// `GET /api/v1/infra/status`.
+async fn infra_bootstrap<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Json<crate::InfraStatus>> {
+    Ok(Json(state.cp.infra_bootstrap().await?))
 }
 
 async fn register_project<
@@ -1496,6 +1525,8 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct FakeOci {
         calls: Arc<Mutex<Vec<String>>>,
+        /// Docker networks `ensure_network`/`network_exists` believe exist.
+        networks: Arc<Mutex<std::collections::HashSet<String>>>,
     }
 
     impl ContainerPort for FakeOci {
@@ -1579,6 +1610,40 @@ mod tests {
                 cpu_count: 4,
             })
         }
+        async fn network_exists(&self, name: &str) -> Result<bool, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("network_exists:{name}"));
+            Ok(self.networks.lock().unwrap().contains(name))
+        }
+        async fn ensure_network(&self, name: &str) -> Result<oxid_core::NetworkStatus, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ensure_network:{name}"));
+            if self.networks.lock().unwrap().insert(name.to_owned()) {
+                Ok(oxid_core::NetworkStatus::Created)
+            } else {
+                Ok(oxid_core::NetworkStatus::AlreadyExisted)
+            }
+        }
+        async fn ensure_traefik(
+            &self,
+            spec: oxid_core::TraefikSpec,
+        ) -> Result<oxid_core::TraefikStatus, OciError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("ensure_traefik:{}", spec.container_name));
+            Ok(oxid_core::TraefikStatus::Created)
+        }
+        async fn self_wiring_status(
+            &self,
+            _network: &str,
+        ) -> Result<oxid_core::SelfWiringStatus, OciError> {
+            Ok(oxid_core::SelfWiringStatus::NotContainerized)
+        }
     }
 
     /// A data dir with a dummy `secret.key`, for backup-endpoint tests.
@@ -1596,6 +1661,26 @@ mod tests {
         let oci = FakeOci::default();
         let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
             .with_readiness_check(false);
+        (
+            router(ApiState {
+                cp,
+                webhook_secret: Some("test-secret".to_owned()),
+                api_token: None,
+                data_dir: test_data_dir(),
+                allow_restore: true,
+                rate_limit: None,
+            }),
+            oci,
+        )
+    }
+
+    async fn test_app_with_traefik() -> (Router, FakeOci) {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let oci = FakeOci::default();
+        let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+            .with_readiness_check(false)
+            .with_traefik("oxid-net", "http://oxid-daemon:8080");
         (
             router(ApiState {
                 cp,
@@ -1843,6 +1928,48 @@ port = 8080
         // on this to know an environment's `url` isn't a reachable link
         // without Traefik fronting it (SPEC.md's direct-port-publish mode).
         assert_eq!(node_stats["traefik_enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn infra_status_requires_traefik_configured() {
+        let (app, _) = test_app().await;
+        let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("OXID_DOCKER_NETWORK")
+        );
+    }
+
+    #[tokio::test]
+    async fn infra_status_and_bootstrap_endpoints_round_trip() {
+        let (app, _) = test_app_with_traefik().await;
+
+        let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let before: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(before["network"], "oxid-net");
+        assert_eq!(before["network_exists"], false);
+
+        let (status, body) = json_request(&app, "POST", "/api/v1/infra/bootstrap", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let after_bootstrap: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(after_bootstrap["network_exists"], true);
+
+        // Idempotent: running it again through the API changes nothing and
+        // still succeeds.
+        let (status, body) = json_request(&app, "POST", "/api/v1/infra/bootstrap", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let second: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(second["network_exists"], true);
+
+        let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let after: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(after["network_exists"], true);
     }
 
     #[tokio::test]
