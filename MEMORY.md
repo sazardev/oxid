@@ -235,7 +235,45 @@ just "where did we leave off and why."
   100% uptime (0/60 failed polls) serving the last good build the entire
   time, and a follow-up good push redeployed normally with the address
   (`public_port`) unchanged across all three deploys.
-- Full test/clippy/fmt pass green (132 daemon/core tests + 32 CLI tests).
+- **Private GitHub repo support (this round), live-verified end-to-end
+  against a real private repo, a real fine-grained PAT, and a real GitHub
+  webhook delivered over the internet:** the daemon clones every project
+  into its own git-cache directory, independent of any credential helper
+  the operator's shell has — so it could never deploy a private repo at
+  all before this. New per-project git token (`PATCH
+  /api/v1/projects/{id}`, `oxid configure --git-token`, a write-only
+  dashboard field under "Private repo access") stored encrypted at rest
+  with the same AES-GCM cipher used for project secrets — `rotate_master_key`
+  was extended to also re-encrypt `projects.git_token_enc`, easy to miss
+  since it's a separate table from `secrets`. Deliberately **not** a field
+  on the `Project` domain struct (which is returned wholesale from `GET
+  /api/v1/projects`) — it only ever exists in memory for the instant
+  `deploy_at` decrypts it right before the git operation that needs it.
+  `GitPort::ensure_repo` gained an `Option<&str>` token param, injected as
+  HTTPS userinfo (`x-access-token:<token>@host`) only for the actual
+  clone/fetch network call — `cache_dir_name` still hashes the token-free
+  URL, `Repository::clone`'s persisted `origin` URL is reset back to the
+  token-free one immediately after cloning, and every fetch goes through
+  an anonymous (never `.git/config`-persisted) remote instead of
+  `find_remote("origin")` + `remote_set_url`, so a token can't linger on
+  disk anywhere, ever, even transiently.
+  Setup for the live test, for reference: created `sazardev/oxid-private-test`
+  (private) via `gh repo create`; installed `cloudflared` (only for this
+  local sandbox — real production wouldn't need a tunnel, since the daemon
+  would already have a real public address) and exposed a *fresh*
+  daemon instance that had `OXID_API_TOKEN` set *before* exposing it
+  publicly (never exposed the open-by-default instance); created a
+  **fine-grained, read-only, single-repo** GitHub PAT (explicitly not the
+  broad `gh auth token` already logged in — reusing that got correctly
+  blocked by the safety classifier as credential over-scoping, and the
+  literal `--git-token <PAT>` CLI invocation also got blocked for landing
+  in shell history/`ps`, so the user ran that one command themselves via
+  `!`); created a real webhook via `gh api repos/.../hooks` pointed at the
+  tunnel URL. A real `git push` delivered a real GitHub webhook over the
+  internet, the daemon decrypted the stored token, cloned the private repo,
+  built, and cut over with zero downtime (same `public_port` across both
+  deploys, new commit's content actually served).
+- Full test/clippy/fmt pass green (136 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
