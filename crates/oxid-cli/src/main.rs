@@ -1272,114 +1272,120 @@ async fn cmd_configure(
 /// no daemon round-trip, so it's synchronous unlike every other `cmd_*`.
 fn cmd_context(action: ContextAction) -> Result<(), CliError> {
     match action {
-        ContextAction::Add { name, api, token } => {
-            let mut cfg = config::load()?;
-            cfg.contexts
-                .insert(name.clone(), config::Context { api, token });
-            config::save(&cfg)?;
-            if !emit_json(&json!({ "context": name, "action": "added" })) {
-                ok(format!("Added context `{name}`"));
+        ContextAction::Add { name, api, token } => cmd_context_add(&name, api, token),
+        ContextAction::Use { name } => cmd_context_use(&name),
+        ContextAction::List => cmd_context_list(),
+        ContextAction::Current => cmd_context_current(),
+        ContextAction::Remove { name, force } => cmd_context_remove(&name, force),
+    }
+}
+
+fn cmd_context_add(name: &str, api: String, token: Option<String>) -> Result<(), CliError> {
+    let mut cfg = config::load()?;
+    cfg.contexts
+        .insert(name.to_owned(), config::Context { api, token });
+    config::save(&cfg)?;
+    if !emit_json(&json!({ "context": name, "action": "added" })) {
+        ok(format!("Added context `{name}`"));
+    }
+    Ok(())
+}
+
+fn cmd_context_use(name: &str) -> Result<(), CliError> {
+    let mut cfg = config::load()?;
+    if !cfg.contexts.contains_key(name) {
+        return Err(CliError::new(
+            format!(
+                "no such context `{name}` — add it first with `oxid context add {name} --api <url>`"
+            ),
+            EXIT_NOT_FOUND,
+        ));
+    }
+    cfg.current_context = Some(name.to_owned());
+    config::save(&cfg)?;
+    if !emit_json(&json!({ "context": name, "action": "activated" })) {
+        ok(format!("Switched to context `{name}`"));
+    }
+    Ok(())
+}
+
+fn cmd_context_list() -> Result<(), CliError> {
+    let cfg = config::load()?;
+    if emit_json(&json!(
+        cfg.contexts
+            .iter()
+            .map(|(name, ctx)| json!({
+                "name": name,
+                "api": ctx.api,
+                "token": ctx.token.as_deref().map(config::mask_token),
+                "current": cfg.current_context.as_deref() == Some(name.as_str()),
+            }))
+            .collect::<Vec<_>>()
+    )) {
+        return Ok(());
+    }
+    if cfg.contexts.is_empty() {
+        bg("No contexts configured yet. Add one with `oxid context add <name> --api <url>`.");
+        return Ok(());
+    }
+    println!("{:<4} {:<16} {:<32} TOKEN", "", "NAME", "API");
+    for (name, ctx) in &cfg.contexts {
+        let marker = if cfg.current_context.as_deref() == Some(name.as_str()) {
+            "*"
+        } else {
+            ""
+        };
+        let token = ctx
+            .token
+            .as_deref()
+            .map_or("-".to_owned(), config::mask_token);
+        println!("{marker:<4} {name:<16} {:<32} {token}", ctx.api);
+    }
+    Ok(())
+}
+
+fn cmd_context_current() -> Result<(), CliError> {
+    let cfg = config::load()?;
+    match &cfg.current_context {
+        Some(name) if cfg.contexts.contains_key(name) => {
+            if !emit_json(&json!({ "context": name })) {
+                println!("{name}");
             }
             Ok(())
         }
-        ContextAction::Use { name } => {
-            let mut cfg = config::load()?;
-            if !cfg.contexts.contains_key(&name) {
-                return Err(CliError::new(
-                    format!(
-                        "no such context `{name}` — add it first with `oxid context add {name} --api <url>`"
-                    ),
-                    EXIT_NOT_FOUND,
-                ));
-            }
-            cfg.current_context = Some(name.clone());
-            config::save(&cfg)?;
-            if !emit_json(&json!({ "context": name, "action": "activated" })) {
-                ok(format!("Switched to context `{name}`"));
-            }
-            Ok(())
-        }
-        ContextAction::List => {
-            let cfg = config::load()?;
-            if emit_json(&json!(
-                cfg.contexts
-                    .iter()
-                    .map(|(name, ctx)| json!({
-                        "name": name,
-                        "api": ctx.api,
-                        "token": ctx.token.as_deref().map(config::mask_token),
-                        "current": cfg.current_context.as_deref() == Some(name.as_str()),
-                    }))
-                    .collect::<Vec<_>>()
-            )) {
-                return Ok(());
-            }
-            if cfg.contexts.is_empty() {
-                bg(
-                    "No contexts configured yet. Add one with `oxid context add <name> --api <url>`.",
-                );
-                return Ok(());
-            }
-            println!("{:<4} {:<16} {:<32} TOKEN", "", "NAME", "API");
-            for (name, ctx) in &cfg.contexts {
-                let marker = if cfg.current_context.as_deref() == Some(name.as_str()) {
-                    "*"
-                } else {
-                    ""
-                };
-                let token = ctx
-                    .token
-                    .as_deref()
-                    .map_or("-".to_owned(), config::mask_token);
-                println!("{marker:<4} {name:<16} {:<32} {token}", ctx.api);
-            }
-            Ok(())
-        }
-        ContextAction::Current => {
-            let cfg = config::load()?;
-            match &cfg.current_context {
-                Some(name) if cfg.contexts.contains_key(name) => {
-                    if !emit_json(&json!({ "context": name })) {
-                        println!("{name}");
-                    }
-                    Ok(())
-                }
-                _ => {
-                    if !emit_json(&json!({ "context": Value::Null })) {
-                        bg("No active context (using --api/OXID_API/default).");
-                    }
-                    Ok(())
-                }
-            }
-        }
-        ContextAction::Remove { name, force } => {
-            let mut cfg = config::load()?;
-            if !cfg.contexts.contains_key(&name) {
-                return Err(CliError::new(
-                    format!("no such context `{name}`"),
-                    EXIT_NOT_FOUND,
-                ));
-            }
-            let is_active = cfg.current_context.as_deref() == Some(name.as_str());
-            if is_active && !force {
-                return Err(
-                    format!(
-                        "`{name}` is the active context — pass --force to remove it anyway (falls back to --api/OXID_API/default)"
-                    )
-                    .into(),
-                );
-            }
-            cfg.contexts.remove(&name);
-            if is_active {
-                cfg.current_context = None;
-            }
-            config::save(&cfg)?;
-            if !emit_json(&json!({ "context": name, "action": "removed" })) {
-                ok(format!("Removed context `{name}`"));
+        _ => {
+            if !emit_json(&json!({ "context": Value::Null })) {
+                bg("No active context (using --api/OXID_API/default).");
             }
             Ok(())
         }
     }
+}
+
+fn cmd_context_remove(name: &str, force: bool) -> Result<(), CliError> {
+    let mut cfg = config::load()?;
+    if !cfg.contexts.contains_key(name) {
+        return Err(CliError::new(
+            format!("no such context `{name}`"),
+            EXIT_NOT_FOUND,
+        ));
+    }
+    let is_active = cfg.current_context.as_deref() == Some(name);
+    if is_active && !force {
+        return Err(format!(
+            "`{name}` is the active context — pass --force to remove it anyway (falls back to --api/OXID_API/default)"
+        )
+        .into());
+    }
+    cfg.contexts.remove(name);
+    if is_active {
+        cfg.current_context = None;
+    }
+    config::save(&cfg)?;
+    if !emit_json(&json!({ "context": name, "action": "removed" })) {
+        ok(format!("Removed context `{name}`"));
+    }
+    Ok(())
 }
 
 async fn cmd_queue(client: &Client, base: &str) -> Result<(), CliError> {
@@ -1600,52 +1606,15 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
             Err(e) => json!({ "error": e }),
         }),
     })) {
-        ok(format!(
-            "Daemon reachable at {base} (v{daemon_version}, {}ms)",
-            latency.as_millis()
-        ));
-        if auth_ok {
-            ok("Control API authenticates correctly");
-        } else {
-            bg(
-                "Control API requires a token that wasn't provided/didn't work — pass --token or set OXID_TOKEN",
-            );
-        }
-        if version_mismatch {
-            bg(format!(
-                "CLI is v{cli_version} but daemon is v{daemon_version} (major version mismatch) \
-                 — upgrade whichever is older; a mismatch across major versions may break API compatibility"
-            ));
-        } else if daemon_version != "unknown" {
-            ok(format!(
-                "CLI (v{cli_version}) and daemon (v{daemon_version}) versions match"
-            ));
-        }
-        match &node_stats {
-            Some(Ok(node_stats)) => {
-                let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
-                let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
-                if mem_bytes == 0 || cpus == 0 {
-                    bg(
-                        "Daemon reports 0 host memory/CPUs — its Docker socket may be \
-                         unreachable; check OXID's container has /var/run/docker.sock mounted \
-                         and the daemon user can access it",
-                    );
-                } else {
-                    #[allow(clippy::cast_precision_loss)]
-                    let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    ok(format!(
-                        "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
-                        node_stats["environments_running"].as_u64().unwrap_or(0),
-                    ));
-                }
-            }
-            Some(Err(message)) => bg(format!(
-                "Could not fetch capacity stats ({message}) — the daemon may predate \
-                 `/api/v1/stats`; upgrade it to enable this check"
-            )),
-            None => {}
-        }
+        print_doctor_report(
+            base,
+            &daemon_version,
+            cli_version,
+            version_mismatch,
+            latency,
+            auth_ok,
+            node_stats.as_ref(),
+        );
     }
     if !auth_ok {
         return Err(CliError::new(
@@ -1654,6 +1623,63 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
         ));
     }
     Ok(())
+}
+
+fn print_doctor_report(
+    base: &str,
+    daemon_version: &str,
+    cli_version: &str,
+    version_mismatch: bool,
+    latency: std::time::Duration,
+    auth_ok: bool,
+    node_stats: Option<&Result<Value, String>>,
+) {
+    ok(format!(
+        "Daemon reachable at {base} (v{daemon_version}, {}ms)",
+        latency.as_millis()
+    ));
+    if auth_ok {
+        ok("Control API authenticates correctly");
+    } else {
+        bg(
+            "Control API requires a token that wasn't provided/didn't work — pass --token or set OXID_TOKEN",
+        );
+    }
+    if version_mismatch {
+        bg(format!(
+            "CLI is v{cli_version} but daemon is v{daemon_version} (major version mismatch) \
+             — upgrade whichever is older; a mismatch across major versions may break API compatibility"
+        ));
+    } else if daemon_version != "unknown" {
+        ok(format!(
+            "CLI (v{cli_version}) and daemon (v{daemon_version}) versions match"
+        ));
+    }
+    match node_stats {
+        Some(Ok(node_stats)) => {
+            let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
+            let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
+            if mem_bytes == 0 || cpus == 0 {
+                bg(
+                    "Daemon reports 0 host memory/CPUs — its Docker socket may be \
+                     unreachable; check OXID's container has /var/run/docker.sock mounted \
+                     and the daemon user can access it",
+                );
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                ok(format!(
+                    "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
+                    node_stats["environments_running"].as_u64().unwrap_or(0),
+                ));
+            }
+        }
+        Some(Err(message)) => bg(format!(
+            "Could not fetch capacity stats ({message}) — the daemon may predate \
+             `/api/v1/stats`; upgrade it to enable this check"
+        )),
+        None => {}
+    }
 }
 
 async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
