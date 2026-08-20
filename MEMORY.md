@@ -191,7 +191,51 @@ just "where did we leave off and why."
   the audit trail and in each environment's history tab — live-verified
   against the playground's real build events (values like `1.0s`/`0ms`,
   `–` for non-build event kinds).
-- Full test/clippy/fmt pass green (131 daemon/core tests + 32 CLI tests).
+- **Zero-downtime redeploys (this round), live-verified against real Docker
+  with continuous polling during real pushes:** explicit, emphatic ask
+  after seeing a redeploy work but wanting "0 caidas 0 defecto siempre
+  elvantando algo para no tener fallas." Root cause: `deploy_at` destroyed
+  the previous container *before* building/starting the new one — always a
+  real gap — and in direct-publish mode the branch's address (`host_port`)
+  changes on every redeploy anyway, so even a perfectly-timed swap would
+  still break anyone already connected. Fixed at the root, not papered
+  over: a redeploy now builds and starts the new instance fully (a
+  per-deployment-unique container name — `Environment.container_name`,
+  migration `0007` — so old and new coexist briefly without colliding),
+  waits for it to actually accept TCP connections
+  (`service/proxy.rs::wait_until_ready`, direct-publish mode only — Traefik
+  mode already gets this ordering benefit for free since containers
+  join/leave behind a stable `Host()` rule), *then* cuts traffic over and
+  only *then* removes the previous container. A failed redeploy cleans up
+  only the new (half-started) container and leaves the previous one running
+  exactly as it was — a bad push can never take an already-live branch down
+  with it (new regression test
+  `failed_redeploy_leaves_the_previous_instance_untouched`).
+  New built-in per-branch TCP reverse proxy (`service/proxy.rs`,
+  `ProxyRegistry`) gives every branch a stable `public_port` in
+  direct-publish mode — bound once, persisted (`Environment.public_port`),
+  reused across every redeploy, with its upstream target swapped atomically
+  at cutover — so the branch's *address* no longer changes either, on top
+  of there being no gap. Rebuilt on daemon restart from the persisted port
+  (`reconcile_startup_state`), released on pause (`mark_unavailable`, fails
+  fast instead of hanging), destroy (`remove`), and re-armed on wake.
+  Found and fixed a real bug surfaced by this change: `find_environment_by_branch`
+  picked the highest-`id` row regardless of state, so a *failed* redeploy
+  (which creates a higher-id `Destroyed` row) could shadow an
+  actually-still-`Running` older row — silently breaking the webhook
+  branch-deletion handler and `deploy_at`'s own "is there a previous live
+  instance to protect" check. Now prefers the highest-id *live* row, falling
+  back to the highest-id row overall only when nothing is live.
+  Live-verified end-to-end on the real playground (real git pushes, real
+  Docker, real `nginx` containers): pushed a content change to `main` while
+  polling its stable port every 50ms — 200/200 requests returned 200, and
+  the served content changed to the new commit, proving a real cutover (not
+  just the old container surviving); then pushed a deliberately broken
+  Dockerfile — the deploy failed with a real Docker error, `main` stayed at
+  100% uptime (0/60 failed polls) serving the last good build the entire
+  time, and a follow-up good push redeployed normally with the address
+  (`public_port`) unchanged across all three deploys.
+- Full test/clippy/fmt pass green (132 daemon/core tests + 32 CLI tests).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
