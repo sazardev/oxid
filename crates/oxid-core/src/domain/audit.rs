@@ -23,6 +23,14 @@ pub struct AuditEvent {
     /// `None` for the master `OXID_API_TOKEN` or system-initiated events
     /// (the GC sweep).
     pub operator: Option<String>,
+    /// The `X-Request-Id` of the HTTP request that caused this event, when
+    /// there was one — lets an operator correlate a single request across
+    /// structured logs (`request_id=<id>`) and the audit trail (`WHERE
+    /// request_id = <id>`). `None` for system-initiated events (the GC
+    /// sweep, the deploy-queue retry pass) which have no originating
+    /// request.
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -55,6 +63,17 @@ impl AuditEvent {
             detail,
             occurred_at,
             operator,
+            request_id: None,
         }
+    }
+
+    /// Attaches the originating request's id. A separate chained setter
+    /// rather than a third constructor, so [`Self::new`]/[`Self::with_operator`]
+    /// (and the many existing call sites/tests using them) keep compiling
+    /// unchanged.
+    #[must_use]
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
     }
 }

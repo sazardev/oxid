@@ -12,16 +12,17 @@ use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
-    AuditEvent, AuditStore, Branch, BranchName, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
-    ContainerStatus, Dependency, DomainError, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, EnvironmentStore, GitError, GitPort, LogStream, OciError, OffsetDateTime,
-    PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore,
-    SecretValue, StateTransition, Ttl,
+    AuditEvent, AuditFilter, AuditStore, Branch, BranchName, BuildSpec, CommitRef, ContainerPort,
+    ContainerSpec, ContainerStatus, Dependency, DomainError, EnvVarScope, Environment,
+    EnvironmentId, EnvironmentState, EnvironmentStore, GitError, GitPort, LogStream, OciError,
+    OffsetDateTime, PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl,
+    RepositoryError, SecretStore, SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::config::{self, ConfigError};
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
+use crate::request_context::current_request_id;
 
 /// Errors surfaced by the control plane.
 #[derive(Debug, thiserror::Error)]
@@ -464,6 +465,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
+    #[tracing::instrument(skip(self), fields(%project_id, %branch))]
     pub async fn deploy(
         &self,
         project_id: ProjectId,
@@ -486,6 +488,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
+    #[tracing::instrument(skip(self, operator), fields(%project_id, %branch, ?operator))]
     pub async fn deploy_with_operator(
         &self,
         project_id: ProjectId,
@@ -515,6 +518,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure, or
     /// [`CpError::InsufficientCapacity`] if the request can never fit.
+    #[tracing::instrument(skip(self, operator), fields(%project_id, %branch, ?operator))]
     pub async fn deploy_or_queue(
         &self,
         project_id: ProjectId,
@@ -594,6 +598,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
     #[allow(clippy::too_many_lines)]
+    #[tracing::instrument(skip(self, sha_override, operator), fields(%project_id, %branch, ?operator, check_admission))]
     async fn deploy_at(
         &self,
         project_id: ProjectId,
@@ -602,6 +607,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         operator: Option<String>,
         check_admission: bool,
     ) -> Result<DeployOutcome, CpError> {
+        tracing::info!(%project_id, %branch, "deploy started");
         // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
         // comment for the two race conditions this closes) — admission
         // control is decided under the same lock as the deploy it gates,
@@ -626,6 +632,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .iter()
                 .position(|q| q.id == queue_id)
                 .map_or(1, |i| i as u64 + 1);
+            tracing::info!(%project_id, %branch, position, "deploy queued (insufficient host capacity)");
             return Ok(DeployOutcome::Queued { position });
         }
 
@@ -734,16 +741,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 let _ = EnvironmentStore::update(&self.store, &env).await;
                 let _ = self
                     .store
-                    .record(&AuditEvent::with_operator(
-                        u64::try_from(now.unix_timestamp()).unwrap_or_default(),
-                        env.id,
-                        StateTransition::BuildFailed,
-                        Some(err.to_string()),
-                        now,
-                        operator.clone(),
-                    ))
+                    .record(
+                        &AuditEvent::with_operator(
+                            u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                            env.id,
+                            StateTransition::BuildFailed,
+                            Some(err.to_string()),
+                            now,
+                            operator.clone(),
+                        )
+                        .with_request_id(current_request_id()),
+                    )
                     .await;
             }
+            tracing::error!(%project_id, %branch, environment_id = %env.id, error = %err, "deploy failed");
             return Err(err);
         }
 
@@ -758,6 +769,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
 
+        tracing::info!(%project_id, %branch, environment_id = %env.id, "deploy succeeded");
         Ok(DeployOutcome::Deployed(env))
     }
 
@@ -1001,14 +1013,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map_err(|e| state_err(&e))?;
         EnvironmentStore::update(&self.store, env).await?;
         self.store
-            .record(&AuditEvent::with_operator(
-                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
-                env.id,
-                StateTransition::BuildSucceeded,
-                Some(name),
-                now,
-                operator.map(str::to_owned),
-            ))
+            .record(
+                &AuditEvent::with_operator(
+                    u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                    env.id,
+                    StateTransition::BuildSucceeded,
+                    Some(name),
+                    now,
+                    operator.map(str::to_owned),
+                )
+                .with_request_id(current_request_id()),
+            )
             .await?;
         Ok(())
     }
@@ -1148,6 +1163,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
+    #[tracing::instrument(skip(self), fields(%environment_id))]
     pub async fn pause(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
         let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
@@ -1167,6 +1183,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         env.transition(StateTransition::IdleTimeout, now)
             .map_err(|e| state_err(&e))?;
         EnvironmentStore::update(&self.store, &env).await?;
+        tracing::info!(%environment_id, "environment paused");
         Ok(())
     }
 
@@ -1177,6 +1194,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
+    #[tracing::instrument(skip(self), fields(%environment_id))]
     pub async fn wake(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
         self.wake_env(environment_id).await
     }
@@ -1265,6 +1283,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
         EnvironmentStore::update(&self.store, &env).await?;
+        tracing::info!(%environment_id, "environment woken");
         Ok(())
     }
 
@@ -1279,6 +1298,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
+    #[tracing::instrument(skip(self), fields(%environment_id, purge_secrets))]
     pub async fn destroy(
         &self,
         environment_id: EnvironmentId,
@@ -1293,6 +1313,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Same as [`Self::destroy`].
+    #[tracing::instrument(skip(self, operator), fields(%environment_id, purge_secrets, ?operator))]
     pub async fn destroy_with_operator(
         &self,
         environment_id: EnvironmentId,
@@ -1333,15 +1354,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map_err(|e| state_err(&e))?;
         EnvironmentStore::update(&self.store, &env).await?;
         self.store
-            .record(&AuditEvent::with_operator(
-                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
-                env.id,
-                StateTransition::Destroy,
-                None,
-                now,
-                operator,
-            ))
+            .record(
+                &AuditEvent::with_operator(
+                    u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                    env.id,
+                    StateTransition::Destroy,
+                    None,
+                    now,
+                    operator,
+                )
+                .with_request_id(current_request_id()),
+            )
             .await?;
+        tracing::info!(%environment_id, "environment destroyed");
         Ok(())
     }
 
@@ -1511,12 +1536,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Returns the most recent audit events across every project, newest
     /// first — an operator-facing view of `AuditStore`, which until now was
     /// write-only (recorded on every deploy/pause/wake/destroy but never
-    /// exposed over the API).
+    /// exposed over the API). `filter` narrows by project/branch/time
+    /// range/transition kind and caps the page size — see [`AuditFilter`].
     ///
     /// # Errors
     /// Returns [`CpError`] on storage failure.
-    pub async fn recent_audit_events(&self, limit: u64) -> Result<Vec<AuditEvent>, CpError> {
-        Ok(AuditStore::list_recent(&self.store, limit).await?)
+    pub async fn recent_audit_events(
+        &self,
+        filter: &AuditFilter,
+    ) -> Result<Vec<AuditEvent>, CpError> {
+        Ok(AuditStore::list_recent(&self.store, filter).await?)
     }
 
     /// Lists every deploy currently waiting for host capacity, oldest
@@ -1560,7 +1589,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(stats)
     }
 
-    /// Returns an environment's full audit history, oldest first.
+    /// Returns an environment's full audit history, oldest first. `filter`'s
+    /// `since`/`until`/`kind` narrow it further; its `project_id`/`branch`/
+    /// `limit` are ignored (see [`AuditFilter`] and
+    /// `AuditStore::list_by_environment`'s doc comment).
     ///
     /// # Errors
     /// Returns [`CpError::NotFound`] if the environment doesn't exist, plus
@@ -1568,9 +1600,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     pub async fn audit_events_for(
         &self,
         environment_id: EnvironmentId,
+        filter: &AuditFilter,
     ) -> Result<Vec<AuditEvent>, CpError> {
         self.ensure_environment(environment_id).await?;
-        Ok(AuditStore::list_by_environment(&self.store, environment_id).await?)
+        Ok(AuditStore::list_by_environment(&self.store, environment_id, filter).await?)
     }
 
     /// Stores or replaces a secret at the given scope
@@ -1649,6 +1682,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] only if listing environments or projects fails.
+    #[tracing::instrument(skip(self, now))]
     pub async fn sweep(&self, now: OffsetDateTime) -> Result<GcSummary, CpError> {
         let mut summary = GcSummary::default();
         if self.docker_network.is_none() {
@@ -2760,7 +2794,10 @@ port = 8080
         // allocated"), not a blank `detail` — found live when a real
         // deploy failure showed up in the dashboard with no way to tell
         // what actually went wrong.
-        let events = cp.audit_events_for(envs[0].id).await.unwrap();
+        let events = cp
+            .audit_events_for(envs[0].id, &AuditFilter::default())
+            .await
+            .unwrap();
         let failed = events
             .iter()
             .find(|e| e.kind == StateTransition::BuildFailed)

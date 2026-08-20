@@ -34,6 +34,7 @@ hex.workspace = true
 aes-gcm.workspace = true
 rand.workspace = true
 url.workspace = true
+time.workspace = true
 yaml-rust2 = "0.12.0"
 # `tls-rustls-no-provider` + `rustls/ring` instead of the `tls-rustls`
 # feature's default (`rustls/aws-lc-rs`) — `ring` is a pure-Rust crypto
@@ -45,8 +46,17 @@ axum-server = { version = "0.8.0", default-features = false, features = [
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tower_governor = { version = "0.8.0", default-features = false, features = ["axum"] }
 arc-swap = "1.9.2"
+# Structured logging (see `main.rs::init_tracing`): level via `RUST_LOG`,
+# format (`pretty`/`json`) via `OXID_LOG_FORMAT`.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# `catch-panic`: turns a handler panic into a logged 500 instead of a dropped
+# connection (see `api.rs`'s `CatchPanicLayer`/`handle_panic`).
+tower-http = { version = "0.6", default-features = false, features = ["catch-panic"] }
+# Generates the per-request `X-Request-Id` when a client doesn't supply one
+# (see `api.rs`'s `request_id_middleware`).
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tower.workspace = true
 tempfile = "3"
-time.workspace = true

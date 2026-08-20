@@ -24,25 +24,27 @@ where
         match cp.sweep(OffsetDateTime::now_utc()).await {
             Ok(summary) => {
                 if summary.paused > 0 || summary.hibernated > 0 || summary.destroyed > 0 {
-                    println!(
-                        "[gc] paused={} hibernated={} destroyed={}",
-                        summary.paused, summary.hibernated, summary.destroyed
+                    tracing::info!(
+                        paused = summary.paused,
+                        hibernated = summary.hibernated,
+                        destroyed = summary.destroyed,
+                        "gc sweep completed"
                     );
                 }
                 for (id, err) in &summary.errors {
-                    eprintln!("[gc] environment `{id}` sweep failed: {err}");
+                    tracing::warn!(environment_id = %id, error = %err, "gc sweep failed for environment");
                 }
             }
-            Err(err) => eprintln!("[gc] sweep failed: {err}"),
+            Err(err) => tracing::error!(error = %err, "gc sweep failed"),
         }
 
         match cp.retry_queued_deploys().await {
             Ok(failures) => {
                 for (id, err) in &failures {
-                    eprintln!("[queue] queued deploy `{id}` failed to redeploy: {err}");
+                    tracing::warn!(queue_id = id, error = %err, "queued deploy failed to redeploy");
                 }
             }
-            Err(err) => eprintln!("[queue] retry pass failed: {err}"),
+            Err(err) => tracing::error!(error = %err, "deploy queue retry pass failed"),
         }
     }
 }

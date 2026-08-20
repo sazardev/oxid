@@ -109,6 +109,36 @@ pub trait EnvironmentStore {
     async fn delete(&self, id: EnvironmentId) -> Result<(), RepositoryError>;
 }
 
+/// Filters accepted by [`AuditStore::list_recent`]/[`AuditStore::list_by_environment`].
+///
+/// Every field is optional and additive (`AND`ed together) — `Default`
+/// (no filters, `limit` falls back to the store's own default) preserves
+/// the pre-filter behavior of both methods. `project_id`/`branch` only
+/// apply to [`AuditStore::list_recent`] (an environment audit query is
+/// already scoped to one environment, hence one project/branch) —
+/// adapters must ignore them in [`AuditStore::list_by_environment`].
+///
+/// Query-param names on `GET /api/v1/audit` and
+/// `GET /api/v1/environments/{id}/audit` mirror these field names exactly
+/// (`project_id`, `branch`, `since`, `until`, `kind`, `limit`) — see
+/// `oxid-daemon/src/api.rs`'s `AuditQuery`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditFilter {
+    /// Only events belonging to environments of this project.
+    pub project_id: Option<ProjectId>,
+    /// Only events belonging to environments of this branch.
+    pub branch: Option<String>,
+    /// Only events at or after this instant (inclusive).
+    pub since: Option<time::OffsetDateTime>,
+    /// Only events at or before this instant (inclusive).
+    pub until: Option<time::OffsetDateTime>,
+    /// Only events of this transition kind.
+    pub kind: Option<crate::domain::state::StateTransition>,
+    /// Caps the number of returned rows. `None` means "use the store's own
+    /// default" (adapters should still cap this to something sane).
+    pub limit: Option<u64>,
+}
+
 /// Persistence contract for the audit trail.
 #[trait_variant::make(Send)]
 pub trait AuditStore {
@@ -117,19 +147,24 @@ pub trait AuditStore {
     /// # Errors
     /// Any storage failure.
     async fn record(&self, event: &AuditEvent) -> Result<(), RepositoryError>;
-    /// Lists events of one environment, oldest first.
+    /// Lists events of one environment, oldest first, optionally narrowed by
+    /// `filter.since`/`filter.until`/`filter.kind` (`filter.project_id`/
+    /// `filter.branch`/`filter.limit` are ignored — see [`AuditFilter`]).
     ///
     /// # Errors
     /// Any storage failure.
     async fn list_by_environment(
         &self,
         environment_id: EnvironmentId,
+        filter: &AuditFilter,
     ) -> Result<Vec<AuditEvent>, RepositoryError>;
-    /// Lists the most recent `limit` events, newest first.
+    /// Lists the most recent events across every environment, newest first,
+    /// narrowed by every field of `filter` (`filter.limit` defaults to the
+    /// adapter's own default when `None`).
     ///
     /// # Errors
     /// Any storage failure.
-    async fn list_recent(&self, limit: u64) -> Result<Vec<AuditEvent>, RepositoryError>;
+    async fn list_recent(&self, filter: &AuditFilter) -> Result<Vec<AuditEvent>, RepositoryError>;
 }
 
 // ---------------------------------------------------------------------------

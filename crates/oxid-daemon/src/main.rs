@@ -8,6 +8,11 @@
 //!   When unset, a key is generated and persisted to `/data/secret.key`.
 //! - `OXID_WEBHOOK_SECRET` — shared secret verifying GitHub webhook signatures.
 //!   Webhooks are rejected while unset.
+//! - `RUST_LOG` — `tracing-subscriber` `EnvFilter` syntax (default `info`),
+//!   e.g. `oxid_daemon=debug,info`.
+//! - `OXID_LOG_FORMAT` — `pretty` (default, human-readable/colorized) or
+//!   `json` (one JSON object per line) for the structured log output; use
+//!   `json` in production so a log aggregator can parse fields directly.
 //! - `OXID_DOCKER_NETWORK` — docker network shared with Traefik and this
 //!   daemon. When set, deployed containers join it and skip publishing a
 //!   host port, reachable instead via a Traefik `Host()` subdomain
@@ -104,6 +109,8 @@ use oxid_daemon::adapter::git::GitClient;
 use oxid_daemon::adapter::oci::DockerClient;
 use oxid_daemon::adapter::store::SqliteStore;
 use oxid_daemon::api::{ApiState, router};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 const DEFAULT_DATA_DIR: &str = "/data";
 const DEFAULT_ADDR: &str = "0.0.0.0:8080";
@@ -111,6 +118,7 @@ const DEFAULT_GC_INTERVAL_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let data_dir = std::env::var("OXID_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_owned());
     let addr = std::env::var("OXID_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
     let gc_interval_secs = std::env::var("OXID_GC_INTERVAL_SECS")
@@ -186,10 +194,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(errors) if errors.is_empty() => {}
         Ok(errors) => {
             for (env_id, message) in errors {
-                println!("[~] startup reconciliation issue for environment {env_id}: {message}");
+                tracing::warn!(environment_id = %env_id, message = %message, "startup reconciliation issue");
             }
         }
-        Err(e) => println!("[~] startup reconciliation failed: {e}"),
+        Err(e) => tracing::error!(error = %e, "startup reconciliation failed"),
     }
 
     tokio::spawn(oxid_daemon::service::scheduler::run(
@@ -200,8 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let webhook_secret = std::env::var("OXID_WEBHOOK_SECRET").ok();
     let api_token = std::env::var("OXID_API_TOKEN").ok();
     if api_token.is_none() {
-        println!(
-            "[~] OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
+        tracing::warn!(
+            "OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
         );
     }
     let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
@@ -232,8 +240,11 @@ async fn serve(
         let socket_addr: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
-        println!(
-            "[>] oxid daemon listening on https://{addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
+        tracing::info!(
+            %addr,
+            %data_dir,
+            gc_interval_secs,
+            "oxid daemon listening on https"
         );
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -249,8 +260,11 @@ async fn serve(
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        println!(
-            "[>] oxid daemon listening on {addr} (data: {data_dir}, gc every {gc_interval_secs}s)"
+        tracing::info!(
+            %addr,
+            %data_dir,
+            gc_interval_secs,
+            "oxid daemon listening on http"
         );
         // `axum::serve(...).with_graceful_shutdown(fut)` only decides *when*
         // to stop accepting new connections — once `fut` resolves, it still
@@ -276,7 +290,7 @@ async fn serve(
                     .await
                     .is_err()
                 {
-                    eprintln!("[~] graceful shutdown timed out after 10s, forcing exit");
+                    tracing::error!("graceful shutdown timed out after 10s, forcing exit");
                 }
             }
         }
@@ -310,7 +324,30 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
-    println!("[~] shutdown signal received, draining in-flight requests...");
+    tracing::info!("shutdown signal received, draining in-flight requests...");
+}
+
+/// Initializes the global `tracing` subscriber — must run before anything
+/// else logs. Level is `RUST_LOG` (standard `tracing-subscriber`
+/// env-filter syntax, e.g. `oxid_daemon=debug,info`), defaulting to `info`
+/// when unset. Format is `OXID_LOG_FORMAT`: `pretty` (human-readable,
+/// colorized, the default — meant for a terminal/`docker logs` a person is
+/// watching) or `json` (one JSON object per line, with `request_id`/etc as
+/// structured fields) — **use `json` in production**, so a log aggregator
+/// (Loki, `CloudWatch`, whatever) can parse and index fields directly instead
+/// of regexing a human-oriented format.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json = std::env::var("OXID_LOG_FORMAT").as_deref() == Ok("json");
+    let registry = tracing_subscriber::registry().with(filter);
+    if json {
+        registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        registry.with(tracing_subscriber::fmt::layer()).init();
+    }
 }
 
 /// Best-effort: makes the Linux OOM killer less likely to pick this
@@ -369,7 +406,7 @@ fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::e
     if !staged_path.exists() {
         return Ok(());
     }
-    println!("[>] applying staged restore from {}", staged_path.display());
+    tracing::info!(path = %staged_path.display(), "applying staged restore");
     let file = std::fs::File::open(&staged_path)?;
     let mut archive = tar::Archive::new(file);
     for entry in archive.entries()? {
@@ -380,6 +417,6 @@ fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::e
         }
     }
     std::fs::remove_file(&staged_path)?;
-    println!("[+] restore applied; starting normally");
+    tracing::info!("restore applied; starting normally");
     Ok(())
 }

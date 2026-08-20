@@ -15,10 +15,10 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
-    AuditEvent, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError, EnvVarScope,
-    Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime, PoolKind,
-    Project, ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext,
-    SecretStore, SecretValue, StateTransition, Ttl,
+    AuditEvent, AuditFilter, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError,
+    EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime,
+    PoolKind, Project, ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError,
+    SecretContext, SecretStore, SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::crypto::{Cipher, CryptoError};
@@ -1005,7 +1005,13 @@ impl EnvironmentStore for SqliteStore {
 // audit mapping
 // ---------------------------------------------------------------------------
 
-const AUDIT_COLUMNS: &str = "id, environment_id, kind, detail, occurred_at, operator";
+const AUDIT_COLUMNS: &str = "audit_events.id, audit_events.environment_id, audit_events.kind, \
+    audit_events.detail, audit_events.occurred_at, audit_events.operator, \
+    audit_events.request_id";
+
+/// Fallback for [`AuditFilter::limit`] when unset — matches the API layer's
+/// own `DEFAULT_AUDIT_LIMIT` (kept in sync manually; see `api.rs`).
+const DEFAULT_LIST_RECENT_LIMIT: u64 = 50;
 
 fn audit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -1014,6 +1020,7 @@ fn audit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Repositor
     let detail: Option<String> = row.try_get("detail").map_err(storage)?;
     let occurred_at = ts_from_row(row, "occurred_at")?;
     let operator: Option<String> = row.try_get("operator").map_err(storage)?;
+    let request_id: Option<String> = row.try_get("request_id").map_err(storage)?;
 
     Ok(AuditEvent::with_operator(
         id,
@@ -1023,20 +1030,44 @@ fn audit_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Repositor
         detail,
         occurred_at,
         operator,
-    ))
+    )
+    .with_request_id(request_id))
+}
+
+/// Appends `AND audit_events.occurred_at >= ?`/`<= ?`/`AND
+/// audit_events.kind = ?` to `qb` for whichever of `filter.since`/
+/// `filter.until`/`filter.kind` are set — shared by both `AuditStore`
+/// methods below, since both accept the same three fields.
+fn push_common_audit_filters<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>,
+    filter: &'a AuditFilter,
+) {
+    if let Some(since) = filter.since {
+        qb.push(" AND audit_events.occurred_at >= ");
+        qb.push_bind(ts(&since));
+    }
+    if let Some(until) = filter.until {
+        qb.push(" AND audit_events.occurred_at <= ");
+        qb.push_bind(ts(&until));
+    }
+    if let Some(kind) = filter.kind {
+        qb.push(" AND audit_events.kind = ");
+        qb.push_bind(kind.to_string());
+    }
 }
 
 impl AuditStore for SqliteStore {
     async fn record(&self, event: &AuditEvent) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO audit_events (environment_id, kind, detail, occurred_at, operator) \
-                     VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO audit_events (environment_id, kind, detail, occurred_at, operator, request_id) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id_as_i64(event.environment_id.0))
         .bind(event.kind.to_string())
         .bind(event.detail.as_deref())
         .bind(ts(&event.occurred_at))
         .bind(event.operator.as_deref())
+        .bind(event.request_id.as_deref())
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -1046,27 +1077,42 @@ impl AuditStore for SqliteStore {
     async fn list_by_environment(
         &self,
         environment_id: EnvironmentId,
+        filter: &AuditFilter,
     ) -> Result<Vec<AuditEvent>, RepositoryError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {AUDIT_COLUMNS} FROM audit_events WHERE environment_id = ? \
-             ORDER BY occurred_at ASC, id ASC"
-        ))
-        .bind(id_as_i64(environment_id.0))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        // `project_id`/`branch`/`limit` are deliberately ignored here — an
+        // environment is already scoped to exactly one project/branch (see
+        // `AuditFilter`'s doc comment), and this endpoint has always
+        // returned an environment's *full* history, not a page of it.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "SELECT {AUDIT_COLUMNS} FROM audit_events WHERE audit_events.environment_id = "
+        ));
+        qb.push_bind(id_as_i64(environment_id.0));
+        push_common_audit_filters(&mut qb, filter);
+        qb.push(" ORDER BY audit_events.occurred_at ASC, audit_events.id ASC");
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(map_sqlx)?;
         rows.iter().map(audit_from_row).collect()
     }
 
-    async fn list_recent(&self, limit: u64) -> Result<Vec<AuditEvent>, RepositoryError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {AUDIT_COLUMNS} FROM audit_events ORDER BY occurred_at DESC, id DESC \
-             LIMIT ?"
-        ))
-        .bind(i64::try_from(limit).expect("limit fits in i64"))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+    async fn list_recent(&self, filter: &AuditFilter) -> Result<Vec<AuditEvent>, RepositoryError> {
+        // `project_id`/`branch` need a join against `environments` — an
+        // audit event only carries `environment_id`.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "SELECT {AUDIT_COLUMNS} FROM audit_events \
+             JOIN environments ON environments.id = audit_events.environment_id WHERE 1 = 1"
+        ));
+        if let Some(project_id) = filter.project_id {
+            qb.push(" AND environments.project_id = ");
+            qb.push_bind(id_as_i64(project_id.0));
+        }
+        if let Some(branch) = &filter.branch {
+            qb.push(" AND environments.branch_name = ");
+            qb.push_bind(branch.clone());
+        }
+        push_common_audit_filters(&mut qb, filter);
+        qb.push(" ORDER BY audit_events.occurred_at DESC, audit_events.id DESC LIMIT ");
+        let limit = filter.limit.unwrap_or(DEFAULT_LIST_RECENT_LIMIT);
+        qb.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        let rows = qb.build().fetch_all(&self.pool).await.map_err(map_sqlx)?;
         rows.iter().map(audit_from_row).collect()
     }
 }
@@ -1221,7 +1267,9 @@ const SECRET_COLUMNS: &str = "name, scope, value_enc";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxid_core::{AuditStore, EnvironmentStore, PoolKind, ProjectStore, StateTransition};
+    use oxid_core::{
+        AuditFilter, AuditStore, EnvironmentStore, PoolKind, ProjectStore, StateTransition,
+    };
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -1504,15 +1552,59 @@ mod tests {
         .await
         .unwrap();
 
-        let events = AuditStore::list_by_environment(&store, EnvironmentId(1))
-            .await
-            .unwrap();
+        let events =
+            AuditStore::list_by_environment(&store, EnvironmentId(1), &AuditFilter::default())
+                .await
+                .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, StateTransition::Woken);
 
-        let recent = AuditStore::list_recent(&store, 1).await.unwrap();
+        let recent = AuditStore::list_recent(
+            &store,
+            &AuditFilter {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].kind, StateTransition::IdleTimeout);
+
+        // `kind` filter narrows `list_recent` to just that transition.
+        let woken_only = AuditStore::list_recent(
+            &store,
+            &AuditFilter {
+                kind: Some(StateTransition::Woken),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(woken_only.len(), 1);
+        assert_eq!(woken_only[0].kind, StateTransition::Woken);
+
+        // `project_id` filter requires the `environments` join to work.
+        let by_project = AuditStore::list_recent(
+            &store,
+            &AuditFilter {
+                project_id: Some(ProjectId(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_project.len(), 2);
+        let by_other_project = AuditStore::list_recent(
+            &store,
+            &AuditFilter {
+                project_id: Some(ProjectId(2)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(by_other_project.is_empty());
     }
 
     #[tokio::test]

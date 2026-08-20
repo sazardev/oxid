@@ -2,12 +2,13 @@
 //!
 //! The CLI, TUI, dashboard and desktop app all consume this router.
 
+use std::any::Any;
 use std::convert::Infallible;
 use std::path::PathBuf;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -16,8 +17,9 @@ use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use oxid_core::{
-    BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId, EnvironmentState, GitPort,
-    PoolError, Project, ProjectId, RepositoryError, Ttl,
+    AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
+    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
+    Ttl,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,8 +27,19 @@ use sha2::Sha256;
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_governor::key_extractor::GlobalKeyExtractor;
+use tower_http::catch_panic::CatchPanicLayer;
 
+use crate::request_context::current_request_id;
 use crate::{ControlPlane, CpError, DeployOutcome};
+
+/// Header carrying the per-request correlation id (see
+/// [`request_id_middleware`]) — generated when a client doesn't supply one,
+/// echoed back on the response either way, and threaded through
+/// `tracing` spans/[`oxid_core::AuditEvent::request_id`] so an operator can
+/// grep structured logs for `request_id=<id>` and cross-reference `SELECT *
+/// FROM audit_events WHERE request_id = '<id>'` to see one request's whole
+/// story.
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Shared state injected into every handler.
 #[derive(Clone)]
@@ -163,7 +176,83 @@ pub fn router<
         // hard refresh or a shared deep link on any of those paths still
         // has to return `index.html`, not a 404.
         .fallback(get(dashboard_index))
+        // `CatchPanicLayer` first (innermost — applied to every route,
+        // including the fallback) so a handler panic never becomes a raw
+        // dropped connection; `request_id_middleware` wraps *that*
+        // (outermost) so the id it generates/reads is available both to
+        // `handle_panic`'s log line and to every normal response, panic or
+        // not. Layer application order in axum is "last `.layer()` call is
+        // outermost" — see this function's own ordering below.
+        .layer(CatchPanicLayer::custom(handle_panic))
+        .layer(middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// Reads (or, if absent/blank, generates) this request's `X-Request-Id`,
+/// makes it available for the rest of the request's execution via
+/// [`current_request_id`] (see `request_context`'s doc comment for why a
+/// `tokio::task_local!` rather than an explicit parameter threaded through
+/// every `ControlPlane` method), records it into a `tracing` span covering
+/// the whole request/response, and echoes it back as a response header —
+/// the three places an operator correlates a single request: the response
+/// itself, structured logs (`grep request_id=<id>`), and the audit trail
+/// (`WHERE request_id = '<id>'`).
+async fn request_id_middleware(request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_owned);
+
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let span = tracing::info_span!("http_request", request_id = %request_id, %method, %uri);
+
+    let mut response = {
+        use tracing::Instrument;
+        crate::request_context::scope(request_id.clone(), next.run(request))
+            .instrument(span)
+            .await
+    };
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
+}
+
+/// Converts a panicking handler into a `500` with the same `{"error": ...}`
+/// shape as [`ApiError`], instead of `tower-http`'s default plain-text body
+/// (or, without this layer at all, a dropped connection the client sees as
+/// a reset). Logs the panic message via `tracing::error!` tagged with this
+/// request's id (if any — [`current_request_id`] reads it from the span
+/// [`request_id_middleware`] set up, which wraps this layer) so it shows up
+/// in the same place every other request failure does.
+// `tower_http::catch_panic::ResponseForPanic`'s blanket impl requires this
+// exact `Fn(Box<dyn Any + Send>) -> Response` signature (taking the box by
+// value) — can't take `&Box<..>` instead as clippy's `pedantic` lint would
+// otherwise suggest.
+#[allow(clippy::needless_pass_by_value)]
+fn handle_panic(err: Box<dyn Any + Send + 'static>) -> Response {
+    let detail = if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else {
+        "unknown panic".to_owned()
+    };
+    let request_id = current_request_id();
+    tracing::error!(
+        request_id = request_id.as_deref().unwrap_or("-"),
+        panic = %detail,
+        "panic in request handler"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal server error", "request_id": request_id })),
+    )
+        .into_response()
 }
 
 /// Which credential a request authenticated with — attached to
@@ -277,11 +366,78 @@ pub struct DeployBody {
     pub branch: String,
 }
 
-/// Query for `GET /api/v1/audit`.
+/// Query for `GET /api/v1/audit` and `GET /api/v1/environments/{id}/audit`.
+///
+/// **Exact query-param names — `oxid-cli`'s `oxid audit
+/// --project/--branch/--since/--until/--kind` flags map onto these
+/// verbatim, so don't rename a field without updating the CLI side too:**
+/// - `project_id` — numeric project id. Only applies to `GET /api/v1/audit`
+///   (an environment's audit history is already scoped to one project).
+/// - `branch` — exact branch name (e.g. `main`, `feature-x`). Same
+///   `/api/v1/audit`-only scope as `project_id`.
+/// - `since` / `until` — RFC3339 timestamps (e.g.
+///   `2026-08-01T00:00:00Z`), inclusive on both ends. Apply to both
+///   endpoints.
+/// - `kind` — a [`StateTransition`] variant in `snake_case` (`build_succeeded`,
+///   `build_failed`, `idle_timeout`, `woken`, `deep_sleep`, `ttl_expired`,
+///   `destroy`). Apply to both endpoints.
+/// - `limit` — max rows, default 50. Only applies to `GET /api/v1/audit`
+///   (the environment endpoint has always returned the full history).
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditQuery {
-    /// Maximum number of events to return (default 50).
+    /// See the field-by-field breakdown above.
+    pub project_id: Option<u64>,
+    /// See the field-by-field breakdown above.
+    pub branch: Option<String>,
+    /// See the field-by-field breakdown above.
+    pub since: Option<String>,
+    /// See the field-by-field breakdown above.
+    pub until: Option<String>,
+    /// See the field-by-field breakdown above.
+    pub kind: Option<String>,
+    /// See the field-by-field breakdown above.
     pub limit: Option<u64>,
+}
+
+impl AuditQuery {
+    /// Parses the query-string values into a strongly-typed [`AuditFilter`],
+    /// rejecting an unparseable `since`/`until`/`kind` with `400` rather
+    /// than silently ignoring it.
+    fn into_filter(self) -> ApiResult<AuditFilter> {
+        let since = self
+            .since
+            .as_deref()
+            .map(parse_rfc3339)
+            .transpose()
+            .map_err(|e| ApiError::from_validation(format!("invalid `since`: {e}")))?;
+        let until = self
+            .until
+            .as_deref()
+            .map(parse_rfc3339)
+            .transpose()
+            .map_err(|e| ApiError::from_validation(format!("invalid `until`: {e}")))?;
+        let kind = self
+            .kind
+            .as_deref()
+            .map(|k| {
+                k.parse::<StateTransition>()
+                    .map_err(|e| ApiError::from_validation(format!("invalid `kind`: {e}")))
+            })
+            .transpose()?;
+        Ok(AuditFilter {
+            project_id: self.project_id.map(ProjectId),
+            branch: self.branch,
+            since,
+            until,
+            kind,
+            limit: self.limit,
+        })
+    }
+}
+
+/// Parses an RFC3339 timestamp (`since`/`until` query params).
+fn parse_rfc3339(raw: &str) -> Result<time::OffsetDateTime, time::error::Parse> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
 }
 
 /// Body for `POST /api/v1/projects/{id}/rollback`.
@@ -627,8 +783,9 @@ async fn recent_audit<
     State(state): State<ApiState<G, O>>,
     Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<Vec<oxid_core::AuditEvent>>> {
-    let limit = query.limit.unwrap_or(DEFAULT_AUDIT_LIMIT);
-    Ok(Json(state.cp.recent_audit_events(limit).await?))
+    let mut filter = query.into_filter()?;
+    filter.limit = Some(filter.limit.unwrap_or(DEFAULT_AUDIT_LIMIT));
+    Ok(Json(state.cp.recent_audit_events(&filter).await?))
 }
 
 /// Lists deploys currently waiting for host capacity (see
@@ -648,9 +805,14 @@ async fn environment_audit<
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    Query(query): Query<AuditQuery>,
 ) -> ApiResult<Json<Vec<oxid_core::AuditEvent>>> {
+    let filter = query.into_filter()?;
     Ok(Json(
-        state.cp.audit_events_for(EnvironmentId(env_id)).await?,
+        state
+            .cp
+            .audit_events_for(EnvironmentId(env_id), &filter)
+            .await?,
     ))
 }
 
@@ -2168,6 +2330,132 @@ port = 8080
         assert!(
             recent.iter().any(|e| e["environment_id"] == env.id.0),
             "{recent:?}"
+        );
+
+        // `kind`/`project_id` narrow `/api/v1/audit` to a subset.
+        let (status, body) =
+            json_request(&app, "GET", "/api/v1/audit?kind=build_succeeded", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let filtered: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            filtered
+                .iter()
+                .all(|e| e["kind"] == "build_succeeded" && e["environment_id"] == env.id.0),
+            "{filtered:?}"
+        );
+
+        let (status, body) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/audit?project_id={}", project.id.0 + 1).as_str(),
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let none: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(none.is_empty(), "{none:?}");
+
+        // An unparseable `kind`/`since` is a 400, not a silently-ignored filter.
+        let (status, _) =
+            json_request(&app, "GET", "/api/v1/audit?kind=not_a_kind", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) =
+            json_request(&app, "GET", "/api/v1/audit?since=not-a-date", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn deploy_request_id_is_correlated_into_the_audit_trail() {
+        let repo = repo_dir_with_config();
+        let (app, _) = test_app().await;
+        let (_, body) = json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": repo.path().display().to_string() }),
+        )
+        .await;
+        let project: Project = serde_json::from_slice(&body).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/projects/{}/deploy", project.id.0))
+                    .header("content-type", "application/json")
+                    .header("x-request-id", "trace-abc-123")
+                    .body(Body::from(json!({ "branch": "feature-login" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "trace-abc-123"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let env: Environment = serde_json::from_slice(&body).unwrap();
+
+        let (_, body) = json_request(
+            &app,
+            "GET",
+            format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+            json!({}),
+        )
+        .await;
+        let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e["request_id"] == "trace-abc-123" && e["kind"] == "build_succeeded"),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_a_request_id_header_and_echoes_a_provided_one() {
+        let (app, _) = test_app().await;
+
+        // No `X-Request-Id` sent: one is generated.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let generated = response
+            .headers()
+            .get("x-request-id")
+            .expect("x-request-id header present")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(!generated.is_empty());
+
+        // A caller-supplied id is echoed back unchanged.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/health")
+                    .header("x-request-id", "my-trace-id-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "my-trace-id-123"
         );
     }
 
