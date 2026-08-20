@@ -7,10 +7,13 @@
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
+
+mod config;
 
 /// Ephemeral environments that breathe. Ferrous performance, invisible footprint.
 #[derive(Debug, Parser)]
@@ -49,7 +52,16 @@ enum Command {
         to: Option<String>,
     },
     /// List environments for the project in the current directory.
-    Status,
+    Status {
+        /// Sort rows by `branch`, `state` or `updated` (deploy recency).
+        /// Default is server order (unsorted).
+        #[arg(long)]
+        sort: Option<SortKey>,
+        /// Keep only rows whose state matches exactly, or whose branch name
+        /// contains this text (case-insensitive).
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Destroy a branch's environment permanently.
     Down {
         /// Branch whose environment to destroy.
@@ -80,7 +92,17 @@ enum Command {
         branch: String,
     },
     /// List registered projects.
-    Ps,
+    Ps {
+        /// Sort rows by `branch`, `state` or `updated`. `Ps` only has
+        /// `branch`-equivalent (name) and no state/updated columns, but the
+        /// flag is accepted for symmetry with `status`; only `branch` has
+        /// an effect here.
+        #[arg(long)]
+        sort: Option<SortKey>,
+        /// Keep only rows whose name contains this text (case-insensitive).
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Manage environment variables / secrets.
     Env {
         #[command(subcommand)]
@@ -104,6 +126,28 @@ enum Command {
         /// without `branch`).
         #[arg(long)]
         limit: Option<u64>,
+        /// Only events for this project id.
+        #[arg(long)]
+        project: Option<u64>,
+        /// Only events for this branch name — a server-side filter on
+        /// `GET /api/v1/audit`, distinct from the positional `branch` above
+        /// (which instead resolves the current directory's environment and
+        /// switches to its full per-environment history endpoint). Use this
+        /// one together with `--project` to filter the cross-project feed
+        /// without needing a local checkout of that branch.
+        #[arg(long = "branch")]
+        branch_filter: Option<String>,
+        /// Only events at/after this RFC3339 timestamp (e.g.
+        /// `2026-08-01T00:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only events at/before this RFC3339 timestamp.
+        #[arg(long)]
+        until: Option<String>,
+        /// Only events of this kind (e.g. `deploy`, `pause`, `wake`,
+        /// `destroy`).
+        #[arg(long)]
+        kind: Option<String>,
     },
     /// Download a consistent snapshot of the daemon's database + secret key.
     Backup {
@@ -146,6 +190,61 @@ enum Command {
         #[arg(long)]
         git_token: Option<String>,
     },
+    /// Manage named daemon contexts (`kubectl config`-style), persisted at
+    /// `~/.config/oxid/config.toml`, so `--api`/`--token` don't need to be
+    /// repeated for every daemon you talk to.
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+    /// Prints a shell completion script to stdout — pipe it into your
+    /// shell's completion directory, e.g.
+    /// `oxid completions zsh > ~/.zfunc/_oxid`.
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContextAction {
+    /// Add (or overwrite) a named context.
+    Add {
+        /// Name for this context, e.g. `staging` or `prod`.
+        name: String,
+        /// Daemon base URL for this context.
+        #[arg(long)]
+        api: String,
+        /// Bearer token for this context's daemon, if it requires one.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Switch the active context.
+    Use {
+        /// Name of a context previously added with `oxid context add`.
+        name: String,
+    },
+    /// List every configured context; the active one is marked. Tokens are
+    /// masked to their last 4 characters.
+    List,
+    /// Print the name of the active context.
+    Current,
+    /// Remove a context. Refuses if it's the active one unless `--force`.
+    Remove {
+        /// Name of the context to remove.
+        name: String,
+        /// Remove even if it's the currently active context.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Sort key shared by `status` and `ps` table output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SortKey {
+    Branch,
+    State,
+    Updated,
 }
 
 #[derive(Debug, Subcommand)]
@@ -275,10 +374,19 @@ fn colored_state(state: &str) -> String {
     }
 }
 
+/// Precedence: `--api` flag > `OXID_API` env > active context in
+/// `~/.config/oxid/config.toml` > hardcoded default. A config file that
+/// fails to parse is treated the same as a missing one here — `oxid
+/// context` subcommands are where a bad file gets surfaced as a real error.
 fn api_base(cli_flag: Option<&str>) -> String {
     cli_flag
         .map(str::to_owned)
         .or_else(|| std::env::var("OXID_API").ok())
+        .or_else(|| {
+            config::load()
+                .ok()
+                .and_then(|cfg| config::current(&cfg).map(|ctx| ctx.api.clone()))
+        })
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
 }
 
@@ -308,10 +416,17 @@ fn env_display_address(base: &str, env: &Value) -> String {
     format!("http://{host}:{port}/")
 }
 
+/// Same precedence as [`api_base`]: `--token` flag > `OXID_TOKEN` env >
+/// active context's token > none.
 fn api_token(cli_flag: Option<&str>) -> Option<String> {
     cli_flag
         .map(str::to_owned)
         .or_else(|| std::env::var("OXID_TOKEN").ok())
+        .or_else(|| {
+            config::load()
+                .ok()
+                .and_then(|cfg| config::current(&cfg).and_then(|ctx| ctx.token.clone()))
+        })
 }
 
 /// Builds the shared HTTP client, attaching `Authorization: Bearer <token>`
@@ -389,10 +504,28 @@ fn response_error(body: &str, status: StatusCode, context: &str) -> CliError {
 
 /// Builds a [`CliError`] for a request that never reached the daemon at
 /// all (connection refused, DNS failure, timeout) — distinct from the
-/// daemon replying with an error status.
+/// daemon replying with an error status. Differentiates the common causes
+/// with an actionable suggestion instead of just echoing `reqwest`'s raw
+/// error text, since "cannot reach daemon: error sending request" reads the
+/// same whether the daemon is down, the host doesn't resolve, or it's just
+/// slow.
 fn connect_error(url: &str, e: &reqwest::Error) -> CliError {
+    let hint = if e.is_timeout() {
+        "the daemon didn't respond in time — it may be overloaded or stuck; \
+         retry, or check its logs on the host running `oxidd`"
+    } else if e.is_connect() {
+        "connection refused/unreachable — check the daemon is running and that \
+         --api/OXID_API points at the right host and port"
+    } else if e.to_string().contains("dns error")
+        || e.to_string().contains("failed to lookup address")
+    {
+        "DNS resolution failed — check the hostname in --api/OXID_API is spelled \
+         correctly and resolves from this machine"
+    } else {
+        "the request never reached the daemon"
+    };
     CliError::new(
-        format!("cannot reach daemon at {url}: {e}"),
+        format!("cannot reach daemon at {url}: {e} ({hint})"),
         EXIT_UNREACHABLE,
     )
 }
@@ -401,6 +534,10 @@ fn connect_error(url: &str, e: &reqwest::Error) -> CliError {
 // calls — it never benefits from a multi-threaded work-stealing runtime,
 // which would otherwise spin up one OS thread per CPU core just to run
 // them one at a time. `current_thread` avoids that startup cost entirely.
+// A single flat `match` over every subcommand is what pushes this past
+// clippy's line-count heuristic; splitting the dispatch table into its own
+// function would just move the length elsewhere for no clarity gain.
+#[allow(clippy::too_many_lines)]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
@@ -420,7 +557,9 @@ async fn main() {
         Command::Rollback { branch, to } => {
             cmd_rollback(&client, &base, &branch, to.as_deref()).await
         }
-        Command::Status => cmd_status(&client, &base).await,
+        Command::Status { sort, filter } => {
+            cmd_status(&client, &base, sort, filter.as_deref()).await
+        }
         Command::Down {
             branch,
             force,
@@ -429,7 +568,7 @@ async fn main() {
         Command::RmProject { force } => cmd_rm_project(&client, &base, force).await,
         Command::Pause { branch } => cmd_pause(&client, &base, &branch).await,
         Command::Wake { branch } => cmd_wake(&client, &base, &branch).await,
-        Command::Ps => cmd_ps(&client, &base).await,
+        Command::Ps { sort, filter } => cmd_ps(&client, &base, sort, filter.as_deref()).await,
         Command::Env { action } => match action {
             EnvAction::Set {
                 assignment,
@@ -460,8 +599,29 @@ async fn main() {
             } => cmd_env_delete(&client, &base, &name, &scope, project, branch.as_deref()).await,
         },
         Command::Logs { branch, follow } => cmd_logs(&client, &base, &branch, follow).await,
-        Command::Audit { branch, limit } => {
-            cmd_audit(&client, &base, branch.as_deref(), limit).await
+        Command::Audit {
+            branch,
+            limit,
+            project,
+            branch_filter,
+            since,
+            until,
+            kind,
+        } => {
+            cmd_audit(
+                &client,
+                &base,
+                branch.as_deref(),
+                limit,
+                AuditFilters {
+                    project,
+                    branch: branch_filter,
+                    since,
+                    until,
+                    kind,
+                },
+            )
+            .await
         }
         Command::Backup { file } => cmd_backup(&client, &base, &file).await,
         Command::Restore { file } => cmd_restore(&client, &base, &file).await,
@@ -486,6 +646,13 @@ async fn main() {
                 git_token.as_deref(),
             )
             .await
+        }
+        Command::Context { action } => cmd_context(action),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_owned();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
         }
     };
 
@@ -659,7 +826,35 @@ async fn cmd_rollback(
     Ok(())
 }
 
-async fn cmd_status(client: &Client, base: &str) -> Result<(), CliError> {
+/// Extracts a lexicographically-comparable key from a `time`-serialized
+/// timestamp field (an array like `occurred_at`'s: `[year, ordinal, hour,
+/// minute, second, ...]`). Comparing the arrays element-by-element sorts
+/// chronologically since each field is listed in decreasing significance.
+fn timestamp_sort_key(value: &Value) -> Vec<i64> {
+    value
+        .as_array()
+        .map(|parts| parts.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
+}
+
+/// Applies `--filter` to a row: matches an exact (case-insensitive) state,
+/// or a case-insensitive substring of the branch/name.
+fn row_matches_filter(branch_or_name: &str, state: Option<&str>, filter: &str) -> bool {
+    let filter = filter.to_lowercase();
+    if let Some(state) = state
+        && state.to_lowercase() == filter
+    {
+        return true;
+    }
+    branch_or_name.to_lowercase().contains(&filter)
+}
+
+async fn cmd_status(
+    client: &Client,
+    base: &str,
+    sort: Option<SortKey>,
+    filter: Option<&str>,
+) -> Result<(), CliError> {
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
@@ -669,35 +864,54 @@ async fn cmd_status(client: &Client, base: &str) -> Result<(), CliError> {
         format!("{base}/api/v1/projects/{project_id}/environments"),
     )
     .await?;
-    if emit_json(&envs) {
-        return Ok(());
-    }
     let envs = envs
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
-    if envs.is_empty() {
+    // The daemon keeps one row per historical deploy (audit trail); only the
+    // most recent row per branch reflects what's actually live. `envs` is
+    // returned in ascending id order, so a later entry always overwrites an
+    // earlier one for the same branch here.
+    let mut latest: Vec<(&str, &str, String, Vec<i64>)> = Vec::new();
+    for env in envs {
+        let branch = env["branch"]["name"].as_str().unwrap_or("?");
+        let state = env["state"].as_str().unwrap_or("?");
+        let address = env_display_address(base, env);
+        let updated = timestamp_sort_key(&env["updated_at"]);
+        match latest.iter_mut().find(|(b, ..)| *b == branch) {
+            Some(entry) => *entry = (branch, state, address, updated),
+            None => latest.push((branch, state, address, updated)),
+        }
+    }
+    if let Some(filter) = filter {
+        latest.retain(|(branch, state, ..)| row_matches_filter(branch, Some(state), filter));
+    }
+    match sort {
+        Some(SortKey::Branch) => latest.sort_by(|a, b| a.0.cmp(b.0)),
+        Some(SortKey::State) => latest.sort_by(|a, b| a.1.cmp(b.1)),
+        Some(SortKey::Updated) => latest.sort_by(|a, b| a.3.cmp(&b.3)),
+        None => {}
+    }
+    if emit_json(&json!(
+        latest
+            .iter()
+            .map(|(branch, state, address, _)| json!({
+                "branch": branch,
+                "state": state,
+                "url": address,
+            }))
+            .collect::<Vec<_>>()
+    )) {
+        return Ok(());
+    }
+    if latest.is_empty() {
         bg(format!(
             "No environments for `{}` yet. Deploy one with `oxid up <branch>`.",
             project["name"].as_str().unwrap_or("?")
         ));
         return Ok(());
     }
-    // The daemon keeps one row per historical deploy (audit trail); only the
-    // most recent row per branch reflects what's actually live. `envs` is
-    // returned in ascending id order, so a later entry always overwrites an
-    // earlier one for the same branch here.
-    let mut latest: Vec<(&str, &str, String)> = Vec::new();
-    for env in envs {
-        let branch = env["branch"]["name"].as_str().unwrap_or("?");
-        let state = env["state"].as_str().unwrap_or("?");
-        let address = env_display_address(base, env);
-        match latest.iter_mut().find(|(b, ..)| *b == branch) {
-            Some(entry) => *entry = (branch, state, address),
-            None => latest.push((branch, state, address)),
-        }
-    }
     println!("{:<24} {:<24} URL", "BRANCH", "STATE");
-    for (branch, state, address) in latest {
+    for (branch, state, address, _) in latest {
         println!("{:<24} {:<33} {}", branch, colored_state(state), address);
     }
     Ok(())
@@ -895,18 +1109,80 @@ fn format_occurred_at(value: &Value) -> String {
     )
 }
 
+/// Server-side filters for `GET /api/v1/audit` and
+/// `GET /api/v1/environments/{id}/audit` (`project_id`, `branch`, `since`,
+/// `until`, `kind`) — the daemon side of this contract may still be landing
+/// in parallel; an unknown query param is either ignored or answered with a
+/// `400`, which surfaces through the CLI's existing `response_error` path
+/// either way.
+#[derive(Debug, Default, Clone)]
+struct AuditFilters {
+    project: Option<u64>,
+    branch: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    kind: Option<String>,
+}
+
+impl AuditFilters {
+    /// Appends `&key=value` pairs (percent-encoding reserved characters in
+    /// values) to `url`.
+    fn append_to(&self, url: &mut String) {
+        use std::fmt::Write as _;
+        if let Some(project) = self.project {
+            let _ = write!(url, "&project_id={project}");
+        }
+        if let Some(branch) = &self.branch {
+            let _ = write!(url, "&branch={}", percent_encode(branch));
+        }
+        if let Some(since) = &self.since {
+            let _ = write!(url, "&since={}", percent_encode(since));
+        }
+        if let Some(until) = &self.until {
+            let _ = write!(url, "&until={}", percent_encode(until));
+        }
+        if let Some(kind) = &self.kind {
+            let _ = write!(url, "&kind={}", percent_encode(kind));
+        }
+    }
+}
+
+/// Minimal query-value percent-encoding — just enough for the handful of
+/// reserved characters that show up in RFC3339 timestamps and branch names
+/// (`:`, `+`, spaces), without pulling in the `url` crate for it.
+fn percent_encode(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
 async fn cmd_audit(
     client: &Client,
     base: &str,
     branch: Option<&str>,
     limit: Option<u64>,
+    filters: AuditFilters,
 ) -> Result<(), CliError> {
     let url = if let Some(branch) = branch {
         let (env_id, _) = resolve_environment(client, base, branch).await?;
-        format!("{base}/api/v1/environments/{env_id}/audit")
+        let mut url = format!("{base}/api/v1/environments/{env_id}/audit?");
+        filters.append_to(&mut url);
+        url
     } else {
         let limit = limit.unwrap_or(50);
-        format!("{base}/api/v1/audit?limit={limit}")
+        let mut url = format!("{base}/api/v1/audit?limit={limit}");
+        filters.append_to(&mut url);
+        url
     };
     let value = get_json(client, url).await?;
     if emit_json(&value) {
@@ -990,6 +1266,120 @@ async fn cmd_configure(
         ok(msg);
     }
     Ok(())
+}
+
+/// Handles `oxid context <add|use|list|current|remove>` — purely local,
+/// no daemon round-trip, so it's synchronous unlike every other `cmd_*`.
+fn cmd_context(action: ContextAction) -> Result<(), CliError> {
+    match action {
+        ContextAction::Add { name, api, token } => {
+            let mut cfg = config::load()?;
+            cfg.contexts
+                .insert(name.clone(), config::Context { api, token });
+            config::save(&cfg)?;
+            if !emit_json(&json!({ "context": name, "action": "added" })) {
+                ok(format!("Added context `{name}`"));
+            }
+            Ok(())
+        }
+        ContextAction::Use { name } => {
+            let mut cfg = config::load()?;
+            if !cfg.contexts.contains_key(&name) {
+                return Err(CliError::new(
+                    format!(
+                        "no such context `{name}` — add it first with `oxid context add {name} --api <url>`"
+                    ),
+                    EXIT_NOT_FOUND,
+                ));
+            }
+            cfg.current_context = Some(name.clone());
+            config::save(&cfg)?;
+            if !emit_json(&json!({ "context": name, "action": "activated" })) {
+                ok(format!("Switched to context `{name}`"));
+            }
+            Ok(())
+        }
+        ContextAction::List => {
+            let cfg = config::load()?;
+            if emit_json(&json!(
+                cfg.contexts
+                    .iter()
+                    .map(|(name, ctx)| json!({
+                        "name": name,
+                        "api": ctx.api,
+                        "token": ctx.token.as_deref().map(config::mask_token),
+                        "current": cfg.current_context.as_deref() == Some(name.as_str()),
+                    }))
+                    .collect::<Vec<_>>()
+            )) {
+                return Ok(());
+            }
+            if cfg.contexts.is_empty() {
+                bg(
+                    "No contexts configured yet. Add one with `oxid context add <name> --api <url>`.",
+                );
+                return Ok(());
+            }
+            println!("{:<4} {:<16} {:<32} TOKEN", "", "NAME", "API");
+            for (name, ctx) in &cfg.contexts {
+                let marker = if cfg.current_context.as_deref() == Some(name.as_str()) {
+                    "*"
+                } else {
+                    ""
+                };
+                let token = ctx
+                    .token
+                    .as_deref()
+                    .map_or("-".to_owned(), config::mask_token);
+                println!("{marker:<4} {name:<16} {:<32} {token}", ctx.api);
+            }
+            Ok(())
+        }
+        ContextAction::Current => {
+            let cfg = config::load()?;
+            match &cfg.current_context {
+                Some(name) if cfg.contexts.contains_key(name) => {
+                    if !emit_json(&json!({ "context": name })) {
+                        println!("{name}");
+                    }
+                    Ok(())
+                }
+                _ => {
+                    if !emit_json(&json!({ "context": Value::Null })) {
+                        bg("No active context (using --api/OXID_API/default).");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        ContextAction::Remove { name, force } => {
+            let mut cfg = config::load()?;
+            if !cfg.contexts.contains_key(&name) {
+                return Err(CliError::new(
+                    format!("no such context `{name}`"),
+                    EXIT_NOT_FOUND,
+                ));
+            }
+            let is_active = cfg.current_context.as_deref() == Some(name.as_str());
+            if is_active && !force {
+                return Err(
+                    format!(
+                        "`{name}` is the active context — pass --force to remove it anyway (falls back to --api/OXID_API/default)"
+                    )
+                    .into(),
+                );
+            }
+            cfg.contexts.remove(&name);
+            if is_active {
+                cfg.current_context = None;
+            }
+            config::save(&cfg)?;
+            if !emit_json(&json!({ "context": name, "action": "removed" })) {
+                ok(format!("Removed context `{name}`"));
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn cmd_queue(client: &Client, base: &str) -> Result<(), CliError> {
@@ -1147,6 +1537,16 @@ async fn cmd_token_revoke(client: &Client, base: &str, id: u64) -> Result<(), Cl
 /// Preflight/diagnostic check: is the daemon reachable, what version is it
 /// running, and (if a token is configured) does it actually authenticate —
 /// instead of a command failing halfway through with a less obvious error.
+/// Compares `x.y.z` version strings, returning `true` when the major
+/// component differs — the only mismatch severe enough to warn about, since
+/// this workspace doesn't yet promise semver compatibility within a major
+/// version but a CLI/daemon pair built from the same release always match
+/// exactly anyway.
+fn major_version_mismatch(cli_version: &str, daemon_version: &str) -> bool {
+    let major = |v: &str| v.split('.').next().unwrap_or(v).to_owned();
+    daemon_version != "unknown" && major(cli_version) != major(daemon_version)
+}
+
 async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
     let start = std::time::Instant::now();
     let url = format!("{base}/api/v1/health");
@@ -1166,7 +1566,9 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
     }
     let health: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
-    let version = health["version"].as_str().unwrap_or("unknown");
+    let daemon_version = health["version"].as_str().unwrap_or("unknown").to_owned();
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let version_mismatch = major_version_mismatch(cli_version, &daemon_version);
 
     let (auth_status, auth_ok) = match get_json(client, format!("{base}/api/v1/projects")).await {
         Ok(_) => ("ok", true),
@@ -1174,14 +1576,32 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
         Err(err) => return Err(err),
     };
 
+    // Best-effort: `/api/v1/stats` needs the same auth as everything else,
+    // and predates on daemons old enough to 404 it, so its failure never
+    // fails `doctor` outright — it's capacity/version diagnostics, not a
+    // correctness gate.
+    let node_stats = if auth_ok {
+        match get_json(client, format!("{base}/api/v1/stats")).await {
+            Ok(node_stats) => Some(Ok(node_stats)),
+            Err(err) => Some(Err(err.message)),
+        }
+    } else {
+        None
+    };
     if !emit_json(&json!({
         "reachable": true,
-        "version": version,
+        "version": daemon_version,
+        "cli_version": cli_version,
+        "version_mismatch": version_mismatch,
         "latency_ms": latency.as_millis(),
         "auth": auth_status,
+        "capacity": node_stats.as_ref().map(|c| match c {
+            Ok(node_stats) => node_stats.clone(),
+            Err(e) => json!({ "error": e }),
+        }),
     })) {
         ok(format!(
-            "Daemon reachable at {base} (v{version}, {}ms)",
+            "Daemon reachable at {base} (v{daemon_version}, {}ms)",
             latency.as_millis()
         ));
         if auth_ok {
@@ -1191,15 +1611,49 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
                 "Control API requires a token that wasn't provided/didn't work — pass --token or set OXID_TOKEN",
             );
         }
+        if version_mismatch {
+            bg(format!(
+                "CLI is v{cli_version} but daemon is v{daemon_version} (major version mismatch) \
+                 — upgrade whichever is older; a mismatch across major versions may break API compatibility"
+            ));
+        } else if daemon_version != "unknown" {
+            ok(format!(
+                "CLI (v{cli_version}) and daemon (v{daemon_version}) versions match"
+            ));
+        }
+        match &node_stats {
+            Some(Ok(node_stats)) => {
+                let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
+                let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
+                if mem_bytes == 0 || cpus == 0 {
+                    bg(
+                        "Daemon reports 0 host memory/CPUs — its Docker socket may be \
+                         unreachable; check OXID's container has /var/run/docker.sock mounted \
+                         and the daemon user can access it",
+                    );
+                } else {
+                    #[allow(clippy::cast_precision_loss)]
+                    let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    ok(format!(
+                        "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
+                        node_stats["environments_running"].as_u64().unwrap_or(0),
+                    ));
+                }
+            }
+            Some(Err(message)) => bg(format!(
+                "Could not fetch capacity stats ({message}) — the daemon may predate \
+                 `/api/v1/stats`; upgrade it to enable this check"
+            )),
+            None => {}
+        }
     }
-    if auth_ok {
-        Ok(())
-    } else {
-        Err(CliError::new(
+    if !auth_ok {
+        return Err(CliError::new(
             "authentication check failed",
             EXIT_UNAUTHORIZED,
-        ))
+        ));
     }
+    Ok(())
 }
 
 async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
@@ -1228,7 +1682,12 @@ async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn cmd_ps(client: &Client, base: &str) -> Result<(), CliError> {
+async fn cmd_ps(
+    client: &Client,
+    base: &str,
+    sort: Option<SortKey>,
+    filter: Option<&str>,
+) -> Result<(), CliError> {
     let url = format!("{base}/api/v1/projects");
     let response = client
         .get(&url)
@@ -1243,8 +1702,24 @@ async fn cmd_ps(client: &Client, base: &str) -> Result<(), CliError> {
     if !status.is_success() {
         return Err(response_error(&body, status, "listing projects failed"));
     }
-    let projects: Vec<Value> =
+    let mut projects: Vec<Value> =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if let Some(filter) = filter {
+        projects.retain(|p| row_matches_filter(p["name"].as_str().unwrap_or(""), None, filter));
+    }
+    // `Ps` lists projects, which have no `state`/`updated` columns — `--sort`
+    // only has something to act on via the project name, so every key sorts
+    // by name here; it's still accepted (rather than rejected) so scripts
+    // that pass `--sort` uniformly across `status`/`ps` don't need a
+    // special case.
+    if sort.is_some() {
+        projects.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        });
+    }
     if emit_json(&Value::Array(projects.clone())) {
         return Ok(());
     }
@@ -1487,7 +1962,7 @@ mod tests {
     fn parses_audit_without_branch() {
         let cli = Cli::try_parse_from(["oxid", "audit"]).unwrap();
         match cli.command {
-            Command::Audit { branch, limit } => {
+            Command::Audit { branch, limit, .. } => {
                 assert_eq!(branch, None);
                 assert_eq!(limit, None);
             }
@@ -1499,9 +1974,47 @@ mod tests {
     fn parses_audit_with_branch_and_limit() {
         let cli = Cli::try_parse_from(["oxid", "audit", "main", "--limit", "10"]).unwrap();
         match cli.command {
-            Command::Audit { branch, limit } => {
+            Command::Audit { branch, limit, .. } => {
                 assert_eq!(branch.as_deref(), Some("main"));
                 assert_eq!(limit, Some(10));
+            }
+            other => panic!("expected Audit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_with_new_filters() {
+        let cli = Cli::try_parse_from([
+            "oxid",
+            "audit",
+            "--project",
+            "3",
+            "--branch",
+            "feat-a",
+            "--since",
+            "2026-08-01T00:00:00Z",
+            "--until",
+            "2026-08-20T00:00:00Z",
+            "--kind",
+            "deploy",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Audit {
+                branch,
+                project,
+                branch_filter,
+                since,
+                until,
+                kind,
+                ..
+            } => {
+                assert_eq!(branch, None);
+                assert_eq!(project, Some(3));
+                assert_eq!(branch_filter.as_deref(), Some("feat-a"));
+                assert_eq!(since.as_deref(), Some("2026-08-01T00:00:00Z"));
+                assert_eq!(until.as_deref(), Some("2026-08-20T00:00:00Z"));
+                assert_eq!(kind.as_deref(), Some("deploy"));
             }
             other => panic!("expected Audit, got {other:?}"),
         }
@@ -1561,6 +2074,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_context_subcommands() {
+        let cli = Cli::try_parse_from([
+            "oxid",
+            "context",
+            "add",
+            "staging",
+            "--api",
+            "http://staging:8080",
+            "--token",
+            "s3cr3t",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Context {
+                action: ContextAction::Add { name, api, token },
+            } => {
+                assert_eq!(name, "staging");
+                assert_eq!(api, "http://staging:8080");
+                assert_eq!(token.as_deref(), Some("s3cr3t"));
+            }
+            other => panic!("expected Context::Add, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["oxid", "context", "use", "staging"]).unwrap();
+        match cli.command {
+            Command::Context {
+                action: ContextAction::Use { name },
+            } => assert_eq!(name, "staging"),
+            other => panic!("expected Context::Use, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["oxid", "context", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Context {
+                action: ContextAction::List
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["oxid", "context", "current"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Context {
+                action: ContextAction::Current
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["oxid", "context", "remove", "staging", "--force"]).unwrap();
+        match cli.command {
+            Command::Context {
+                action: ContextAction::Remove { name, force },
+            } => {
+                assert_eq!(name, "staging");
+                assert!(force);
+            }
+            other => panic!("expected Context::Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_completions_command() {
+        let cli = Cli::try_parse_from(["oxid", "completions", "zsh"]).unwrap();
+        match cli.command {
+            Command::Completions { shell } => assert_eq!(shell, Shell::Zsh),
+            other => panic!("expected Completions, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_rollback_without_to() {
         let cli = Cli::try_parse_from(["oxid", "rollback", "main"]).unwrap();
         match cli.command {
@@ -1587,13 +2169,51 @@ mod tests {
     #[test]
     fn parses_ps_command() {
         let cli = Cli::try_parse_from(["oxid", "ps"]).unwrap();
-        assert!(matches!(cli.command, Command::Ps));
+        assert!(matches!(
+            cli.command,
+            Command::Ps {
+                sort: None,
+                filter: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_ps_with_sort_and_filter() {
+        let cli =
+            Cli::try_parse_from(["oxid", "ps", "--sort", "branch", "--filter", "web"]).unwrap();
+        match cli.command {
+            Command::Ps { sort, filter } => {
+                assert_eq!(sort, Some(SortKey::Branch));
+                assert_eq!(filter.as_deref(), Some("web"));
+            }
+            other => panic!("expected Ps, got {other:?}"),
+        }
     }
 
     #[test]
     fn parses_status_command() {
         let cli = Cli::try_parse_from(["oxid", "status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                sort: None,
+                filter: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_status_with_sort_and_filter() {
+        let cli = Cli::try_parse_from(["oxid", "status", "--sort", "state", "--filter", "running"])
+            .unwrap();
+        match cli.command {
+            Command::Status { sort, filter } => {
+                assert_eq!(sort, Some(SortKey::State));
+                assert_eq!(filter.as_deref(), Some("running"));
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[test]
