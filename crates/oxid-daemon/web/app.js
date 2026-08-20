@@ -402,12 +402,22 @@ function dashboard() {
     // project's static `[routing].port`, which is just the container's own
     // internal listening port and no longer says anything about the host
     // side.
+    // `public_port` (when present) is the branch's stable address — bound
+    // once by Oxid's own built-in zero-downtime proxy and reused across
+    // every redeploy, unlike `host_port` which changes each time a new
+    // container is cut over. Prefer it; fall back to `host_port` for
+    // environments deployed before this existed.
+    envAddressPort(env) {
+      return env.public_port ?? env.host_port;
+    },
+
     envLink(env) {
       if (this.stats.traefik_enabled) {
         return `http://${env.url}`;
       }
-      return env.host_port
-        ? `${location.protocol}//${location.hostname}:${env.host_port}/`
+      const port = this.envAddressPort(env);
+      return port
+        ? `${location.protocol}//${location.hostname}:${port}/`
         : `http://${env.url}`;
     },
 
@@ -415,7 +425,8 @@ function dashboard() {
       if (this.stats.traefik_enabled) {
         return env.url;
       }
-      return env.host_port ? `${location.hostname}:${env.host_port}` : env.url;
+      const port = this.envAddressPort(env);
+      return port ? `${location.hostname}:${port}` : env.url;
     },
 
     hostMemoryLabel() {

@@ -735,10 +735,10 @@ impl ProjectStore for SqliteStore {
 // ---------------------------------------------------------------------------
 
 const ENV_COLUMNS: &str = "id, project_id, branch_name, commit_sha, state, url, \
-     created_at, updated_at, last_accessed_at, host_port";
+     created_at, updated_at, last_accessed_at, host_port, public_port, container_name";
 
 const ENV_COLUMNS_NO_ID: &str = "project_id, branch_name, commit_sha, state, url, \
-     created_at, updated_at, last_accessed_at, host_port";
+     created_at, updated_at, last_accessed_at, host_port, public_port, container_name";
 
 fn env_to_binds(env: &Environment) -> EnvBinds<'_> {
     EnvBinds {
@@ -752,6 +752,8 @@ fn env_to_binds(env: &Environment) -> EnvBinds<'_> {
         updated_at: ts(&env.updated_at),
         last_accessed_at: ts(&env.last_accessed_at),
         host_port: env.host_port.map(i64::from),
+        public_port: env.public_port.map(i64::from),
+        container_name: env.container_name.as_deref(),
     }
 }
 
@@ -766,6 +768,8 @@ struct EnvBinds<'a> {
     updated_at: i64,
     last_accessed_at: i64,
     host_port: Option<i64>,
+    public_port: Option<i64>,
+    container_name: Option<&'a str>,
 }
 
 fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, RepositoryError> {
@@ -779,6 +783,8 @@ fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, Repository
     let updated_at = ts_from_row(row, "updated_at")?;
     let last_accessed_at = ts_from_row(row, "last_accessed_at")?;
     let host_port: Option<i64> = row.try_get("host_port").map_err(storage)?;
+    let public_port: Option<i64> = row.try_get("public_port").map_err(storage)?;
+    let container_name: Option<String> = row.try_get("container_name").map_err(storage)?;
 
     let branch = Branch::new(
         BranchName::parse(branch_name).map_err(|e| validation(&e))?,
@@ -802,6 +808,8 @@ fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, Repository
     env.updated_at = updated_at;
     env.last_accessed_at = last_accessed_at;
     env.host_port = host_port.and_then(|p| u16::try_from(p).ok());
+    env.public_port = public_port.and_then(|p| u16::try_from(p).ok());
+    env.container_name = container_name;
     Ok(env)
 }
 
@@ -810,7 +818,7 @@ impl EnvironmentStore for SqliteStore {
         let binds = env_to_binds(env);
         let row = sqlx::query(&format!(
             "INSERT INTO environments ({ENV_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.project_id)
         .bind(binds.branch_name)
@@ -821,6 +829,8 @@ impl EnvironmentStore for SqliteStore {
         .bind(binds.updated_at)
         .bind(binds.last_accessed_at)
         .bind(binds.host_port)
+        .bind(binds.public_port)
+        .bind(binds.container_name)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -874,7 +884,7 @@ impl EnvironmentStore for SqliteStore {
         let res = sqlx::query(
             "UPDATE environments SET project_id = ?, branch_name = ?, commit_sha = ?, \
              state = ?, url = ?, created_at = ?, updated_at = ?, last_accessed_at = ?, \
-             host_port = ? WHERE id = ?",
+             host_port = ?, public_port = ?, container_name = ? WHERE id = ?",
         )
         .bind(binds.project_id)
         .bind(binds.branch_name)
@@ -885,6 +895,8 @@ impl EnvironmentStore for SqliteStore {
         .bind(binds.updated_at)
         .bind(binds.last_accessed_at)
         .bind(binds.host_port)
+        .bind(binds.public_port)
+        .bind(binds.container_name)
         .bind(binds.id)
         .execute(&self.pool)
         .await

@@ -220,7 +220,7 @@
               <dt>url</dt><dd><a class="link" :href="envLink(currentEnvironment())" target="_blank" rel="noopener" x-text="envLinkLabel(currentEnvironment())"></a></dd>
               <dt x-show="!stats.traefik_enabled" class="muted">note</dt>
               <dd x-show="!stats.traefik_enabled" class="muted">
-                no Traefik configured — this is the host's own published port, not <span x-text="currentEnvironment().url"></span>
+                no Traefik configured — this is Oxid's own stable proxy port for this branch, not <span x-text="currentEnvironment().url"></span>. It stays the same across redeploys: a push swaps traffic to the new container with zero downtime instead of changing the address.
               </dd>
               <dt>commit sha</dt><dd x-text="currentEnvironment().branch.commit_sha"></dd>
               <dt>created</dt><dd x-text="formatTime(currentEnvironment().created_at)"></dd>

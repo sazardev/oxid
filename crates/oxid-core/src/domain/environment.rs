@@ -45,7 +45,23 @@ pub struct Environment {
     /// Absoluta" — a busy configured port should never block a deploy), so
     /// it's only known after the container actually starts. `None` when
     /// routed through Traefik instead (no host port is published at all).
+    /// Changes on every redeploy — see `public_port` for the stable address.
     pub host_port: Option<u16>,
+    /// The branch's stable public address in direct-publish mode: a port
+    /// bound once (by Oxid's own built-in reverse proxy) and reused across
+    /// every redeploy, unlike `host_port` which changes each time. A
+    /// redeploy swaps this proxy's upstream target to the new container
+    /// only once it's confirmed ready, so this address never has a gap.
+    /// `None` under Traefik (which is already a stable-address proxy).
+    pub public_port: Option<u16>,
+    /// The exact Docker container name this deployment runs under. Persisted
+    /// (rather than always recomputed from project+branch) so a redeploy can
+    /// give its new instance a distinct name from the still-running old one —
+    /// necessary for a zero-downtime cutover, where both briefly coexist.
+    /// `None` for environments predating this (falls back to the legacy
+    /// deterministic `oxid-{project}-{branch}` naming, which is what their
+    /// real container is actually named).
+    pub container_name: Option<String>,
 }
 
 impl Environment {
@@ -76,6 +92,8 @@ impl Environment {
             updated_at: now,
             last_accessed_at: now,
             host_port: None,
+            public_port: None,
+            container_name: None,
         })
     }
 

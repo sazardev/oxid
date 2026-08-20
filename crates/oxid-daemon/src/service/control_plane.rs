@@ -47,6 +47,15 @@ pub enum CpError {
     /// A requested record does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+    /// The built-in zero-downtime reverse proxy (direct-publish mode) could
+    /// not bind a listener.
+    #[error(transparent)]
+    Proxy(#[from] crate::service::proxy::ProxyError),
+    /// A newly-deployed instance never started accepting connections within
+    /// the readiness timeout — the redeploy is aborted and the previous
+    /// instance (if any) is left running untouched.
+    #[error("new instance never became ready: {0}")]
+    DeployNotReady(String),
     /// A deploy's own resource request exceeds the host's total usable
     /// capacity — no amount of waiting in the queue would ever make this
     /// one fit, so it's rejected immediately instead of queued forever.
@@ -195,6 +204,17 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// admission control entirely — every deploy proceeds immediately
     /// regardless of host capacity, the behavior before this existed.
     reserved_memory_mb: Option<u64>,
+    /// Every branch's built-in reverse proxy in direct-publish mode — see
+    /// `service/proxy.rs`. Only actually used when `docker_network` is
+    /// `None`; under Traefik, Traefik itself is already the stable-address
+    /// proxy in front of every container.
+    proxy: crate::service::proxy::ProxyRegistry,
+    /// Whether a redeploy's new instance must actually accept TCP
+    /// connections before cutover (direct-publish mode only). Always `true`
+    /// in production; test doubles disable it via
+    /// [`Self::with_readiness_check`] since a fake [`ContainerPort`] has no
+    /// real socket to connect to.
+    readiness_check: bool,
 }
 
 const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
@@ -221,7 +241,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             default_memory_limit_mb: None,
             default_cpu_limit_millicores: None,
             reserved_memory_mb: None,
+            proxy: crate::service::proxy::ProxyRegistry::default(),
+            readiness_check: true,
         }
+    }
+
+    /// Enables or disables the zero-downtime readiness gate (direct-publish
+    /// mode: wait for a redeploy's new container to actually accept TCP
+    /// connections before cutting traffic over to it). Defaults to `true`;
+    /// test doubles that don't simulate a real listening socket must
+    /// disable it or every deploy will fail waiting for a connection that
+    /// can never succeed.
+    #[must_use]
+    pub fn with_readiness_check(mut self, enabled: bool) -> Self {
+        self.readiness_check = enabled;
+        self
     }
 
     /// Enables Traefik routing: deployed containers join `network` (no host
@@ -575,14 +609,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Ok(DeployOutcome::Queued { position });
         }
 
-        // 0. A redeploy of an already-live branch (a webhook firing on a
-        // new push, or a second `oxid up`) reuses the same container name,
-        // so the previous container has to go first or Docker rejects the
-        // new one with a 409 name conflict. Mark its Environment row
-        // Destroyed too, so `status`/branch-resolution don't keep pointing
-        // at a container that no longer exists.
-        self.replace_previous_deployment(&project, project_id, &branch)
-            .await?;
+        // 0. A redeploy of an already-live branch (a webhook firing on a new
+        // push, or a second `oxid up`) used to destroy the previous
+        // container *before* building/starting the new one — always a real
+        // gap where the branch was unreachable, and in direct-publish mode
+        // the address itself changed underneath anyone already using it.
+        // The previous instance is kept fully alive here, still serving
+        // traffic, until the new one is built, started and confirmed
+        // healthy — see the cutover at the end of `run_and_activate`.
+        let previous = self
+            .find_environment_by_branch(project_id, &branch)
+            .await?
+            .filter(|e| e.state != EnvironmentState::Destroyed);
 
         // 1. Clone cache + resolve (or reuse an explicit rollback target)
         // + checkout the commit.
@@ -633,16 +671,37 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         )?;
         let env_id = EnvironmentStore::create(&self.store, &env).await?;
         env.id = env_id;
+        // A per-deployment-unique container name, distinct from the
+        // previous (still running) instance's — the two coexist briefly
+        // during the cutover below, so they can never share a name.
+        env.container_name = Some(format!(
+            "oxid-{}-{}-{}",
+            project.name,
+            sanitize_label(&branch),
+            env.id.0
+        ));
 
         // 4-7: resolve secrets, run the container, run `on_start` hooks,
-        // then activate. Everything from here on can fail (a bad secret, a
-        // Docker error, a failing hook) *after* the row above was already
-        // persisted as `Building`. Leaving it there on error would brick the
-        // branch permanently: `Building` cannot transition to `Destroy`, so
-        // `replace_previous_deployment` could never clear it on a retry (see
-        // regression test `failed_deploy_does_not_permanently_block_branch`).
+        // wait for it to be ready, then cut over from `previous` (if any)
+        // and activate. Everything from here on can fail (a bad secret, a
+        // Docker error, a failing hook, a readiness timeout) *after* the row
+        // above was already persisted as `Building` — but `previous`, if
+        // any, is never touched until the new instance is confirmed ready,
+        // so a failed redeploy leaves the branch exactly as reachable as it
+        // was before the redeploy started. Leaving the new row stuck as
+        // `Building` on error would brick the branch permanently otherwise
+        // (`Building` cannot transition to `Destroy`), see regression test
+        // `failed_deploy_does_not_permanently_block_branch`.
         if let Err(err) = self
-            .run_and_activate(&project, &branch, image, url, &mut env, operator.as_deref())
+            .run_and_activate(
+                &project,
+                &branch,
+                image,
+                url,
+                &mut env,
+                previous.as_ref(),
+                operator.as_deref(),
+            )
             .await
         {
             let now = OffsetDateTime::now_utc();
@@ -663,6 +722,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Err(err);
         }
 
+        // The new instance is live (and, per the cutover inside
+        // `run_and_activate`, the previous container is already gone) —
+        // now retire the previous Environment row so `status`/branch
+        // resolution stop pointing at it.
+        if let Some(mut prev) = previous {
+            let now = OffsetDateTime::now_utc();
+            if prev.transition(StateTransition::Destroy, now).is_ok() {
+                let _ = EnvironmentStore::update(&self.store, &prev).await;
+            }
+        }
+
         Ok(DeployOutcome::Deployed(env))
     }
 
@@ -670,8 +740,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// the safety net for a bad deploy, since `oxid up` always rebuilds from
     /// HEAD with no way back otherwise. Reuses `environments`' existing
     /// per-deploy history (a new row per deploy, the prior one marked
-    /// `Destroyed` — see `replace_previous_deployment`) rather than needing
-    /// any new storage: every past deploy's commit is already sitting in
+    /// `Destroyed` once the new one cuts over — see [`Self::deploy_at`])
+    /// rather than needing any new storage: every past deploy's commit is
+    /// already sitting in
     /// `Environment.branch.commit_sha`.
     ///
     /// Without `to_sha`, rolls back to the commit immediately before the
@@ -742,10 +813,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
     }
 
-    /// Resolves secrets, runs the container, runs `[build].on_start` hooks,
-    /// then transitions `env` to `Running` and records the deployment. Split
-    /// out of [`Self::deploy`] so its errors can be caught there and turned
-    /// into a `BuildFailed` transition instead of leaving `env` stuck.
+    /// Resolves secrets, runs the new container, runs `[build].on_start`
+    /// hooks, waits for it to actually accept connections, cuts traffic
+    /// over from `previous` (if this is a redeploy of an already-live
+    /// branch), then transitions `env` to `Running` and records the
+    /// deployment. Split out of [`Self::deploy`] so its errors can be
+    /// caught there and turned into a `BuildFailed` transition instead of
+    /// leaving `env` stuck.
+    ///
+    /// `previous`, when given, is never touched until the new instance is
+    /// confirmed ready — on any failure here, only the *new* container is
+    /// cleaned up, and `previous` keeps running exactly as it was, so a
+    /// failed redeploy never takes an already-live branch down with it.
+    // The zero-downtime cutover (build new, wait ready, swap, remove old)
+    // is one cohesive sequence that reads far worse split across helper
+    // functions than as slightly-too-long straight-line code.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_and_activate(
         &self,
         project: &Project,
@@ -753,6 +836,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         image: String,
         url: String,
         env: &mut Environment,
+        previous: Option<&Environment>,
         operator: Option<&str>,
     ) -> Result<(), CpError> {
         // Global -> Project -> Branch secrets plus orchestrator runtime
@@ -798,13 +882,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .map(|(k, v)| (k, v.as_str().to_owned()))
             .collect::<BTreeMap<_, _>>();
 
-        let name = container_name(project, branch);
-        // Defensive: remove any leftover container under this name even if
-        // no DB row referenced it (e.g. the daemon crashed mid-deploy, or
-        // its database was reset independently of Docker). Without this, a
-        // stale container blocks every future deploy of this branch with a
-        // 409 name conflict that `replace_previous_deployment` alone cannot
-        // see or fix.
+        let name = resolved_container_name(project, env);
+        // Defensive: remove any leftover container under this exact
+        // (per-deployment-unique) name, in case a prior crashed attempt for
+        // this same environment id left one behind. `previous`'s container
+        // (if any) has a *different* name and is deliberately left running
+        // — it keeps serving traffic until the cutover below.
         match self.oci.remove(&name).await {
             Ok(()) | Err(OciError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
@@ -834,10 +917,58 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .cpu_limit_millicores
                 .or(self.default_cpu_limit_millicores),
         };
-        env.host_port = self.oci.run(&spec).await?;
+        env.host_port = match self.oci.run(&spec).await {
+            Ok(port) => port,
+            Err(e) => {
+                let _ = self.oci.remove(&name).await;
+                return Err(e.into());
+            }
+        };
 
         for command in &project.config.build.on_start {
-            self.oci.exec(&name, command).await?;
+            if let Err(e) = self.oci.exec(&name, command).await {
+                let _ = self.oci.remove(&name).await;
+                return Err(e.into());
+            }
+        }
+
+        // In direct-publish mode, wait for the new container to actually
+        // accept connections before cutting traffic over to it — `on_start`
+        // succeeding only proves those specific commands ran, not that the
+        // app itself is up and listening.
+        if self.docker_network.is_none()
+            && self.readiness_check
+            && let Some(port) = env.host_port
+            && !crate::service::proxy::wait_until_ready(port, std::time::Duration::from_secs(20))
+                .await
+        {
+            let _ = self.oci.remove(&name).await;
+            return Err(CpError::DeployNotReady(format!(
+                "container `{name}` did not accept connections on port {port} within 20s"
+            )));
+        }
+
+        // Cutover: repoint the branch's stable proxy at the new container
+        // before touching the previous one — the actual zero-downtime
+        // moment. Anything already connected to the old target keeps
+        // talking to it; every new connection goes to the new one.
+        if self.docker_network.is_none()
+            && let Some(port) = env.host_port
+        {
+            let public_port = self
+                .proxy
+                .ensure(env.project_id, branch, previous.and_then(|p| p.public_port))
+                .await?;
+            env.public_port = Some(public_port);
+            self.proxy.set_target(env.project_id, branch, port).await;
+        }
+
+        // Only now remove the previous instance, if this was a redeploy —
+        // it has been serving traffic this entire time, right up to the
+        // cutover above.
+        if let Some(prev) = previous {
+            let prev_name = resolved_container_name(project, prev);
+            let _ = self.oci.remove(&prev_name).await;
         }
 
         let now = OffsetDateTime::now_utc();
@@ -999,8 +1130,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         self.oci
-            .pause(&container_name(&project, &env.branch.name))
+            .pause(&resolved_container_name(&project, &env))
             .await?;
+        if self.docker_network.is_none() {
+            self.proxy
+                .mark_unavailable(env.project_id, &env.branch.name)
+                .await;
+        }
 
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::IdleTimeout, now)
@@ -1061,7 +1197,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
-        let name = container_name(&project, &env.branch.name);
+        let name = resolved_container_name(&project, &env);
         match env.state {
             EnvironmentState::Hibernating => self.oci.start(&name).await?,
             _ => self.oci.unpause(&name).await?,
@@ -1080,6 +1216,24 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .published_port(&name, project.config.port)
                 .await
                 .unwrap_or(None);
+        }
+
+        // Repoints the branch's stable proxy back at this container now
+        // that it's alive again — without this, a woken environment stays
+        // unreachable through its public address (still `mark_unavailable`d
+        // from the pause that put it to sleep) even though the container
+        // itself is running again.
+        if self.docker_network.is_none()
+            && let Some(port) = env.host_port
+        {
+            let public_port = self
+                .proxy
+                .ensure(env.project_id, &env.branch.name, env.public_port)
+                .await?;
+            env.public_port = Some(public_port);
+            self.proxy
+                .set_target(env.project_id, &env.branch.name, port)
+                .await;
         }
 
         let now = OffsetDateTime::now_utc();
@@ -1125,7 +1279,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
-        let name = container_name(&project, &env.branch.name);
+        let name = resolved_container_name(&project, &env);
         self.oci.stop(&name).await?;
         self.oci.remove(&name).await?;
         // Best-effort: an image that never finished building (a deploy that
@@ -1137,6 +1291,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         {
             Ok(()) | Err(OciError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
+        }
+        if self.docker_network.is_none() {
+            self.proxy.remove(env.project_id, &env.branch.name).await;
         }
 
         if purge_secrets {
@@ -1183,10 +1340,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(())
     }
 
-    /// Finds the most recent environment for `branch` within a project, if
-    /// any. A branch can have multiple historical rows (each `deploy` call
-    /// creates a new one rather than reusing an old, possibly `Destroyed`
-    /// one), so this always resolves to the latest by id, never a stale one.
+    /// Finds the current environment for `branch` within a project, if any.
+    /// A branch can have multiple historical rows (each `deploy` call
+    /// creates a new one), so this prefers the most recent *live*
+    /// (non-`Destroyed`) row over a merely higher-id one — a redeploy that
+    /// zero-downtime-cuts-over successfully leaves exactly one live row as
+    /// the highest id, but a *failed* redeploy leaves a higher-id
+    /// `Destroyed` row sitting on top of a still-`Running` older one, which
+    /// would otherwise "hide" it from callers that need to know whether the
+    /// branch is actually still live (e.g. the webhook branch-deletion
+    /// handler). Only falls back to the highest-id row overall (which will
+    /// be `Destroyed`) when nothing is live at all.
     ///
     /// # Errors
     /// Returns [`CpError::NotFound`] if the project does not exist.
@@ -1196,13 +1360,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: &BranchName,
     ) -> Result<Option<Environment>, CpError> {
         self.ensure_project(project_id).await?;
-        Ok(self
+        let envs: Vec<Environment> = self
             .store
             .list_by_project(project_id)
             .await?
             .into_iter()
             .filter(|e| &e.branch.name == branch)
-            .max_by_key(|e| e.id.0))
+            .collect();
+        if let Some(live) = envs
+            .iter()
+            .filter(|e| e.state != EnvironmentState::Destroyed)
+            .max_by_key(|e| e.id.0)
+        {
+            return Ok(Some(live.clone()));
+        }
+        Ok(envs.into_iter().max_by_key(|e| e.id.0))
     }
 
     /// Returns the logs of an environment's container.
@@ -1216,7 +1388,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
             .oci
-            .logs(&container_name(&project, &env.branch.name))
+            .logs(&resolved_container_name(&project, &env))
             .await?)
     }
 
@@ -1232,7 +1404,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
             .oci
-            .stream_logs(&container_name(&project, &env.branch.name))
+            .stream_logs(&resolved_container_name(&project, &env))
             .await?)
     }
 
@@ -1542,7 +1714,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     None => continue,
                 },
             };
-            let name = container_name(&project, &env.branch.name);
+            let name = resolved_container_name(&project, &env);
             let status = match self.oci.container_status(&name).await {
                 Ok(status) => status,
                 Err(e) => {
@@ -1563,6 +1735,35 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             {
                 env.host_port = Some(port);
                 let _ = EnvironmentStore::update(&self.store, &env).await;
+            }
+
+            // The proxy registry (see `service/proxy.rs`) lives entirely in
+            // memory, so a daemon restart loses every branch's stable
+            // public address unless it's rebuilt here — reusing the
+            // persisted `public_port` so it comes back on the exact same
+            // port whenever possible instead of quietly reassigning a new
+            // one out from under anyone who bookmarked it.
+            if self.docker_network.is_none()
+                && matches!(
+                    env.state,
+                    EnvironmentState::Running | EnvironmentState::Paused
+                )
+                && let Ok(public_port) = self
+                    .proxy
+                    .ensure(env.project_id, &env.branch.name, env.public_port)
+                    .await
+            {
+                if env.public_port != Some(public_port) {
+                    env.public_port = Some(public_port);
+                    let _ = EnvironmentStore::update(&self.store, &env).await;
+                }
+                if env.state == EnvironmentState::Running
+                    && let Some(port) = env.host_port
+                {
+                    self.proxy
+                        .set_target(env.project_id, &env.branch.name, port)
+                        .await;
+                }
             }
 
             let outcome = match (env.state, status) {
@@ -1618,12 +1819,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let transition = action
             .transition()
             .expect("Keep is filtered out before calling apply_gc_action");
-        let name = container_name(project, &env.branch.name);
+        let name = resolved_container_name(project, &env);
 
         match action {
             GcAction::Pause => self.oci.pause(&name).await?,
             GcAction::Hibernate | GcAction::Destroy => self.oci.stop(&name).await?,
             GcAction::Keep => unreachable!("Keep is filtered out before calling apply_gc_action"),
+        }
+        if self.docker_network.is_none() {
+            if action == GcAction::Destroy {
+                self.proxy.remove(env.project_id, &env.branch.name).await;
+            } else {
+                self.proxy
+                    .mark_unavailable(env.project_id, &env.branch.name)
+                    .await;
+            }
         }
         if action == GcAction::Destroy {
             self.oci.remove(&name).await?;
@@ -1704,35 +1914,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 format!("{}/api/v1/heartbeat", self.daemon_url),
             ),
         ])
-    }
-
-    /// Tears down the previous live deployment of `branch`, if any, so a
-    /// redeploy doesn't collide on the reused container name and doesn't
-    /// leave a stale `Running`-looking row behind. See [`Self::deploy`].
-    async fn replace_previous_deployment(
-        &self,
-        project: &Project,
-        project_id: ProjectId,
-        branch: &BranchName,
-    ) -> Result<(), CpError> {
-        let Some(mut previous) = self.find_environment_by_branch(project_id, branch).await? else {
-            return Ok(());
-        };
-        if previous.state == EnvironmentState::Destroyed {
-            return Ok(());
-        }
-
-        let name = container_name(project, &previous.branch.name);
-        match self.oci.remove(&name).await {
-            Ok(()) | Err(OciError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
-        let now = OffsetDateTime::now_utc();
-        previous
-            .transition(StateTransition::Destroy, now)
-            .map_err(|e| state_err(&e))?;
-        EnvironmentStore::update(&self.store, &previous).await?;
-        Ok(())
     }
 
     async fn find_project_by_repo(
@@ -1840,8 +2021,24 @@ fn hash_token(raw_token: &str) -> String {
     hex::encode(digest)
 }
 
+/// Legacy deterministic container name (one instance per project+branch,
+/// ever) — kept only as the fallback for environments deployed before
+/// `Environment::container_name` was persisted per-deployment. Every live
+/// call site should go through [`resolved_container_name`] instead, so an
+/// old row's actual (already-running) container is still found correctly.
 fn container_name(project: &Project, branch: &BranchName) -> String {
     format!("oxid-{}-{}", project.name, sanitize_label(branch))
+}
+
+/// The container name this environment's own instance actually runs
+/// under — its persisted `container_name` if set (every deployment since
+/// zero-downtime redeploys shipped sets this, uniquely per environment id,
+/// so a redeploy's new instance never collides with the still-running old
+/// one), or the legacy project+branch name for anything deployed before.
+fn resolved_container_name(project: &Project, env: &Environment) -> String {
+    env.container_name
+        .clone()
+        .unwrap_or_else(|| container_name(project, &env.branch.name))
 }
 
 fn image_name(project: &Project, branch: &BranchName) -> String {
@@ -2080,7 +2277,12 @@ port = 8080
 
     async fn cp(oci: FakeOci) -> ControlPlane<FakeGit, FakeOci> {
         let cache = tempfile::tempdir().unwrap();
+        // FakeOci doesn't simulate a real listening socket, so the
+        // zero-downtime readiness gate (which does a real TCP connect)
+        // would otherwise time out on every deploy — see
+        // `ControlPlane::with_readiness_check`'s doc comment.
         ControlPlane::new(store().await, FakeGit, oci, cache.path().to_owned())
+            .with_readiness_check(false)
     }
 
     /// A project declaring one `redis` dependency — deliberately no
@@ -2271,7 +2473,8 @@ port = 8080
             FakeOci::default(),
             cache.path().to_owned(),
         )
-        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16);
+        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16)
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
 
         let env_a = cp
@@ -2309,7 +2512,8 @@ port = 8080
             FakeOci::default(),
             cache.path().to_owned(),
         )
-        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 1);
+        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 1)
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
 
         let env_a = cp
@@ -2367,10 +2571,25 @@ port = 8080
         assert_eq!(old.state, EnvironmentState::Destroyed);
 
         {
+            // Zero-downtime cutover: the new instance (`-2`) is built and
+            // started fully before the previous one (`-1`) is ever removed
+            // — the reverse of the old "destroy first, build second" order,
+            // which always had a gap where the branch was unreachable.
             let calls = oci.calls.lock().unwrap();
+            let run_new = calls
+                .iter()
+                .position(|c| c == "run:oxid-app-feature-a-2:env={\"OXID_BRANCH\": \"feature-a\", \"OXID_ENV_URL\": \"feature-a.app.local.dev\"}:mem=None:cpu=None")
+                .expect("new instance must have been run");
+            // The *last* removal of `-1` is the cutover teardown — its
+            // *first* occurrence is just the defensive pre-run cleanup its
+            // own deploy already did for itself.
+            let remove_old = calls
+                .iter()
+                .rposition(|c| c == "remove:oxid-app-feature-a-1")
+                .expect("previous container must eventually be removed");
             assert!(
-                calls.iter().any(|c| c == "remove:oxid-app-feature-a"),
-                "expected the previous container to be removed before redeploying: {calls:?}"
+                run_new < remove_old,
+                "previous container must not be removed until the new one is up: {calls:?}"
             );
         }
         // Exactly one live environment remains for the branch.
@@ -2393,7 +2612,8 @@ port = 8080
             SequentialGit::default(),
             oci,
             cache.path().to_owned(),
-        );
+        )
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
         let branch = BranchName::parse("main").unwrap();
 
@@ -2416,7 +2636,8 @@ port = 8080
             SequentialGit::default(),
             oci,
             cache.path().to_owned(),
-        );
+        )
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
         let branch = BranchName::parse("main").unwrap();
 
@@ -2441,7 +2662,8 @@ port = 8080
             SequentialGit::default(),
             oci,
             cache.path().to_owned(),
-        );
+        )
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
         let branch = BranchName::parse("main").unwrap();
         cp.deploy(project.id, branch.clone()).await.unwrap();
@@ -2463,7 +2685,8 @@ port = 8080
             SequentialGit::default(),
             oci,
             cache.path().to_owned(),
-        );
+        )
+        .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
         let branch = BranchName::parse("main").unwrap();
         cp.deploy(project.id, branch.clone()).await.unwrap();
@@ -2516,6 +2739,67 @@ port = 8080
             .await
             .unwrap();
         assert_eq!(env.state, EnvironmentState::Running);
+    }
+
+    /// The whole point of building new-before-old for a redeploy: if the
+    /// new instance never comes up, the previous one — which has been
+    /// serving traffic this entire time — must be left running exactly as
+    /// it was, not torn down. Explicit user requirement ("siempre
+    /// levantando algo para no tener fallas"): a bad push must never take
+    /// an already-live branch down with it.
+    #[tokio::test]
+    async fn failed_redeploy_leaves_the_previous_instance_untouched() {
+        let repo = repo_dir_with_config();
+        let oci = FakeOci::default();
+        let cp = cp(oci.clone()).await;
+        let project = cp.register_project(repo.path()).await.unwrap();
+
+        let first = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.state, EnvironmentState::Running);
+
+        *oci.fail_run_times.lock().unwrap() = 1;
+        let err = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CpError::Oci(_)), "{err:?}");
+
+        // The previous environment must still be exactly as it was.
+        let still_live = EnvironmentStore::get(&cp.store, first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_live.state, EnvironmentState::Running);
+
+        // Its container must have been removed exactly once — the
+        // defensive pre-run cleanup its *own* first deploy already did for
+        // itself — and never a second time because of the failed redeploy.
+        {
+            let calls = oci.calls.lock().unwrap();
+            let removes_of_previous = calls
+                .iter()
+                .filter(|c| *c == "remove:oxid-app-feature-a-1")
+                .count();
+            assert_eq!(
+                removes_of_previous, 1,
+                "previous container must survive a failed redeploy untouched: {calls:?}"
+            );
+        }
+
+        // A subsequent, successful redeploy must still work normally.
+        let second = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(second.state, EnvironmentState::Running);
+        let old = EnvironmentStore::get(&cp.store, first.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.state, EnvironmentState::Destroyed);
     }
 
     /// Regression test for a real race found by firing ten concurrent `oxid
@@ -2786,7 +3070,8 @@ cpu_limit_millicores = 250
         let repo = repo_dir_with_config();
         let cache = tempfile::tempdir().unwrap();
         let oci = FakeOci::default();
-        let cp = ControlPlane::new(store().await, FakeGit, oci.clone(), cache.path().to_owned());
+        let cp = ControlPlane::new(store().await, FakeGit, oci.clone(), cache.path().to_owned())
+            .with_readiness_check(false);
         let project = cp.register_project(repo.path()).await.unwrap();
         let env = cp
             .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -3229,10 +3514,10 @@ cpu_limit_millicores = 250
             .await
             .unwrap();
 
-        oci.container_statuses
-            .lock()
-            .unwrap()
-            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Missing);
+        oci.container_statuses.lock().unwrap().insert(
+            format!("oxid-app-feature-a-{}", env.id.0),
+            ContainerStatus::Missing,
+        );
 
         let errors = cp.reconcile_startup_state().await.unwrap();
         assert!(errors.is_empty(), "{errors:?}");
@@ -3258,10 +3543,10 @@ cpu_limit_millicores = 250
 
         // A reboot doesn't preserve the cgroup-freezer "paused" state —
         // `unless-stopped` brings the container back fully running.
-        oci.container_statuses
-            .lock()
-            .unwrap()
-            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Running);
+        oci.container_statuses.lock().unwrap().insert(
+            format!("oxid-app-feature-a-{}", env.id.0),
+            ContainerStatus::Running,
+        );
 
         let errors = cp.reconcile_startup_state().await.unwrap();
         assert!(errors.is_empty(), "{errors:?}");
@@ -3270,7 +3555,7 @@ cpu_limit_millicores = 250
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c == "pause:oxid-app-feature-a"),
+                .any(|c| *c == format!("pause:oxid-app-feature-a-{}", env.id.0)),
             "{:?}",
             oci.calls.lock().unwrap()
         );
@@ -3282,14 +3567,15 @@ cpu_limit_millicores = 250
         let oci = FakeOci::default();
         let cp = cp(oci.clone()).await;
         let project = cp.register_project(repo.path()).await.unwrap();
-        cp.deploy(project.id, BranchName::parse("feature-a").unwrap())
+        let env = cp
+            .deploy(project.id, BranchName::parse("feature-a").unwrap())
             .await
             .unwrap();
 
-        oci.container_statuses
-            .lock()
-            .unwrap()
-            .insert("oxid-app-feature-a".to_owned(), ContainerStatus::Stopped);
+        oci.container_statuses.lock().unwrap().insert(
+            format!("oxid-app-feature-a-{}", env.id.0),
+            ContainerStatus::Stopped,
+        );
 
         let errors = cp.reconcile_startup_state().await.unwrap();
         assert!(errors.is_empty(), "{errors:?}");
@@ -3298,7 +3584,7 @@ cpu_limit_millicores = 250
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|c| c == "start:oxid-app-feature-a"),
+                .any(|c| *c == format!("start:oxid-app-feature-a-{}", env.id.0)),
             "{:?}",
             oci.calls.lock().unwrap()
         );

@@ -279,14 +279,18 @@ fn api_base(cli_flag: Option<&str>) -> String {
 /// Builds the address a human should actually open for `env`. Without
 /// Traefik, `env["url"]` is a `branch.base-domain` hostname that only means
 /// anything as a Traefik `Host()` rule — it isn't reachable at all without
-/// DNS/hosts pointing it somewhere. Docker always picks the real published
-/// host port itself now (a busy one should never block a deploy), so when
-/// the daemon reports one back (`env["host_port"]`), that combined with the
-/// daemon's own host is what's actually reachable; falls back to the
-/// Traefik-style `url` when there's no `host_port` (Traefik mode).
+/// DNS/hosts pointing it somewhere. Prefers `env["public_port"]` — the
+/// branch's stable address (Oxid's own built-in zero-downtime proxy, which
+/// stays the same across redeploys); falls back to `env["host_port"]` (the
+/// container's own published port, which changes every redeploy) for
+/// environments that predate `public_port`, then to the Traefik-style `url`
+/// when neither exists.
 fn env_display_address(base: &str, env: &Value) -> String {
     let fallback = env["url"].as_str().unwrap_or("?").to_owned();
-    let Some(port) = env["host_port"].as_u64() else {
+    let port = env["public_port"]
+        .as_u64()
+        .or_else(|| env["host_port"].as_u64());
+    let Some(port) = port else {
         return fallback;
     };
     let host = base

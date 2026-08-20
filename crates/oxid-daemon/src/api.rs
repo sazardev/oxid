@@ -369,9 +369,10 @@ impl From<CpError> for ApiError {
             CpError::Git(_) | CpError::Oci(_) | CpError::Pool(PoolError::Failure(_)) => {
                 Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
             }
-            CpError::InsufficientCapacity(_) => {
+            CpError::InsufficientCapacity(_) | CpError::DeployNotReady(_) => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
             }
+            CpError::Proxy(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         }
     }
 }
@@ -1417,7 +1418,8 @@ mod tests {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
         let oci = FakeOci::default();
-        let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+            .with_readiness_check(false);
         (
             router(ApiState {
                 cp,
@@ -1434,7 +1436,8 @@ mod tests {
     async fn test_app_with_token(token: &str) -> Router {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         router(ApiState {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
@@ -1459,7 +1462,8 @@ mod tests {
         let oci = FakeOci::default();
         let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
             .with_resource_defaults(Some(default_mem_mb), None)
-            .with_admission_control(Some(reserved_mb));
+            .with_admission_control(Some(reserved_mb))
+            .with_readiness_check(false);
         (
             router(ApiState {
                 cp,
@@ -1856,7 +1860,8 @@ port = 8080
     async fn rotate_key_requires_master_and_keeps_secrets_readable() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         let data_dir = test_data_dir();
         let app = router(ApiState {
             cp,
@@ -1933,7 +1938,8 @@ port = 8080
     async fn rate_limit_blocks_a_burst_past_its_configured_size() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         let app = router(ApiState {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
@@ -2021,7 +2027,8 @@ port = 8080
             .await
             .unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         let app = router(ApiState {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
@@ -2062,7 +2069,8 @@ port = 8080
     async fn restore_is_rejected_when_not_allowed() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         let app = router(ApiState {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
@@ -2083,7 +2091,8 @@ port = 8080
             .await
             .unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned());
+        let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+            .with_readiness_check(false);
         let app = router(ApiState {
             cp,
             webhook_secret: Some("test-secret".to_owned()),
@@ -2614,11 +2623,11 @@ port = 8080
         let calls = oci.calls.lock().unwrap();
         let run_a = calls
             .iter()
-            .find(|c| c.starts_with("run:oxid-app-feature-a:"))
+            .find(|c| c.starts_with("run:oxid-app-feature-a-"))
             .expect("feature-a container was started");
         let run_b = calls
             .iter()
-            .find(|c| c.starts_with("run:oxid-app-feature-b:"))
+            .find(|c| c.starts_with("run:oxid-app-feature-b-"))
             .expect("feature-b container was started");
         assert!(run_a.contains("\"DB_PASSWORD\": \"secret-a\""), "{run_a}");
         assert!(run_b.contains("\"DB_PASSWORD\": \"secret-b\""), "{run_b}");
