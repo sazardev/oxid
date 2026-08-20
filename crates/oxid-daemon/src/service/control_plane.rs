@@ -438,6 +438,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(project)
     }
 
+    /// Sets (or, with `token: None`/an empty string, clears) a project's git
+    /// access token — required for the daemon to clone/fetch a *private*
+    /// repository, since its own git-cache clone is independent of any
+    /// credential helper the operator's own shell has configured. Never
+    /// returned by any API response: it lives only in the encrypted
+    /// `projects.git_token_enc` column, decrypted just-in-time by
+    /// [`Self::deploy_at`] right before the git operation that needs it.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn set_project_git_token(
+        &self,
+        project_id: ProjectId,
+        token: Option<&str>,
+    ) -> Result<(), CpError> {
+        self.ensure_project(project_id).await?;
+        Ok(self.store.set_git_token(project_id, token).await?)
+    }
+
     /// Deploys `branch` for a project: clone, build, run, then transition to
     /// `Running`. Always deploys immediately, ignoring admission control —
     /// see [`Self::deploy_or_queue`] for the capacity-aware entry point
@@ -574,6 +593,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
+    #[allow(clippy::too_many_lines)]
     async fn deploy_at(
         &self,
         project_id: ProjectId,
@@ -623,10 +643,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .filter(|e| e.state != EnvironmentState::Destroyed);
 
         // 1. Clone cache + resolve (or reuse an explicit rollback target)
-        // + checkout the commit.
+        // + checkout the commit. `git_token`, when set, authenticates the
+        // clone/fetch for a private repository (see
+        // `Self::set_project_git_token`) — this daemon-side cache is cloned
+        // independently of whatever git credential helper an operator's own
+        // shell has configured, so a private repo needs its own credential.
+        let git_token = self.store.get_git_token(project.id).await?;
         let repo_dir = self
             .git
-            .ensure_repo(&project.repo_url, &self.cache_dir)
+            .ensure_repo(&project.repo_url, git_token.as_deref(), &self.cache_dir)
             .await?;
         let commit = match sha_override {
             Some(sha) => CommitRef {
@@ -2099,7 +2124,12 @@ mod tests {
             RepoUrl::parse("https://github.com/org/app.git")
                 .map_err(|e| GitError::Failure(e.to_string()))
         }
-        async fn ensure_repo(&self, _url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError> {
+        async fn ensure_repo(
+            &self,
+            _url: &RepoUrl,
+            _token: Option<&str>,
+            cache_dir: &Path,
+        ) -> Result<PathBuf, GitError> {
             Ok(cache_dir.join("app"))
         }
         async fn resolve_branch_head(
@@ -2239,7 +2269,12 @@ mod tests {
             RepoUrl::parse("https://github.com/org/app.git")
                 .map_err(|e| GitError::Failure(e.to_string()))
         }
-        async fn ensure_repo(&self, _url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError> {
+        async fn ensure_repo(
+            &self,
+            _url: &RepoUrl,
+            _token: Option<&str>,
+            cache_dir: &Path,
+        ) -> Result<PathBuf, GitError> {
             Ok(cache_dir.join("app"))
         }
         async fn resolve_branch_head(

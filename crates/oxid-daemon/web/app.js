@@ -552,6 +552,9 @@ function dashboard() {
       this.projectSettingsForm = {
         pause_after: project.config.pause_after,
         destroy_after: project.config.destroy_after,
+        // Write-only, like project secrets — never echoed back by the API,
+        // so this always starts blank regardless of whether one is set.
+        git_token: "",
       };
     },
 
@@ -570,6 +573,35 @@ function dashboard() {
         this.loadForRoute();
       } catch (err) {
         this.showNotice(`Updating settings failed: ${err.message}`);
+      }
+    },
+
+    async saveGitToken(project) {
+      const token = this.projectSettingsForm.git_token.trim();
+      if (!token) {
+        this.showNotice("Enter a token first, or use \"clear\" to remove it.");
+        return;
+      }
+      try {
+        await this.apiSend("PATCH", `/api/v1/projects/${project.id}`, { git_token: token });
+        this.projectSettingsForm.git_token = "";
+        this.showNotice(`Saved git token for \`${project.name}\`.`);
+      } catch (err) {
+        this.showNotice(`Saving git token failed: ${err.message}`);
+      }
+    },
+
+    async clearGitToken(project) {
+      const confirmed = await this.confirmDialog(`Clear the git token for \`${project.name}\`?`);
+      if (!confirmed) {
+        return;
+      }
+      try {
+        await this.apiSend("PATCH", `/api/v1/projects/${project.id}`, { git_token: "" });
+        this.projectSettingsForm.git_token = "";
+        this.showNotice(`Cleared git token for \`${project.name}\`.`);
+      } catch (err) {
+        this.showNotice(`Clearing git token failed: ${err.message}`);
       }
     },
 

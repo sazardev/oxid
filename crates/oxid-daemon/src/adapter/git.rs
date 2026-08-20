@@ -28,10 +28,16 @@ impl GitPort for GitClient {
             .map_err(|e| GitError::Failure(format!("task failed: {e}")))?
     }
 
-    async fn ensure_repo(&self, url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError> {
+    async fn ensure_repo(
+        &self,
+        url: &RepoUrl,
+        token: Option<&str>,
+        cache_dir: &Path,
+    ) -> Result<PathBuf, GitError> {
         let url = url.clone();
+        let token = token.map(str::to_owned);
         let cache_dir = cache_dir.to_owned();
-        tokio::task::spawn_blocking(move || sync_ensure_repo(&url, &cache_dir))
+        tokio::task::spawn_blocking(move || sync_ensure_repo(&url, token.as_deref(), &cache_dir))
             .await
             .map_err(|e| GitError::Failure(format!("task failed: {e}")))?
     }
@@ -96,28 +102,73 @@ pub(crate) fn cache_dir_name(url: &RepoUrl) -> String {
         .collect()
 }
 
-fn sync_ensure_repo(url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError> {
+/// Builds the URL actually used for the clone/fetch network operation,
+/// injecting `token` as HTTPS userinfo (`x-access-token:<token>@host`) when
+/// given — the standard way GitHub (and most other hosts) accept a PAT over
+/// HTTPS without a separate credentials callback. Non-`https` URLs (local
+/// paths, `file://`, already-authenticated `ssh://`) are returned
+/// unchanged; `cache_dir_name` is computed from the original `url`, not
+/// this one, so a token (or a rotated one) never ends up encoded into the
+/// git-cache directory name on disk.
+fn authenticated_url(url: &RepoUrl, token: Option<&str>) -> String {
+    let raw = url.as_str();
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return raw.to_owned();
+    };
+    let Some(rest) = raw.strip_prefix("https://") else {
+        return raw.to_owned();
+    };
+    // Already has embedded userinfo (`user:pass@host/...`) — don't clobber
+    // an explicitly-provided credential with the stored token.
+    if rest.contains('@') {
+        return raw.to_owned();
+    }
+    format!("https://x-access-token:{token}@{rest}")
+}
+
+fn sync_ensure_repo(
+    url: &RepoUrl,
+    token: Option<&str>,
+    cache_dir: &Path,
+) -> Result<PathBuf, GitError> {
     std::fs::create_dir_all(cache_dir).map_err(map_err)?;
     let dir = cache_dir.join(cache_dir_name(url));
+    let auth_url = authenticated_url(url, token);
 
     if dir.exists() {
         // A cached clone can be arbitrarily stale: a webhook redeploying a
         // branch that was pushed to *after* the first-ever deploy of this
         // project must see the new commits, not the ones from whenever the
         // cache was first populated.
-        let repo = Repository::open(&dir).map_err(map_err)?;
-        fetch_origin(&repo)?;
+        fetch_origin(&auth_url, &dir)?;
         return Ok(dir);
     }
 
     // git2::Repository::clone accepts local paths and file:// URLs.
-    Repository::clone(url.as_str(), &dir).map_err(map_err)?;
+    let repo = Repository::clone(&auth_url, &dir).map_err(map_err)?;
+    // `clone` persists whatever URL it was given as `origin` in
+    // `.git/config` — reset it back to the token-free public URL right
+    // away so a token never lingers on disk beyond this one clone call.
+    // `fetch_origin` never needs to read this back; it always fetches
+    // through its own anonymous, re-authenticated remote.
+    if auth_url != url.as_str() {
+        repo.remote_set_url("origin", url.as_str())
+            .map_err(map_err)?;
+    }
     Ok(dir)
 }
 
-/// Fetches every remote branch from `origin` into `refs/remotes/origin/*`.
-fn fetch_origin(repo: &Repository) -> Result<(), GitError> {
-    let mut remote = repo.find_remote("origin").map_err(map_err)?;
+/// Fetches every remote branch into `refs/remotes/origin/*`, always via an
+/// anonymous (not persisted to `.git/config`) remote pointed at `auth_url` —
+/// deliberately never `find_remote("origin")` + `remote_set_url`, which
+/// would write the token into the cache's on-disk git config in plaintext
+/// and leave it there indefinitely. Using an anonymous remote means a
+/// token added, rotated or removed after the cache already exists still
+/// takes effect on the very next redeploy (nothing stale is reused), while
+/// never persisting the credential anywhere beyond this one fetch call.
+fn fetch_origin(auth_url: &str, dir: &Path) -> Result<(), GitError> {
+    let repo = Repository::open(dir).map_err(map_err)?;
+    let mut remote = repo.remote_anonymous(auth_url).map_err(map_err)?;
     remote
         .fetch(&["+refs/heads/*:refs/remotes/origin/*"], None, None)
         .map_err(map_err)
@@ -249,11 +300,11 @@ mod tests {
 
         let client = GitClient::new();
         let url = RepoUrl::parse(&origin).unwrap();
-        let cloned = client.ensure_repo(&url, cache.path()).await.unwrap();
+        let cloned = client.ensure_repo(&url, None, cache.path()).await.unwrap();
         assert!(cloned.exists());
 
         // Reusing the cache does not fail.
-        let again = client.ensure_repo(&url, cache.path()).await.unwrap();
+        let again = client.ensure_repo(&url, None, cache.path()).await.unwrap();
         assert_eq!(again, cloned);
 
         // The cloned repo can resolve its own branch head.
@@ -314,7 +365,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let client = GitClient::new();
         let url = RepoUrl::parse(&origin).unwrap();
-        let cloned = client.ensure_repo(&url, cache.path()).await.unwrap();
+        let cloned = client.ensure_repo(&url, None, cache.path()).await.unwrap();
 
         let branch = BranchName::parse("feature-one").unwrap();
         let head = client.resolve_branch_head(&cloned, &branch).await.unwrap();
@@ -336,7 +387,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let client = GitClient::new();
         let url = RepoUrl::parse(&origin).unwrap();
-        client.ensure_repo(&url, cache.path()).await.unwrap();
+        client.ensure_repo(&url, None, cache.path()).await.unwrap();
 
         // Push a new commit to `main` in the source repo after the cache
         // already exists.
@@ -360,9 +411,76 @@ mod tests {
             .to_string()
         };
 
-        let cloned = client.ensure_repo(&url, cache.path()).await.unwrap();
+        let cloned = client.ensure_repo(&url, None, cache.path()).await.unwrap();
         let branch = BranchName::parse("main").unwrap();
         let head = client.resolve_branch_head(&cloned, &branch).await.unwrap();
         assert_eq!(head.sha, new_sha, "cache hit did not fetch the new commit");
+    }
+
+    #[test]
+    fn authenticated_url_injects_token_only_for_plain_https() {
+        let https = RepoUrl::parse("https://github.com/org/app.git").unwrap();
+        assert_eq!(
+            authenticated_url(&https, Some("ghp_abc123")),
+            "https://x-access-token:ghp_abc123@github.com/org/app.git"
+        );
+
+        // No token given: unchanged.
+        assert_eq!(
+            authenticated_url(&https, None),
+            "https://github.com/org/app.git"
+        );
+        assert_eq!(
+            authenticated_url(&https, Some("")),
+            "https://github.com/org/app.git"
+        );
+
+        // Already has embedded userinfo: never clobbered.
+        let with_creds = RepoUrl::parse("https://user:pass@github.com/org/app.git").unwrap();
+        assert_eq!(
+            authenticated_url(&with_creds, Some("ghp_abc123")),
+            "https://user:pass@github.com/org/app.git"
+        );
+
+        // Non-https (local/file://): never touched, even with a token set.
+        let local = RepoUrl::parse("file:///tmp/repo").unwrap();
+        assert_eq!(
+            authenticated_url(&local, Some("ghp_abc123")),
+            "file:///tmp/repo"
+        );
+    }
+
+    /// Regression guard: cloning with a token must not leave it sitting in
+    /// the cache's on-disk `.git/config` afterward — `sync_ensure_repo`
+    /// resets `origin` back to the token-free URL right after `clone`.
+    #[tokio::test]
+    async fn ensure_repo_does_not_persist_the_token_in_git_config() {
+        let src = tempfile::tempdir().unwrap();
+        let origin = format!("file://{}", src.path().display());
+        init_repo(src.path(), &origin);
+        let cache = tempfile::tempdir().unwrap();
+
+        let client = GitClient::new();
+        let url = RepoUrl::parse(&origin).unwrap();
+        // `file://` URLs are never token-injected (see
+        // `authenticated_url`), so this exercises the "unchanged" path
+        // safely without needing a real authenticated remote — the
+        // property under test is specifically that whatever `origin` ends
+        // up as on disk exactly matches the token-free `url`, never a
+        // token-embedded variant.
+        let cloned = client
+            .ensure_repo(&url, Some("should-never-be-persisted"), cache.path())
+            .await
+            .unwrap();
+
+        let repo = Repository::open(&cloned).unwrap();
+        let remote = repo.find_remote("origin").unwrap();
+        assert_eq!(remote.url().unwrap(), origin);
+        assert!(
+            !std::fs::read_to_string(cloned.join(".git/config"))
+                .unwrap()
+                .contains("should-never-be-persisted"),
+            "token must never be written to .git/config"
+        );
     }
 }

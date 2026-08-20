@@ -343,6 +343,24 @@
               <button class="btn btn-sm" @click="saveProjectSettings(currentProject())">save</button>
             </div>
 
+            <h2>Private repo access</h2>
+            <p class="muted">
+              Only needed for a private repository — a GitHub personal access token (or
+              equivalent) letting this daemon clone/fetch it on its own. Write-only: never
+              shown back once saved.
+            </p>
+            <div class="secret-form">
+              <label class="mono muted">git_token</label>
+              <input
+                class="token-input mono"
+                type="password"
+                placeholder="e.g. ghp_..., leave blank to keep unchanged"
+                x-model="projectSettingsForm.git_token"
+              />
+              <button class="btn btn-sm" @click="saveGitToken(currentProject())">save</button>
+              <button class="btn btn-sm btn-danger" @click="clearGitToken(currentProject())">clear</button>
+            </div>
+
             <div class="deploy-form">
               <input
                 class="token-input mono"

@@ -139,6 +139,12 @@ enum Command {
         /// New max lifetime before permanent teardown, e.g. `3d`.
         #[arg(long)]
         destroy_after: Option<String>,
+        /// Git access token for a private repository (e.g. a GitHub PAT) —
+        /// required for the daemon to clone/fetch it, since its own
+        /// git-cache clone doesn't inherit any credential helper from your
+        /// shell. Pass an empty string to clear it.
+        #[arg(long)]
+        git_token: Option<String>,
     },
 }
 
@@ -470,12 +476,14 @@ async fn main() {
         Command::Configure {
             pause_after,
             destroy_after,
+            git_token,
         } => {
             cmd_configure(
                 &client,
                 &base,
                 pause_after.as_deref(),
                 destroy_after.as_deref(),
+                git_token.as_deref(),
             )
             .await
         }
@@ -926,10 +934,11 @@ async fn cmd_configure(
     base: &str,
     pause_after: Option<&str>,
     destroy_after: Option<&str>,
+    git_token: Option<&str>,
 ) -> Result<(), CliError> {
-    if pause_after.is_none() && destroy_after.is_none() {
+    if pause_after.is_none() && destroy_after.is_none() && git_token.is_none() {
         return Err(
-            "nothing to configure — pass --pause-after and/or --destroy-after"
+            "nothing to configure — pass --pause-after, --destroy-after and/or --git-token"
                 .to_owned()
                 .into(),
         );
@@ -942,7 +951,11 @@ async fn cmd_configure(
     let url = format!("{base}/api/v1/projects/{project_id}");
     let response = client
         .patch(&url)
-        .json(&json!({ "pause_after": pause_after, "destroy_after": destroy_after }))
+        .json(&json!({
+            "pause_after": pause_after,
+            "destroy_after": destroy_after,
+            "git_token": git_token,
+        }))
         .send()
         .await
         .map_err(|e| connect_error(&url, &e))?;
@@ -961,12 +974,20 @@ async fn cmd_configure(
     let updated: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     if !emit_json(&updated) {
-        ok(format!(
+        let mut msg = format!(
             "Updated `{}`: pause_after={} destroy_after={}",
             updated["name"].as_str().unwrap_or("?"),
             updated["config"]["pause_after"].as_str().unwrap_or("?"),
             updated["config"]["destroy_after"].as_str().unwrap_or("?"),
-        ));
+        );
+        if let Some(token) = git_token {
+            msg.push_str(if token.is_empty() {
+                " git_token=cleared"
+            } else {
+                " git_token=set"
+            });
+        }
+        ok(msg);
     }
     Ok(())
 }

@@ -133,9 +133,85 @@ impl SqliteStore {
                 .execute(&mut *tx)
                 .await?;
         }
+        // Also re-encrypts `projects.git_token_enc` — easy to forget since
+        // it's a completely separate table from `secrets`, but it's
+        // encrypted with the very same cipher and would otherwise become
+        // silently undecryptable the moment `self.cipher` below is swapped.
+        let project_rows =
+            sqlx::query("SELECT id, git_token_enc FROM projects WHERE git_token_enc IS NOT NULL")
+                .fetch_all(&mut *tx)
+                .await?;
+        for row in project_rows {
+            let id: i64 = row.try_get("id")?;
+            let git_token_enc: String = row.try_get("git_token_enc")?;
+            let plaintext = old_cipher.decrypt(&git_token_enc)?;
+            let re_encrypted = new_cipher.encrypt(&plaintext)?;
+            sqlx::query("UPDATE projects SET git_token_enc = ? WHERE id = ?")
+                .bind(re_encrypted)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         self.cipher.store(Arc::new(new_cipher));
         Ok(())
+    }
+
+    /// Sets (or, with `token: None`, clears) a project's git access token —
+    /// needed to clone/fetch a private repository, since the daemon's own
+    /// git-cache clone is independent of any credential helper the operator's
+    /// shell has configured. Encrypted at rest with the same cipher used for
+    /// `secrets.value_enc`; deliberately not exposed on the `Project` domain
+    /// struct (which is returned wholesale from `GET /api/v1/projects`), so
+    /// it's only ever decrypted right before the git operation that needs it.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError::NotFound`] if the project does not exist.
+    pub async fn set_git_token(
+        &self,
+        project_id: ProjectId,
+        token: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let encrypted = token
+            .filter(|t| !t.is_empty())
+            .map(|t| self.cipher.load().encrypt(t))
+            .transpose()
+            .map_err(storage)?;
+        let res = sqlx::query("UPDATE projects SET git_token_enc = ? WHERE id = ?")
+            .bind(encrypted)
+            .bind(id_as_i64(project_id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "project `{project_id}` does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Decrypts and returns a project's git access token, if one is set.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query or decryption failure.
+    pub async fn get_git_token(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<String>, RepositoryError> {
+        let row = sqlx::query("SELECT git_token_enc FROM projects WHERE id = ?")
+            .bind(id_as_i64(project_id.0))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let encrypted: Option<String> = row.try_get("git_token_enc").map_err(storage)?;
+        encrypted
+            .map(|enc| self.cipher.load().decrypt(&enc))
+            .transpose()
+            .map_err(storage)
     }
 
     async fn open_with(opts: SqliteConnectOptions, cipher: Cipher) -> Result<Self, StoreError> {
@@ -1205,6 +1281,72 @@ mod tests {
         // The old key genuinely can't decrypt it anymore.
         let old_cipher = Cipher::from_key([1u8; 32]);
         assert!(old_cipher.decrypt(&new_value_enc).is_err());
+    }
+
+    #[tokio::test]
+    async fn git_token_round_trips_encrypted_and_clears() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = project(1);
+        let id = ProjectStore::create(&store, &project).await.unwrap();
+
+        assert_eq!(store.get_git_token(id).await.unwrap(), None);
+
+        store
+            .set_git_token(id, Some("ghp_secret123"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_git_token(id).await.unwrap(),
+            Some("ghp_secret123".to_owned())
+        );
+
+        // Stored encrypted, not in plaintext.
+        let raw: Option<String> = sqlx::query("SELECT git_token_enc FROM projects WHERE id = ?")
+            .bind(id_as_i64(id.0))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .try_get("git_token_enc")
+            .unwrap();
+        assert_ne!(raw.as_deref(), Some("ghp_secret123"));
+
+        // Clearing it (empty string, matching the API's "empty clears"
+        // convention) removes it entirely.
+        store.set_git_token(id, Some("")).await.unwrap();
+        assert_eq!(store.get_git_token(id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn rotate_master_key_also_re_encrypts_project_git_tokens() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = project(1);
+        let id = ProjectStore::create(&store, &project).await.unwrap();
+        store
+            .set_git_token(id, Some("ghp_secret123"))
+            .await
+            .unwrap();
+
+        store
+            .rotate_master_key(Cipher::from_key([42u8; 32]))
+            .await
+            .unwrap();
+
+        // Still readable through the store under the new key.
+        assert_eq!(
+            store.get_git_token(id).await.unwrap(),
+            Some("ghp_secret123".to_owned())
+        );
+
+        // The old key genuinely can't decrypt it anymore.
+        let raw: String = sqlx::query("SELECT git_token_enc FROM projects WHERE id = ?")
+            .bind(id_as_i64(id.0))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap()
+            .try_get("git_token_enc")
+            .unwrap();
+        let old_cipher = Cipher::from_key([1u8; 32]);
+        assert!(old_cipher.decrypt(&raw).is_err());
     }
 
     fn project(id: u64) -> Project {

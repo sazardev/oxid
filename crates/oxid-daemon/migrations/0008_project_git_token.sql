@@ -1,0 +1,11 @@
+-- Private-repo support: the daemon clones/fetches a project's repo into its
+-- own git-cache directory, independent of whatever credential helper the
+-- operator's own shell has configured — so a private repo needs its own
+-- credential, explicitly given to Oxid rather than inherited.
+--
+-- Deliberately not a field on the `Project` domain struct: `Project` is
+-- returned wholesale in API responses (`GET /api/v1/projects`), and a plain
+-- struct field would leak the token there. Stored encrypted (same AES-GCM
+-- cipher already used for `secrets.value_enc`) and only ever decrypted right
+-- before a git operation that needs it.
+ALTER TABLE projects ADD COLUMN git_token_enc TEXT;

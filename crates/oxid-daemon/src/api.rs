@@ -780,11 +780,18 @@ struct UpdateProjectBody {
     pause_after: Option<String>,
     /// New max lifetime before permanent teardown, e.g. `"3d"`.
     destroy_after: Option<String>,
+    /// New git access token for a private repository — an empty string
+    /// clears it. Never echoed back by any response (see
+    /// `ControlPlane::set_project_git_token`'s doc comment for why it isn't
+    /// a field on `Project` at all).
+    git_token: Option<String>,
 }
 
-/// Updates a project's `pause_after`/`destroy_after` policy — the settings
-/// `oxid.toml` only ever seeds once at first registration, with the
-/// dashboard's project settings form as the intended caller.
+/// Updates a project's `pause_after`/`destroy_after` policy and/or its git
+/// access token — the settings `oxid.toml` only ever seeds once at first
+/// registration, with the dashboard's project settings form as the intended
+/// caller for the TTLs, and `oxid configure --git-token`/the dashboard's
+/// secrets-style write-only field for the token.
 async fn update_project<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
@@ -803,6 +810,12 @@ async fn update_project<
         .map(|raw| Ttl::parse(&raw))
         .transpose()
         .map_err(|e| ApiError::from_validation(e.to_string()))?;
+    if let Some(git_token) = body.git_token.as_deref() {
+        state
+            .cp
+            .set_project_git_token(ProjectId(id), Some(git_token).filter(|t| !t.is_empty()))
+            .await?;
+    }
     let project = state
         .cp
         .update_project_ttls(ProjectId(id), pause_after, destroy_after)
@@ -1294,6 +1307,7 @@ mod tests {
         async fn ensure_repo(
             &self,
             _url: &RepoUrl,
+            _token: Option<&str>,
             cache_dir: &std::path::Path,
         ) -> Result<std::path::PathBuf, GitError> {
             Ok(cache_dir.join("app"))

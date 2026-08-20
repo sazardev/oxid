@@ -223,11 +223,20 @@ pub trait GitPort {
     /// [`GitError::Failure`] if the directory is not a repo or has no `origin`.
     async fn remote_url(&self, repo_dir: &Path) -> Result<RepoUrl, GitError>;
     /// Clones `url` into `cache_dir` (or reuses an existing clone), returning
-    /// the repository directory.
+    /// the repository directory. `token`, when given, authenticates the
+    /// clone/fetch as an HTTPS access token (e.g. a GitHub PAT) — needed for
+    /// any private repository, since this cache is cloned by the daemon
+    /// itself and doesn't inherit whatever git credential helper the
+    /// operator's own shell has configured.
     ///
     /// # Errors
-    /// [`GitError::Failure`] on any clone/cache failure.
-    async fn ensure_repo(&self, url: &RepoUrl, cache_dir: &Path) -> Result<PathBuf, GitError>;
+    /// [`GitError::Failure`] on any clone/cache/auth failure.
+    async fn ensure_repo(
+        &self,
+        url: &RepoUrl,
+        token: Option<&str>,
+        cache_dir: &Path,
+    ) -> Result<PathBuf, GitError>;
     /// Resolves the head commit of `branch` in `repo_dir`.
     ///
     /// # Errors
