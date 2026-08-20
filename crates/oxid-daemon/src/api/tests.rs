@@ -1,0 +1,1963 @@
+use super::*;
+use std::sync::{Arc, Mutex};
+
+use axum::body::Body;
+use axum::http::Request;
+use oxid_core::{BuildSpec, ContainerSpec, GitError, OciError, RepoUrl};
+use tower::ServiceExt;
+
+use crate::adapter::crypto::Cipher;
+use crate::adapter::store::SqliteStore;
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[derive(Debug, Clone, Default)]
+struct FakeGit;
+
+impl GitPort for FakeGit {
+    async fn remote_url(&self, repo_dir: &std::path::Path) -> Result<RepoUrl, GitError> {
+        let _ = repo_dir;
+        RepoUrl::parse("https://github.com/org/app.git")
+            .map_err(|e| GitError::Failure(e.to_string()))
+    }
+    async fn ensure_repo(
+        &self,
+        _url: &RepoUrl,
+        _token: Option<&str>,
+        cache_dir: &std::path::Path,
+    ) -> Result<std::path::PathBuf, GitError> {
+        Ok(cache_dir.join("app"))
+    }
+    async fn resolve_branch_head(
+        &self,
+        _repo_dir: &std::path::Path,
+        branch: &BranchName,
+    ) -> Result<oxid_core::CommitRef, GitError> {
+        Ok(oxid_core::CommitRef {
+            branch: branch.clone(),
+            sha: SHA.to_owned(),
+        })
+    }
+    async fn checkout_commit(
+        &self,
+        _repo_dir: &std::path::Path,
+        _sha: &str,
+    ) -> Result<(), GitError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeOci {
+    calls: Arc<Mutex<Vec<String>>>,
+    /// Docker networks `ensure_network`/`network_exists` believe exist.
+    networks: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ContainerPort for FakeOci {
+    async fn build(&self, spec: &BuildSpec) -> Result<(), OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("build:{}", spec.image));
+        Ok(())
+    }
+    async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("run:{}:env={:?}", spec.name, spec.env));
+        Ok(spec.network.is_none().then_some(65535))
+    }
+    async fn published_port(
+        &self,
+        _name: &str,
+        _container_port: u16,
+    ) -> Result<Option<u16>, OciError> {
+        Ok(Some(65535))
+    }
+    async fn start(&self, name: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("start:{name}"));
+        Ok(())
+    }
+    async fn pause(&self, name: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("pause:{name}"));
+        Ok(())
+    }
+    async fn unpause(&self, name: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("unpause:{name}"));
+        Ok(())
+    }
+    async fn stop(&self, name: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("stop:{name}"));
+        Ok(())
+    }
+    async fn remove(&self, name: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("remove:{name}"));
+        Ok(())
+    }
+    async fn remove_image(&self, image: &str) -> Result<(), OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("remove_image:{image}"));
+        Ok(())
+    }
+    async fn logs(&self, name: &str) -> Result<String, OciError> {
+        self.calls.lock().unwrap().push(format!("logs:{name}"));
+        Ok("build log".to_owned())
+    }
+    async fn stream_logs(&self, name: &str) -> Result<oxid_core::LogStream, OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("stream_logs:{name}"));
+        Ok(Box::pin(futures_util::stream::iter(vec![Ok(
+            "build log".to_owned()
+        )])))
+    }
+    async fn exec(&self, name: &str, command: &str) -> Result<(), OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("exec:{name}:{command}"));
+        Ok(())
+    }
+    async fn container_status(&self, _name: &str) -> Result<oxid_core::ContainerStatus, OciError> {
+        Ok(oxid_core::ContainerStatus::Running)
+    }
+    async fn host_capacity(&self) -> Result<oxid_core::HostCapacity, OciError> {
+        Ok(oxid_core::HostCapacity {
+            total_memory_bytes: 8 * 1_073_741_824,
+            cpu_count: 4,
+        })
+    }
+    async fn network_exists(&self, name: &str) -> Result<bool, OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("network_exists:{name}"));
+        Ok(self.networks.lock().unwrap().contains(name))
+    }
+    async fn ensure_network(&self, name: &str) -> Result<oxid_core::NetworkStatus, OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("ensure_network:{name}"));
+        if self.networks.lock().unwrap().insert(name.to_owned()) {
+            Ok(oxid_core::NetworkStatus::Created)
+        } else {
+            Ok(oxid_core::NetworkStatus::AlreadyExisted)
+        }
+    }
+    async fn ensure_traefik(
+        &self,
+        spec: oxid_core::TraefikSpec,
+    ) -> Result<oxid_core::TraefikStatus, OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("ensure_traefik:{}", spec.container_name));
+        Ok(oxid_core::TraefikStatus::Created)
+    }
+    async fn self_wiring_status(
+        &self,
+        _network: &str,
+    ) -> Result<oxid_core::SelfWiringStatus, OciError> {
+        Ok(oxid_core::SelfWiringStatus::NotContainerized)
+    }
+}
+
+/// A data dir with a dummy `secret.key`, for backup-endpoint tests.
+/// `.keep()` leaks it (no auto-delete on drop) since it must outlive
+/// the individual request(s) a test makes against the returned router.
+fn test_data_dir() -> PathBuf {
+    let dir = tempfile::tempdir().unwrap().keep();
+    std::fs::write(dir.join("secret.key"), b"test-key-material").unwrap();
+    dir
+}
+
+async fn test_app() -> (Router, FakeOci) {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let oci = FakeOci::default();
+    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+        .with_readiness_check(false);
+    (
+        router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: test_data_dir(),
+            allow_restore: true,
+            rate_limit: None,
+        }),
+        oci,
+    )
+}
+
+async fn test_app_with_traefik() -> (Router, FakeOci) {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let oci = FakeOci::default();
+    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+        .with_readiness_check(false)
+        .with_traefik("oxid-net", "http://oxid-daemon:8080");
+    (
+        router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: test_data_dir(),
+            allow_restore: true,
+            rate_limit: None,
+        }),
+        oci,
+    )
+}
+
+async fn test_app_with_token(token: &str) -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some(token.to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        rate_limit: None,
+    })
+}
+
+/// A router whose `ControlPlane` has admission control enabled with an
+/// 8GB host (`FakeOci::host_capacity`'s fixed value) minus
+/// `reserved_mb`, and `default_mem_mb` as the daemon-default memory
+/// request for any project that doesn't set its own — for exercising
+/// `/api/v1/projects/{id}/deploy`'s queued-response path end to end.
+async fn test_app_with_admission_control(
+    reserved_mb: u64,
+    default_mem_mb: u64,
+) -> (Router, FakeOci) {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let oci = FakeOci::default();
+    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
+        .with_resource_defaults(Some(default_mem_mb), None)
+        .with_admission_control(Some(reserved_mb))
+        .with_readiness_check(false);
+    (
+        router(ApiState {
+            cp,
+            webhook_secret: Some("test-secret".to_owned()),
+            api_token: None,
+            data_dir: test_data_dir(),
+            allow_restore: true,
+            rate_limit: None,
+        }),
+        oci,
+    )
+}
+
+fn repo_dir_with_config() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("oxid.toml"),
+        r#"
+[project]
+name = "app"
+
+[routing]
+base_domain = "app.local.dev"
+port = 8080
+"#,
+    )
+    .unwrap();
+    dir
+}
+
+async fn json_request(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Vec<u8>) {
+    json_request_with_auth(app, method, uri, body, None).await
+}
+
+async fn json_request_with_auth(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Value,
+    bearer: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Like `json_request`, but for endpoints that consume/produce raw
+/// bytes instead of JSON (`/backup`, `/backup/restore`).
+async fn raw_request(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 10_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Sends a GitHub webhook with a valid `X-Hub-Signature-256` header.
+async fn signed_webhook(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
+    signed_webhook_with_event(app, payload, None).await
+}
+
+async fn signed_webhook_with_event(
+    app: &Router,
+    payload: Value,
+    event: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let raw = payload.to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"test-secret").unwrap();
+    mac.update(raw.as_bytes());
+    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/v1/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-hub-signature-256", signature);
+    if let Some(event) = event {
+        builder = builder.header("x-github-event", event);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(raw)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn health_ok() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dashboard_static_assets_are_served_without_a_token() {
+    let app = test_app_with_token("s3cr3t").await;
+    for (path, marker) in [
+        ("/", "OXID"),
+        ("/index.html", "OXID"),
+        ("/style.css", "--oxid-orange"),
+        ("/app.js", "function dashboard()"),
+        ("/vendor/alpine.min.js", "Alpine"),
+    ] {
+        let (status, body) = json_request(&app, "GET", path, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains(marker), "{path}: {text:.200}");
+    }
+}
+
+#[tokio::test]
+async fn spa_deep_links_fall_back_to_the_dashboard_shell() {
+    let app = test_app_with_token("s3cr3t").await;
+    // The client-side router owns everything under `/ui/...` — a hard
+    // refresh or a shared link on any of these has to return the same
+    // `index.html` shell, not a 404, so the JS router can take over and
+    // render the right page from `location.pathname`.
+    for path in [
+        "/ui/environments",
+        "/ui/projects/1",
+        "/ui/projects/1/secrets",
+        "/ui/environments/1?tab=logs",
+        "/ui/audit",
+        "/ui/admin",
+        "/this/route/does/not/exist/at/all",
+    ] {
+        let (status, body) = json_request(&app, "GET", path, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("OXID"), "{path}: {text:.200}");
+    }
+}
+
+#[tokio::test]
+async fn stats_endpoint_reports_aggregate_counts() {
+    let (app, _) = test_app().await;
+    let repo = repo_dir_with_config();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/stats", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let node_stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(node_stats["projects"], 1);
+    assert_eq!(node_stats["environments_running"], 1);
+    assert!(node_stats["host_total_memory_bytes"].as_u64().unwrap() > 0);
+    // No `with_traefik(...)` call in `test_app()` — the dashboard relies
+    // on this to know an environment's `url` isn't a reachable link
+    // without Traefik fronting it (SPEC.md's direct-port-publish mode).
+    assert_eq!(node_stats["traefik_enabled"], false);
+}
+
+#[tokio::test]
+async fn infra_status_requires_traefik_configured() {
+    let (app, _) = test_app().await;
+    let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("OXID_DOCKER_NETWORK")
+    );
+}
+
+#[tokio::test]
+async fn infra_status_and_bootstrap_endpoints_round_trip() {
+    let (app, _) = test_app_with_traefik().await;
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let before: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(before["network"], "oxid-net");
+    assert_eq!(before["network_exists"], false);
+
+    let (status, body) = json_request(&app, "POST", "/api/v1/infra/bootstrap", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let after_bootstrap: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(after_bootstrap["network_exists"], true);
+
+    // Idempotent: running it again through the API changes nothing and
+    // still succeeds.
+    let (status, body) = json_request(&app, "POST", "/api/v1/infra/bootstrap", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let second: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(second["network_exists"], true);
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/infra/status", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let after: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(after["network_exists"], true);
+}
+
+#[tokio::test]
+async fn api_is_open_when_no_token_is_configured() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn protected_routes_reject_missing_or_wrong_token() {
+    let app = test_app_with_token("s3cr3t").await;
+
+    let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/projects",
+        json!({}),
+        Some("wrong-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn protected_routes_accept_the_correct_token() {
+    let app = test_app_with_token("s3cr3t").await;
+    let (status, _) =
+        json_request_with_auth(&app, "GET", "/api/v1/projects", json!({}), Some("s3cr3t")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// `/health` and the Traefik-facing `/wake`/`/heartbeat` endpoints must
+/// stay reachable without a token even when one is configured — Traefik
+/// has no way to attach it, and health checks shouldn't need auth.
+#[tokio::test]
+async fn public_routes_stay_open_even_with_a_token_configured() {
+    let app = test_app_with_token("s3cr3t").await;
+    let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn creating_a_token_requires_the_master_credential() {
+    let app = test_app_with_token("master-secret").await;
+
+    // A request with no token at all isn't even authenticated.
+    let (status, _) =
+        json_request(&app, "POST", "/api/v1/tokens", json!({ "name": "alice" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The master token can mint one.
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let alice_token = created["token"].as_str().unwrap().to_owned();
+    assert_eq!(alice_token.len(), 64, "expected a 32-byte hex token");
+
+    // Alice's own (non-master) token cannot mint tokens for others.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "bob" }),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_named_token_authenticates_and_attributes_audit_events() {
+    let repo = repo_dir_with_config();
+    let app = test_app_with_token("master-secret").await;
+
+    let (_, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice" }),
+        Some("master-secret"),
+    )
+    .await;
+    let alice_token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "GET",
+        format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(
+        events.iter().any(|e| e["operator"] == "alice"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn revoked_tokens_stop_authenticating() {
+    let app = test_app_with_token("master-secret").await;
+    let (_, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice" }),
+        Some("master-secret"),
+    )
+    .await;
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let alice_token = created["token"].as_str().unwrap().to_owned();
+    let id = created["id"].as_u64().unwrap();
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/projects",
+        json!({}),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "DELETE",
+        format!("/api/v1/tokens/{id}").as_str(),
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/projects",
+        json!({}),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rotate_key_requires_master_and_keeps_secrets_readable() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let data_dir = test_data_dir();
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some("master-secret".to_owned()),
+        data_dir: data_dir.clone(),
+        allow_restore: true,
+        rate_limit: None,
+    });
+
+    json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "DB_PASSWORD", "scope": "global", "value": "hunter2" }),
+        Some("master-secret"),
+    )
+    .await;
+
+    let old_key = std::fs::read(data_dir.join("secret.key")).unwrap();
+
+    // A named (non-master) token can't rotate the key.
+    let (_, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice" }),
+        Some("master-secret"),
+    )
+    .await;
+    let alice_token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/rotate-key",
+        json!({}),
+        Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The master token can, and the secret.key file actually changes.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/rotate-key",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let new_key = std::fs::read(data_dir.join("secret.key")).unwrap();
+    assert_ne!(old_key, new_key);
+
+    // Secrets set before rotation are still readable after it — hot
+    // rotation, not "wipe and start over".
+    let (status, body) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/secrets",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rate_limit_blocks_a_burst_past_its_configured_size() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: None,
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        // 1 request/sec sustained, burst of 2 — the 3rd immediate
+        // request must be rejected.
+        rate_limit: Some((1, 2)),
+    });
+
+    let mut statuses = Vec::new();
+    for _ in 0..3 {
+        let (status, _) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+        statuses.push(status);
+    }
+    assert_eq!(statuses[0], StatusCode::OK);
+    assert_eq!(statuses[1], StatusCode::OK);
+    assert_eq!(statuses[2], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
+
+    // Public routes (no auth gate) are never rate-limited by this —
+    // Traefik's forwardAuth heartbeat hits `/heartbeat` on every single
+    // request to a live app and must never be throttled.
+    for _ in 0..5 {
+        let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn register_and_deploy_flow() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    assert_eq!(project.name, "app");
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+    assert_eq!(env.state.to_string(), "running");
+    assert_eq!(env.url, "feature-login.app.local.dev");
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/projects/{}/environments", project.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let envs: Vec<Environment> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envs.len(), 1);
+
+    let calls = oci.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.starts_with("run:oxid-app-feature-login")),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key() {
+    // `VACUUM INTO` (what `backup_to` uses) doesn't work against a
+    // `:memory:` source — a real file-backed store is needed here,
+    // matching how the daemon always runs in production.
+    let data_dir = test_data_dir();
+    let store = SqliteStore::open(data_dir.join("audit.sqlite"), Cipher::from_key([1u8; 32]))
+        .await
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: None,
+        data_dir: data_dir.clone(),
+        allow_restore: true,
+        rate_limit: None,
+    });
+    // Give the backup something real to capture.
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "GLOBAL_X", "scope": "global", "value": "v" }),
+    )
+    .await;
+
+    let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut archive = tar::Archive::new(body.as_slice());
+    archive.unpack(dir.path()).unwrap();
+    assert!(dir.path().join("secret.key").exists());
+    let snapshot = dir.path().join("audit.sqlite");
+    assert!(snapshot.exists());
+
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&snapshot);
+    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM secrets WHERE name = 'GLOBAL_X'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.0, 1);
+}
+
+#[tokio::test]
+async fn restore_is_rejected_when_not_allowed() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: None,
+        data_dir: test_data_dir(),
+        allow_restore: false,
+        rate_limit: None,
+    });
+
+    let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", vec![1, 2, 3]).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn restore_stages_the_upload_without_touching_the_live_database() {
+    let data_dir = test_data_dir();
+    let store = SqliteStore::open(data_dir.join("audit.sqlite"), Cipher::from_key([1u8; 32]))
+        .await
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: None,
+        data_dir: data_dir.clone(),
+        allow_restore: true,
+        rate_limit: None,
+    });
+
+    let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // Staged for the next restart to pick up, not applied in place —
+    // the running daemon's own database is left untouched.
+    assert!(data_dir.join(".restore-pending.tar").exists());
+    let (status, _) = json_request(&app, "GET", "/api/v1/health", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn audit_endpoints_expose_the_previously_write_only_trail() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(!events.is_empty(), "expected at least the Deploy event");
+    assert_eq!(events[0]["environment_id"], env.id.0);
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/audit", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let recent: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(
+        recent.iter().any(|e| e["environment_id"] == env.id.0),
+        "{recent:?}"
+    );
+
+    // `kind`/`project_id` narrow `/api/v1/audit` to a subset.
+    let (status, body) =
+        json_request(&app, "GET", "/api/v1/audit?kind=build_succeeded", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let filtered: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(
+        filtered
+            .iter()
+            .all(|e| e["kind"] == "build_succeeded" && e["environment_id"] == env.id.0),
+        "{filtered:?}"
+    );
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/audit?project_id={}", project.id.0 + 1).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let none: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(none.is_empty(), "{none:?}");
+
+    // An unparseable `kind`/`since` is a 400, not a silently-ignored filter.
+    let (status, _) = json_request(&app, "GET", "/api/v1/audit?kind=not_a_kind", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = json_request(&app, "GET", "/api/v1/audit?since=not-a-date", json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn deploy_request_id_is_correlated_into_the_audit_trail() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/projects/{}/deploy", project.id.0))
+                .header("content-type", "application/json")
+                .header("x-request-id", "trace-abc-123")
+                .body(Body::from(json!({ "branch": "feature-login" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "trace-abc-123"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (_, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/environments/{}/audit", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e["request_id"] == "trace-abc-123" && e["kind"] == "build_succeeded"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_response_carries_a_request_id_header_and_echoes_a_provided_one() {
+    let (app, _) = test_app().await;
+
+    // No `X-Request-Id` sent: one is generated.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let generated = response
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id header present")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(!generated.is_empty());
+
+    // A caller-supplied id is echoed back unchanged.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/health")
+                .header("x-request-id", "my-trace-id-123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "my-trace-id-123"
+    );
+}
+
+#[tokio::test]
+async fn deploy_queues_past_capacity_and_the_queue_endpoint_reports_it() {
+    // 8GB host (FakeOci's fixed `host_capacity`) minus 8000MB reserved
+    // leaves 192MB usable; two 100MB deploys can't both fit.
+    let (app, _) = test_app_with_admission_control(8000, 100).await;
+    let repo = repo_dir_with_config();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "main" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "other" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let queued: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(queued["position"], 1);
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/queue", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["branch"], "other");
+}
+
+#[tokio::test]
+async fn rollback_endpoint_is_wired_and_errors_clearly_with_no_prior_deploy() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    // No deploy yet: rollback has nothing to roll back to.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // One deploy: still nothing *prior* to roll back to.
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A second deploy gives rollback something to redeploy.
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/rollback", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+    assert_eq!(env.state.to_string(), "running");
+}
+
+#[tokio::test]
+async fn logs_stream_endpoint_emits_sse_data_events() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/environments/{}/logs/stream", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("data: build log"), "{text:?}");
+}
+
+#[tokio::test]
+async fn webhook_deploys_branch_when_signed() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/feature-hook",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "deployed");
+}
+
+/// Regression test: GitHub sends a `ping` event (no `ref` at all) the
+/// moment a webhook is configured. This used to fail with "webhook
+/// payload is missing `ref`" instead of just being acknowledged.
+#[tokio::test]
+async fn webhook_ignores_non_push_events() {
+    let (app, _) = test_app().await;
+    let (status, body) = signed_webhook_with_event(
+        &app,
+        json!({ "zen": "Anything added dilutes everything else." }),
+        Some("ping"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "ignored");
+}
+
+/// Regression test: a push with `"deleted": true` (branch deletion on
+/// GitHub) used to be treated like a normal push and attempt to deploy
+/// a branch that no longer exists in the remote, failing with a
+/// confusing git error. It should destroy the branch's environment
+/// instead.
+#[tokio::test]
+async fn webhook_destroys_environment_on_branch_deletion() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/feature-hook",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/feature-hook",
+            "deleted": true,
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "destroyed");
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("remove:")),
+        "{:?}",
+        oci.calls
+    );
+}
+
+/// A deletion push for a branch Oxid never deployed must be a no-op,
+/// not an error.
+#[tokio::test]
+async fn webhook_branch_deletion_for_unknown_branch_is_a_noop() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/never-deployed",
+            "deleted": true,
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "ignored");
+}
+
+#[tokio::test]
+async fn webhook_rejects_bad_signature() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/webhooks/github",
+        json!({
+            "ref": "refs/heads/feature-hook",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn webhook_rejects_wrong_secret() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let raw = serde_json::to_string(&json!({
+        "ref": "refs/heads/feature-hook",
+        "repository": { "full_name": "org/app" }
+    }))
+    .unwrap();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"wrong-secret").unwrap();
+    mac.update(raw.as_bytes());
+    let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/webhooks/github")
+                .header("content-type", "application/json")
+                .header("x-hub-signature-256", signature)
+                .body(Body::from(raw))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn secrets_crud_and_injection() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({ "name": "DB_PASSWORD", "scope": "project", "value": "hunter2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({
+            "name": "API_TOKEN",
+            "scope": "branch",
+            "branch": "feature-login",
+            "value": "tok-123"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Without a `branch` filter, only global+project-scope secrets are
+    // visible — a `branch`-scoped secret is meaningless without a branch
+    // context and must not leak into this listing.
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+
+    // With `?branch=feature-login`, its branch-scoped secret joins the
+    // project-scope one.
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!(
+            "/api/v1/projects/{}/secrets?branch=feature-login",
+            project.id.0
+        )
+        .as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["secrets"].as_array().unwrap().len(), 2);
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let calls = oci.calls.lock().unwrap();
+    let run = calls
+        .iter()
+        .find(|c| c.starts_with("run:"))
+        .expect("container was started");
+    assert!(run.starts_with("run:oxid-app-feature-login"), "{run}");
+    assert!(run.contains("\"DB_PASSWORD\": \"hunter2\""), "{run}");
+    assert!(run.contains("\"API_TOKEN\": \"tok-123\""), "{run}");
+    assert!(run.contains("\"OXID_BRANCH\": \"feature-login\""), "{run}");
+}
+
+/// Regression test for a real secret-leakage bug found by deploying two
+/// real branches with same-named branch-scoped secrets: the SQL filter
+/// resolving "secrets visible to this deploy" matched every row for the
+/// project regardless of branch, so branch A's value could shadow branch
+/// B's when both defined the same key.
+#[tokio::test]
+async fn branch_secrets_do_not_cross_over_on_deploy() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({
+            "name": "DB_PASSWORD", "scope": "branch",
+            "branch": "feature-a", "value": "secret-a"
+        }),
+    )
+    .await;
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({
+            "name": "DB_PASSWORD", "scope": "branch",
+            "branch": "feature-b", "value": "secret-b"
+        }),
+    )
+    .await;
+
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-a" }),
+    )
+    .await;
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-b" }),
+    )
+    .await;
+
+    let calls = oci.calls.lock().unwrap();
+    let run_a = calls
+        .iter()
+        .find(|c| c.starts_with("run:oxid-app-feature-a-"))
+        .expect("feature-a container was started");
+    let run_b = calls
+        .iter()
+        .find(|c| c.starts_with("run:oxid-app-feature-b-"))
+        .expect("feature-b container was started");
+    assert!(run_a.contains("\"DB_PASSWORD\": \"secret-a\""), "{run_a}");
+    assert!(run_b.contains("\"DB_PASSWORD\": \"secret-b\""), "{run_b}");
+}
+
+#[tokio::test]
+async fn global_secret_endpoint() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "GLOBAL_FLAG", "scope": "global", "value": "1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = json_request(&app, "GET", "/api/v1/secrets", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["secrets"].as_array().unwrap().len(), 1);
+
+    let (status, _) = json_request(&app, "DELETE", "/api/v1/secrets/GLOBAL_FLAG", json!({})).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn rejects_invalid_scope() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "X", "scope": "runtime", "value": "1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn missing_project_is_404() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects/999/deploy",
+        json!({ "branch": "main" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+async fn request_with_host(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    host: &str,
+) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn destroy_removes_environment() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        "DELETE",
+        format!("/api/v1/environments/{}", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("remove:")),
+        "{:?}",
+        oci.calls
+    );
+}
+
+#[tokio::test]
+async fn destroy_with_purge_secrets_query_param_deletes_branch_secrets() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/secrets", project.id.0).as_str(),
+        json!({
+            "name": "API_KEY", "scope": "branch",
+            "branch": "feature-login", "value": "x"
+        }),
+    )
+    .await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        "DELETE",
+        format!("/api/v1/environments/{}?purge_secrets=true", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = json_request(
+        &app,
+        "GET",
+        format!(
+            "/api/v1/projects/{}/secrets?branch=feature-login",
+            project.id.0
+        )
+        .as_str(),
+        json!({}),
+    )
+    .await;
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "API_KEY"),
+        "{value}"
+    );
+}
+
+#[tokio::test]
+async fn delete_project_endpoint_removes_project_and_environments() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+
+    let (status, _) = json_request(
+        &app,
+        "DELETE",
+        format!("/api/v1/projects/{}", project.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("remove_image:")),
+        "{:?}",
+        oci.calls
+    );
+
+    let (status, _) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/projects/{}/environments", project.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn update_project_changes_ttls_and_rejects_bad_durations() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        "PATCH",
+        format!("/api/v1/projects/{}", project.id.0).as_str(),
+        json!({ "pause_after": "45m" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let updated: Project = serde_json::from_slice(&body).unwrap();
+    assert_eq!(updated.config.pause_after.to_string(), "2700s");
+    // Omitted field stays whatever it already was.
+    assert_eq!(updated.config.destroy_after, project.config.destroy_after);
+
+    let (status, body) = json_request(
+        &app,
+        "PATCH",
+        format!("/api/v1/projects/{}", project.id.0).as_str(),
+        json!({ "destroy_after": "not-a-duration" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn list_environments_filters_by_branch() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!(
+            "/api/v1/projects/{}/environments?branch=feature-login",
+            project.id.0
+        )
+        .as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let envs: Vec<Environment> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envs.len(), 1);
+
+    let (status, body) = json_request(
+        &app,
+        "GET",
+        format!("/api/v1/projects/{}/environments?branch=nope", project.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let envs: Vec<Environment> = serde_json::from_slice(&body).unwrap();
+    assert!(envs.is_empty());
+}
+
+#[tokio::test]
+async fn wake_by_host_wakes_matching_environment() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/environments/{}/pause", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+
+    let (status, body) = request_with_host(&app, "POST", "/api/v1/wake", &env.url).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("feature-login"));
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("unpause:")),
+        "{:?}",
+        oci.calls
+    );
+}
+
+#[tokio::test]
+async fn wake_by_host_unknown_host_is_ok_noop() {
+    let (app, _) = test_app().await;
+    let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody.local.dev").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn heartbeat_always_ok() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+
+    let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", &env.url).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody.local.dev").await;
+    assert_eq!(status, StatusCode::OK);
+}
