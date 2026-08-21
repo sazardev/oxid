@@ -30,12 +30,12 @@ Toolchain pinned in `rust-toolchain.toml` — `stable` + `clippy` + `rustfmt`. N
 ## Architecture (hexagonal, SPEC.md §2)
 
 - `oxid-core` — pure domain, zero I/O. Entities `Project/Branch/Environment/ResourcePool/SecretContext`, state machine `Building/Running/Paused/Hibernating/Destroyed/BuildFailed`, port traits in `domain/ports.rs` (all `#[trait_variant::make(Send)]`), services in `domain/services/` (`gc.rs`, `subdomain.rs`, `var_resolution.rs: Global→Project→Branch→Runtime`).
-- `oxid-daemon` — binary `oxidd`: `adapter/store.rs` (SQLite+`sqlx`, secrets AES-GCM via `adapter/crypto.rs`), `adapter/git.rs` (`git2` cached clones), `adapter/oci.rs` (`bollard` on `/var/run/docker.sock`), `adapter/config.rs` (`oxid.toml`), `service/control_plane.rs` (`ControlPlane::deploy` + GC), `service/scheduler.rs` (tokio GC tick), `api.rs` (`axum` webhooks+REST).
-- `oxid-cli` — thin `clap` HTTP client, no business logic.
+- `oxid-daemon` — binary `oxidd`: `adapter/store.rs` (SQLite+`sqlx`, secrets AES-GCM via `adapter/crypto.rs`), `adapter/git.rs` (`git2` cached clones, optional per-project token for private repos), `adapter/oci.rs` (`bollard` on `/var/run/docker.sock`, network/Traefik bootstrap), `adapter/config.rs` (`oxid.toml`) + `compose.rs` (docker-compose.yml detection) + `postgres_pool.rs` (shared-Postgres per-branch DBs); `service/control_plane/` (`ControlPlane` split SRP: deploy/provision/lifecycle/gc/infra/admission/auth/project), `service/proxy.rs` (built-in per-branch TCP reverse proxy — stable `public_port`, zero-downtime redeploys), `service/scheduler.rs` (tokio GC tick + deploy-queue retry), `api/` (`axum` router in `mod.rs`, one file per resource in `handlers/`, `middleware.rs` auth+rate-limit+request-id, `dashboard.rs` embedded SPA).
+- `oxid-cli` — thin `clap` HTTP client, no business logic (multi-context config in `cli/config.rs`).
 
-Flow: `webhook/CLI → api.rs → ControlPlane::deploy → GitPort → SecretStore+var_resolution → ContainerPort(build/run/exec on_start) → EnvironmentStore/AuditStore`.
+Flow: `webhook/CLI → api/ → ControlPlane::deploy → GitPort → SecretStore+var_resolution → ContainerPort(build/run/exec on_start) → EnvironmentStore/AuditStore`.
 
-Rule: new capability → domain + port in `oxid-core`, adapter in `oxid-daemon/src/adapter/*`, orchestration in `service/control_plane.rs`, HTTP/CLI last. Never add `tokio|sqlx|bollard|axum|reqwest|git2|hyper|tower|tar` to `crates/oxid-core/Cargo.toml` — enforced by `.githooks/_lib.sh:check_hexagonal_boundary` (also `ci.yml:35`).
+Rule: new capability → domain + port in `oxid-core`, adapter in `oxid-daemon/src/adapter/*`, orchestration in `service/control_plane/`, HTTP/CLI last. Never add `tokio|sqlx|bollard|axum|reqwest|git2|hyper|tower|tar` to `crates/oxid-core/Cargo.toml` — enforced by `.githooks/_lib.sh:check_hexagonal_boundary` (also `ci.yml:35`).
 
 `oxid.toml` schema: `crates/oxid-core/src/domain/project_config.rs` / `IDEA.md` (`[project]/[build]/[routing]/[dependencies]`).
 

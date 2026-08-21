@@ -34,13 +34,13 @@ No hagas `cargo build --release` (caro) salvo que el usuario lo pida.
 - Máx 3 `bash` calls. Agrupa con `&&`.
 - Respuesta <20 líneas. No expliques qué es clippy.
 - Si `fmt` falla, no corras `clippy` — reporta `fmt` y corta.
-- Solo `file:line` para warnings con archivo, no listes 100 warnings idénticos — agrupa: `12× clippy::pedantic::needless_pass_by_value en control_plane.rs`.
+- Solo `file:line` para warnings con archivo, no listes 100 warnings idénticos — agrupa: `12× clippy::pedantic::needless_pass_by_value en service/control_plane/deploy.rs`.
 
 ## Formato
 
 ```
 lint: 2 FAIL, 1 WARN
-- FAIL fmt: crates/oxid-daemon/src/api.rs:42 not formatted → cargo fmt
+- FAIL fmt: crates/oxid-daemon/src/api/handlers/project.rs:42 not formatted → cargo fmt
 - FAIL clippy: store.rs:88 needless clone → &str (x3)
 - WARN test: 1 ignored test in audit.rs
 ```

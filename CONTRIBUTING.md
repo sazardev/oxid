@@ -92,7 +92,9 @@ the crate-level docs in `crates/oxid-core/src/lib.rs` /
    any I/O, SQL, Docker, or HTTP dependency.
 2. Adapter implementations (SQLite, Git, Docker, config parsing) go in
    `oxid-daemon/src/adapter/*`.
-3. Orchestration wiring belongs in `oxid-daemon/src/service/control_plane.rs`.
+3. Orchestration wiring belongs in `oxid-daemon/src/service/control_plane/`
+   (one module per concern: `deploy.rs`, `provision.rs`, `lifecycle.rs`,
+   `gc.rs`, `infra.rs`, ...).
 4. HTTP/CLI exposure comes last, once the domain and adapter logic exist.
 
 `unsafe_code` is forbidden workspace-wide (`Cargo.toml` lints) — PRs

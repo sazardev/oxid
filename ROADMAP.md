@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | 1.1 | `oxid down <branch>` — destruir entorno | **SPEC §5.1:** _"`$ ctrl up my-repo --branch feature-login` → Fuerza un despliegue manual."_ Se infiere `down` como operación opuesta. | `cli/main.rs` — `oxid down <branch> [--force]`, resuelve rama → entorno y llama `DELETE /environments/{id}` | ✅ Done |
 | 1.2 | `oxid status` — listar entornos del proyecto actual | **IDEA §4:** _"Comandos cortos, salida coloreada e intuitiva. Ej: `oxid up feature-login`, `oxid env set`."_ | `cli/main.rs` — `oxid status` lista rama/estado/URL coloreado por estado (DESIGN §3.1) | ✅ Done |
-| 1.3 | `oxid logs <branch> -f` — streaming real vía SSE/chunked | **SPEC §5.1:** _"`$ ctrl logs feature-login -f` → Streaming de logs de la rama."_ | `cli/main.rs` — `oxid logs <branch> [-f]` hace polling cada 2s sobre `/logs` (no es SSE real; el daemon solo expone un snapshot) | Parcial |
+| 1.3 | `oxid logs <branch> -f` — streaming real vía SSE/chunked | **SPEC §5.1:** _"`$ ctrl logs feature-login -f` → Streaming de logs de la rama."_ | `api/handlers/lifecycle.rs` expone `/api/v1/environments/{id}/logs/stream` (SSE real) y `cli/main.rs::cmd_logs -f` lo consume vía `bytes_stream`; verificado en vivo contra un contenedor que emite 1 línea/seg | ✅ Done |
 | 1.4 | `oxid env set KEY=val --scope global` — inyectar secretos | **SPEC §5.1:** _"`$ ctrl env set my-repo DB_PASSWORD=secret --scope global` → Inyecta variables."_ | `cli/main.rs` — `oxid env set KEY=VAL --scope <global\|project\|branch> [--project ID] [--branch B]` | ✅ Done (a0c064d) |
 | 1.5 | `oxid env list` — ver secretos configurados | **IDEA §4:** La tabla de interfaces muestra `oxid env set` como ejemplo de la CLI. `list` es el complemento natural. | `cli/main.rs` — `oxid env list [--scope ...]` (valores nunca expuestos) | ✅ Done (a0c064d) |
 | 1.6 | `oxid pause <branch>` — pausar manualmente | **IDEA §6:** _"Oxid apagó el contenedor, liberando 500MB de RAM."_ El usuario debe poder forzar esta acción. | `cli/main.rs` — `oxid pause <branch>` | ✅ Done |
@@ -37,7 +37,7 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 2.1 | Verificación HMAC-SHA256 de webhooks GitHub | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab. Se verifica el payload criptográficamente."_ | `api.rs` — `verify_hmac` + `X-Hub-Signature-256` (comparación constante vía `hmac`) | ✅ Done (a0c064d) |
+| 2.1 | Verificación HMAC-SHA256 de webhooks GitHub | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab. Se verifica el payload criptográficamente."_ | `api/handlers/webhook.rs` — `verify_hmac` + `X-Hub-Signature-256` (comparación constante vía `hmac`) | ✅ Done (a0c064d) |
 | 2.2 | Secret configurable (`OXID_WEBHOOK_SECRET`) | **SPEC §4.1:** implícito en _"Se verifica el payload criptográficamente"_. HMAC requiere un shared secret. | `main.rs` lee `OXID_WEBHOOK_SECRET`; webhooks rechazados si no está configurado | ✅ Done (a0c064d) |
 | 2.3 | Soporte webhooks GitLab (formato distinto) | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab."_ Menciona ambos proveedores. | Solo parsea formato GitHub (`ref`, `repository.full_name`) | No existe |
 | 2.4 | Rate limiting en la API HTTP | **SPEC §1:** _"Ecosistema Unificado: No requiere herramientas de terceros."_ Implica protección integrada. | No existe | No existe |
@@ -51,7 +51,7 @@
 |---|---|---|---|---|
 | 3.1 | Almacenamiento encriptado de secretos (AES-GCM) | **SPEC §4.4:** _"Se compilan los secretos cacheados en disco (encriptados mediante AES-GCM usando una clave maestra local) y se inyectan dinámicamente."_ | `secret_context.rs` — dominio puro, sin persistencia ni encriptación | No existe |
 | 3.2 | Clave maestra local para desencriptar | **SPEC §4.4:** _"una clave maestra local"_ — parte de la infraestructura de encriptación AES-GCM. | No existe | No existe |
-| 3.3 | Inyección real de variables al contenedor en `deploy()` | **SPEC §4.4:** _"se inyectan dinámicamente"_ al contenedor. **IDEA §6:** _"inyecta variables secretas y despliega."_ | `control_plane.rs` — resuelve `VarSources` (Global→Project→Branch→Runtime) e inyecta el mapa resultante en `ContainerSpec.env` | ✅ Done (a0c064d) |
+| 3.3 | Inyección real de variables al contenedor en `deploy()` | **SPEC §4.4:** _"se inyectan dinámicamente"_ al contenedor. **IDEA §6:** _"inyecta variables secretas y despliega."_ | `service/control_plane/provision.rs` — resuelve `VarSources` (Global→Project→Branch→Runtime) e inyecta el mapa resultante en `ContainerSpec.env` | ✅ Done (a0c064d) |
 | 3.4 | Resolución de `SecretContext` con herencia `Global→Project→Branch→Runtime` | **SPEC §2.1:** _"Las variables de entorno se calculan por una matriz de herencia: Global → Project → Branch → Runtime."_ | `var_resolution.rs` conectado a `ControlPlane::deploy`; runtime gana sobre todo | ✅ Done (a0c064d) |
 | 3.5 | Persistencia de secretos en SQLite (tabla `secrets`) | **SPEC §4.4:** _"secretos cacheados en disco"_ — implica persistencia. **IDEA §3:** _"guarda cada variable inyectada."_ | Tabla `secrets` en `0001_init.sql` + `SecretStore` en `SqliteStore` (valores cifrados AES-GCM) | ✅ Done (a0c064d) |
 
@@ -62,10 +62,10 @@
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
 | 4.1 | Adaptador `ResourcePoolPort` que ejecuta `CREATE DATABASE db_<branch>` en Postgres real | **SPEC §3.1:** _"El sistema mantiene un solo contenedor de base de datos encendido. Cuando se levanta la rama feature-A, el orquestador se conecta al contenedor raíz, crea un schema o base de datos lógica dedicada (db_feature_a)"_ | `adapter/postgres_pool.rs::PostgresPool` — `ensure_database`/`drop_database` reales vía `sqlx::PgPool`. Verificado en vivo contra `postgres:16-alpine`: cada rama obtiene su propia DB real, consultable desde el contenedor de la app | ✅ Done |
-| 4.2 | Adaptador Redis que asigna `REDIS_DB=N` por branch | **SPEC §3.1:** _"Se comparte una única instancia de Redis. El orquestador inyecta una variable de entorno para que cada rama use un índice de base de datos distinto (REDIS_DB=1, REDIS_DB=2)"_ | `control_plane.rs::provision_dependency` — asigna el índice libre más bajo (tabla `resource_leases`, sin necesitar un cliente Redis real ya que es pura contabilidad). Verificado en vivo: dos ramas obtienen `REDIS_DB=0` y `REDIS_DB=1` reales contra `redis:7-alpine` | ✅ Done |
+| 4.2 | Adaptador Redis que asigna `REDIS_DB=N` por branch | **SPEC §3.1:** _"Se comparte una única instancia de Redis. El orquestador inyecta una variable de entorno para que cada rama use un índice de base de datos distinto (REDIS_DB=1, REDIS_DB=2)"_ | `service/control_plane/provision.rs::provision_dependency` — asigna el índice libre más bajo (tabla `resource_leases`, sin necesitar un cliente Redis real ya que es pura contabilidad). Verificado en vivo: dos ramas obtienen `REDIS_DB=0` y `REDIS_DB=1` reales contra `redis:7-alpine` | ✅ Done |
 | 4.3 | Conexión a instancia compartida de Postgres/Redis (configuración en `oxid.toml`) | **IDEA §6 (oxid.toml):** _"`[dependencies.database]` type = "postgres" shared_instance = "local-pg-cluster" inject_url_as = "DATABASE_URL""_ | `OXID_POSTGRES_URL`/`OXID_REDIS_URL` (daemon) + `[dependencies.*]` de `oxid.toml` (ya parseado) conectados end-to-end vía `ControlPlane::with_resource_pools` | ✅ Done |
-| 4.4 | Inyección automática de `DATABASE_URL` / `REDIS_URL` al contenedor | **IDEA §6:** _"inyecta esa URL de conexión específica al contenedor de la aplicación como DATABASE_URL"_ | `control_plane.rs::run_and_activate` inyecta `dependency.inject_url_as` como variable `Runtime` (gana sobre cualquier secreto del mismo nombre) | ✅ Done |
-| 4.5 | Liberación de DB/schema cuando el entorno se destruye | **IDEA §6 (oxid.toml):** _"`destroy_after = "7d"` ... Oxid completamente destruye el contenedor y sus volúmenes efímeros."_ Implica limpieza de recursos. | `control_plane.rs::release_dependencies` — `DROP DATABASE` real (Postgres) + libera el índice (Redis), en `destroy()` manual y en el `Destroy` del GC. Verificado: `DROP DATABASE` confirmado con `\l` en Postgres real tras `oxid down` | ✅ Done |
+| 4.4 | Inyección automática de `DATABASE_URL` / `REDIS_URL` al contenedor | **IDEA §6:** _"inyecta esa URL de conexión específica al contenedor de la aplicación como DATABASE_URL"_ | `service/control_plane/provision.rs::run_and_activate` inyecta `dependency.inject_url_as` como variable `Runtime` (gana sobre cualquier secreto del mismo nombre) | ✅ Done |
+| 4.5 | Liberación de DB/schema cuando el entorno se destruye | **IDEA §6 (oxid.toml):** _"`destroy_after = "7d"` ... Oxid completamente destruye el contenedor y sus volúmenes efímeros."_ Implica limpieza de recursos. | `service/control_plane/provision.rs::release_dependencies` — `DROP DATABASE` real (Postgres) + libera el índice (Redis), en `destroy()` manual y en el `Destroy` del GC. Verificado: `DROP DATABASE` confirmado con `\l` en Postgres real tras `oxid down` | ✅ Done |
 
 ---
 
@@ -73,10 +73,10 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 5.1 | Integración con Traefik (labels Docker + configuración) | **SPEC §3.2:** _"Un proxy inverso (Traefik) actúa como entrada."_ **SPEC §4.6:** _"Se levanta el contenedor con etiquetas específicas del proxy. Ejemplo: Subdominio → feat-login.dev.local."_ | `control_plane.rs` — `deploy()` agrega labels `traefik.enable`, router/service/middleware por rama, y une el contenedor a `OXID_DOCKER_NETWORK` (sin publicar host port) cuando está configurado; fallback a host-port si no | ✅ Done |
-| 5.2 | Endpoint de wake-on-request que Traefik llama | **SPEC §3.2:** _"Traefik está configurado para redirigir peticiones fallidas (por contenedor pausado) a un endpoint especial del orquestador en Rust."_ | `api.rs` — `POST /api/v1/wake` lee `Host`/`X-Forwarded-Host`, resuelve el entorno y lo despierta (`wake_by_url`); pensado como target de la `errors` middleware de Traefik | ✅ Done |
-| 5.3 | Devolver señal de recarga al navegador (302 → wake → retry) | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms) y devuelve una señal de recarga al navegador."_ | `api.rs::wake_page_html` — página HTML con `meta refresh` estilo DESIGN (Carbon Black/Oxid Orange) | ✅ Done |
-| 5.4 | Monitor de tráfico real (métricas de Traefik para GC) | **SPEC §3.2:** _"Un cron interno de Rust evalúa la actividad de red. Si la rama feature-x no recibe peticiones en 30 minutos, ejecuta docker pause feature-x."_ **IDEA §6:** _"Oxid lo nota, hace unpause"_ | `api.rs::heartbeat_by_host` + `control_plane.rs::touch_by_url` — endpoint `GET/POST /api/v1/heartbeat` pensado como `forwardAuth` middleware de Traefik en cada request; refresca `last_accessed_at` real en vez de solo tocarlo al desplegar | ✅ Done (requiere wiring de Traefik, ver nota abajo) |
+| 5.1 | Integración con Traefik (labels Docker + configuración) | **SPEC §3.2:** _"Un proxy inverso (Traefik) actúa como entrada."_ **SPEC §4.6:** _"Se levanta el contenedor con etiquetas específicas del proxy. Ejemplo: Subdominio → feat-login.dev.local."_ | `service/control_plane/infra.rs::traefik_labels` — `deploy()` agrega labels `traefik.enable`, router/service/middleware por rama, y une el contenedor a `OXID_DOCKER_NETWORK` (sin publicar host port) cuando está configurado; fallback a host-port si no. Bootstrap automatizado vía `oxid infra status`/`setup` (ver nota abajo) | ✅ Done |
+| 5.2 | Endpoint de wake-on-request que Traefik llama | **SPEC §3.2:** _"Traefik está configurado para redirigir peticiones fallidas (por contenedor pausado) a un endpoint especial del orquestador en Rust."_ | `api/handlers/lifecycle.rs` — `POST /api/v1/wake` lee `Host`/`X-Forwarded-Host`, resuelve el entorno y lo despierta (`wake_by_url`); pensado como target de la `errors` middleware de Traefik | ✅ Done |
+| 5.3 | Devolver señal de recarga al navegador (302 → wake → retry) | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms) y devuelve una señal de recarga al navegador."_ | `api/handlers/lifecycle.rs::wake_page_html` — página HTML con `meta refresh` estilo DESIGN (Carbon Black/Oxid Orange) | ✅ Done |
+| 5.4 | Monitor de tráfico real (métricas de Traefik para GC) | **SPEC §3.2:** _"Un cron interno de Rust evalúa la actividad de red. Si la rama feature-x no recibe peticiones en 30 minutos, ejecuta docker pause feature-x."_ **IDEA §6:** _"Oxid lo nota, hace unpause"_ | `api/handlers/lifecycle.rs::heartbeat_by_host` + `service/control_plane/lifecycle.rs::touch_by_url` — endpoint `GET/POST /api/v1/heartbeat` pensado como `forwardAuth` middleware de Traefik en cada request; refresca `last_accessed_at` real en vez de solo tocarlo al desplegar | ✅ Done (requiere wiring de Traefik, ver nota abajo) |
 | 5.5 | Latencia objetivo < 300ms para unpause | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms)"_ — métrica de referencia. | No hay benchmarks ni mediciones | No medido |
 
 ---
@@ -108,8 +108,8 @@
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
 | 8.1 | Prefijos coloreados: `[+]` verde, `[~]` gris, `[>]` naranja | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks (e.g., pausing). `[>]` in Oxid Orange for actionable prompts or active builds."_ | `cli/main.rs` — helpers `ok`/`bg`/`action`/`error` con ANSI | ✅ Done (a0c064d) |
-| 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | `config.rs` devuelve errores como `ConfigError::Validation(String)` sin acción sugerida | Parcial |
-| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs::cmd_up` — imprime parse/registro/building/live; sin línea de shared-DB ni cache-hit % porque ninguno de los dos existe todavía (bloqueado por 4.1–4.4 y 6.3) | Parcial |
+| 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | Lado CLI avanzó (`cli/main.rs::connect_error`): errores diferenciados por causa (timeout/DNS/conexión) con hint accionable y exit codes por clase (2 not-found, 3 unreachable, 4 auth). Los errores de parseo de `oxid.toml` (`adapter/config.rs` → `ConfigError::Validation`) siguen sin sugerencia del tipo "Did you mean?" | Parcial |
+| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs::cmd_up` — imprime parse/registro/building/live (o "Queued, position N" si hay admission control). El pooling de DB ya existe server-side (4.1–4.5 ✅) pero la CLI no imprime la línea de shared-DB; el cache-hit % sigue sin existir (6.3) | Parcial |
 
 ---
 
@@ -129,7 +129,7 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 10.1 | Dashboard web embebido en el binario | **SPEC §5.3:** _"Incluido dentro del mismo binario estático de Rust (archivos precompilados e incrustados)."_ | `crates/oxid-daemon/web/*` embebido vía `include_str!` en `api.rs`, servido en `/`, sin build step ni dependencias nuevas (Alpine.js vendorizado, 54KB) | Hecho |
+| 10.1 | Dashboard web embebido en el binario | **SPEC §5.3:** _"Incluido dentro del mismo binario estático de Rust (archivos precompilados e incrustados)."_ | `crates/oxid-daemon/web/*` embebido vía `include_str!` en `api/dashboard.rs`, servido en `/` (SPA multi-página con router client-side bajo `/ui/*`), sin build step ni dependencias nuevas (Alpine.js vendorizado, 54KB) | Hecho |
 | 10.2 | Estilo brutalista con bordes duros, sin sombras | **DESIGN §3.2:** _"Use sharp corners (border-radius: 2px or 0px). Use hard 1px solid borders (#333333) instead of drop shadows to separate cards. Layout: Brutalist and data-dense."_ | `web/style.css` implementa la paleta y tipografía completas de DESIGN.md §1-3 | Hecho |
 | 10.3 | Métricas globales del nodo | **SPEC §5.3:** _"Métricas globales del nodo, auditoría histórica de despliegues y visor de logs estructurados."_ | `GET /api/v1/stats` (`ControlPlane::node_stats`) + panel de auditoría/cola + visor de logs en vivo (streaming real vía `fetch`+`ReadableStream`, no `EventSource`, para poder enviar el header `Authorization`) | Hecho |
 
@@ -251,7 +251,7 @@
 >   clone, no el commit nuevo).
 > - **Crítico:** redeploy de una rama ya viva (ej. webhook en un segundo push) fallaba con
 >   `409 Conflict` de Docker por nombre de contenedor duplicado — `deploy()` nunca tiraba el
->   contenedor anterior. Corregido en `control_plane.rs::deploy` (tira el contenedor previo y
+>   contenedor anterior. Corregido en `service/control_plane/deploy.rs::deploy_at` (tira el contenedor previo y
 >   marca su fila `Destroyed` antes de crear el nuevo). Confirmado en vivo con un webhook real
 >   simulando un segundo push a la misma rama.
 > - Una rama redeployada tras `oxid down` dejaba dos filas de `Environment` con la misma URL/nombre
@@ -264,13 +264,19 @@
 > - Cosmético: `oxid up`/`status` imprimían el nombre del proyecto con comillas literales
 >   (`` `"e2e-app"` ``) por interpolar un `serde_json::Value` directo en vez de `.as_str()`.
 >
-> **Nota de wiring pendiente (fuera del alcance de este repo):** las labels de Traefik (5.1) y
-> los endpoints `/api/v1/wake` y `/api/v1/heartbeat` (5.2/5.4) están implementados y probados,
-> pero requieren un Traefik real corriendo con `OXID_DOCKER_NETWORK` configurado, más una
-> `service` global `oxid-wake` definida en las labels del propio contenedor del daemon (ver
-> comentario en `control_plane.rs::traefik_labels`) para que la `errors` middleware pueda
-> apuntar ahí. Sin ese paso de infraestructura, el sistema sigue funcionando en modo
-> "host-port directo" (una rama viva a la vez por proyecto).
+> **Nota de wiring Traefik (actualizada):** las labels de Traefik (5.1) y los endpoints
+> `/api/v1/wake` y `/api/v1/heartbeat` (5.2/5.4) están implementados y probados. Desde
+> `b4b1eb4`, el bootstrap de la infraestructura está automatizado: `oxid infra status`
+> reporta read-only si existen la red Docker, el contenedor Traefik y el wiring del propio
+> daemon (`GET /api/v1/infra/status`), y `oxid infra setup` crea de forma idempotente la red
+> y levanta el Traefik built-in si faltan (`POST /api/v1/infra/bootstrap`). El único paso que
+> sigue siendo manual es conectar el propio contenedor del daemon a la red/labels (Docker no
+> puede relabelar un contenedor corriendo sin recrearlo, y recrear el proceso que ejecuta la
+> llamada no es seguro de automatizar) — `InfraStatus::next_steps` imprime exactamente qué
+> falta. Sin Traefik, el sistema funciona en modo "publicación directa de puertos": desde el
+> backfill de `host_port` dinámico y el reverse-proxy TCP built-in por rama
+> (`service/proxy.rs`), ese modo ya permite múltiples ramas vivas simultáneas del mismo
+> proyecto, cada una con su `public_port` estable y redeploys sin downtime.
 
 | Prioridad | Categoría | Tareas | Justificación |
 |---|---|---|---|
@@ -281,4 +287,4 @@
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x ✅, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, release binaries | 12.1, 12.2, 12.4 ✅ · 12.3 superseded | Necesario para self-hosting real |
 
-**Total: ~50 tareas granulares.** Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.
+**Total: 56 tareas granulares** (34 ✅ Done + 3 Hecho · 2 Parcial · 15 No existe · 1 No medido · 1 Superseded). Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.

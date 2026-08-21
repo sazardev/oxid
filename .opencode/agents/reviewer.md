@@ -44,7 +44,7 @@ Inspírate en `caveman-review` skill: 1 línea por comentario — ubicación, pr
 ### Arquitectura
 - ¿I/O en `oxid-core`? (`grep tokio|sqlx|bollard` en `crates/oxid-core`) → 🔴
 - ¿Nuevo port sin `#[trait_variant::make(Send)]` en `domain/ports.rs`? → 🔴
-- ¿`api.rs`/`store.rs` hinchado >400L? → 🟡 sugiere `optimizer`
+- ¿`api/handlers/*` o `store.rs` hinchado >400L? → 🟡 sugiere `optimizer`
 
 ### Performance
 - `clone()` en loop, `collect()` innecesario, `await` secuencial → 🟡
@@ -69,7 +69,7 @@ Inspírate en `caveman-review` skill: 1 línea por comentario — ubicación, pr
 
 ```
 reviewer: 3 🔴, 4 🟡, 2 🔵
-- 🔴 crates/oxid-daemon/src/api.rs:42 unwrap en handler → .ok_or(AppError::BadRequest)? — panic en prod
+- 🔴 crates/oxid-daemon/src/api/handlers/project.rs:42 unwrap en handler → .ok_or(AppError::BadRequest)? — panic en prod
 - 🔴 crates/oxid-core/src/domain/foo.rs:12 use tokio::fs → viola CLAUDE.md: oxid-core puro, mueve a adapter
 - 🟡 crates/oxid-daemon/src/store.rs:88 clone en loop → &str, saves 1 alloc/deploy
 - 🔵 Cargo.toml:12 dep rand 0.8 sin feature mínima → rand = { version="0.8", default-features=false }

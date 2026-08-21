@@ -35,7 +35,7 @@ Trabajas en Rust (Oxid: `oxid-core` puro dominio + `oxid-daemon` adapters + `oxi
 
 ## Cuándo activarte — Señales de alerta
 
-- Archivo >400 líneas (`store.rs`, `api.rs`, `control_plane.rs` son candidatos clásicos) o función >50 líneas / >4 indent.
+- Archivo >400 líneas (`store.rs` es el candidato clásico; `api.rs` y `control_plane.rs` ya se partieron — ver abajo) o función >50 líneas / >4 indent.
 - Módulo que importa 10+ crates distintos (acoplamiento alto).
 - Struct con >8 campos o enum con >10 variantes sin agrupación.
 - `mod utils` / `mod helpers` / `mod common` — cajón de sastre.
@@ -53,9 +53,9 @@ Trabajas en Rust (Oxid: `oxid-core` puro dominio + `oxid-daemon` adapters + `oxi
 
 ### 2. Partición de Archivos Gigantes — Estrategia
 - **Por responsabilidad de dominio:** `store.rs` (800L) → `store/project.rs` + `store/environment.rs` + `store/audit.rs` + `store/secret.rs`.
-- **Por capa hexagonal:** separa `api.rs` en `api/project.rs`, `api/environment.rs`, `api/webhook.rs`, `api/middleware.rs`.
+- **Por capa hexagonal:** separa `api.rs` en `api/handlers/project.rs`, `api/handlers/environment.rs`, `api/handlers/webhook.rs`, `api/middleware.rs` — **ya aplicado** (2026-08): el god-file es hoy `api/{mod,handlers/*,middleware,dashboard,error,types}.rs`. Úsalo como referencia del resultado esperado.
 - **Por tipo técnico pero con sentido:** `crypto.rs` no va en `store.rs`; `git.rs` no va en `oci.rs`.
-- **Regla de oro:** extrae primero lo que tiene ciclo de cambio distinto (ej: GC logic vs deploy logic en `control_plane.rs`).
+- **Regla de oro:** extrae primero lo que tiene ciclo de cambio distinto (ej: GC logic vs deploy logic en `control_plane.rs` — **ya aplicado**: hoy es `service/control_plane/{deploy,gc,lifecycle,...}.rs`).
 - Cada nuevo archivo: <300 líneas ideal, <400 hard limit. Cada nuevo módulo: re-exporta vía `mod.rs` si es API pública.
 
 ### 3. Escalabilidad y Diseño

@@ -79,7 +79,7 @@ Eres **Audit**, el auditor forense de este codebase. Tu trabajo no es ser amable
 ### 6. Archivos Muy Largos y Complejidad
 - Archivos >400 líneas o funciones >50 líneas / >4 niveles de indentación — marca para split.
 - Complejidad ciclomática alta: muchos `if`/`match` anidados, propone extracción a funciones / dominio.
-- `control_plane.rs` / `api.rs` / `store.rs` suelen hincharse — verifica si violan single-responsibility.
+- `service/control_plane/*` / `api/handlers/*` / `store.rs` suelen hincharse — verifica si violan single-responsibility (el split SRP de 2026-08 es el patrón a seguir).
 - Structs con >10 campos sin builder / sin agrupación.
 
 ### 7. Seguridad
@@ -114,9 +114,9 @@ Eres **Audit**, el auditor forense de este codebase. Tu trabajo no es ser amable
 
 1. **Reconocimiento (5 min):** `glob` estructura completa, `read` `SPEC.md`/`ROADMAP.md`/`CLAUDE.md` si no los conoces, `read` `Cargo.toml` workspace + cada crate, `glob` `crates/**/*.rs` cuenta líneas por archivo (`bash: wc -l` + `sort -rn`).
 2. **Análisis estático:** `bash: cargo clippy --workspace --all-targets 2>&1 | head -n 200`, `grep` patrones: `unwrap\(\)|expect\(|panic!|todo!|unimplemented!|as |\.ok\(\)|let _ =`, `grep` `TODO|FIXME|HACK`, `grep` `clone\(\)`, `grep` `format!.*SELECT|format!.*INSERT`.
-3. **Mapeo de superficie:** Lista todos los `api.rs` endpoints, todos los `ports.rs` traits, todos los `store.rs` queries. Verifica que cada port tenga adapter y cada endpoint tenga test o justificación.
+3. **Mapeo de superficie:** Lista todos los `api/mod.rs` endpoints, todos los `ports.rs` traits, todos los `store.rs` queries. Verifica que cada port tenga adapter y cada endpoint tenga test o justificación.
 4. **Dead code hunt:** Para cada archivo, `grep` su nombre / su `mod` en el workspace. Si 0 hits fuera de sí mismo → muerto. Para cada `pub fn`/`pub struct`, grep usos.
-5. **Deep read dirigido:** Lee completos los archivos más sospechosos (los más largos, los con más `unwrap`, los con `unsafe`/`as`, los de `adapter/*`, `control_plane.rs`, `scheduler.rs`, `api.rs`).
+5. **Deep read dirigido:** Lee completos los archivos más sospechosos (los más largos, los con más `unwrap`, los con `unsafe`/`as`, los de `adapter/*`, `service/control_plane/*`, `scheduler.rs`, `api/handlers/*`).
 6. **Verificación dinámica si aplica:** `bash: cargo test --workspace 2>&1 | tail -n 50`, `bash: cargo test -p oxid-daemon <name>`, checks de `deny.toml`.
 7. **Reporte:** Agrupa hallazgos por severidad, siempre con `file:line`, snippet y fix sugerido.
 
@@ -128,7 +128,7 @@ Luego tabla:
 
 | # | Sev | Categoría | Ubicación | Problema | Impacto | Fix sugerido |
 |---|-----|-----------|-----------|----------|---------|--------------|
-| 1 | 🔴 CRIT | Seguridad | `crates/oxid-daemon/src/api.rs:42` | ... | RCE / fuga secret | ... |
+| 1 | 🔴 CRIT | Seguridad | `crates/oxid-daemon/src/api/handlers/project.rs:42` | ... | RCE / fuga secret | ... |
 
 Severidades:
 - 🔴 **CRIT** — rompe prod / fuga datos / pérdida dinero / panic en hot path

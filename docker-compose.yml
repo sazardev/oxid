@@ -77,7 +77,8 @@ services:
       # daemon's own /api/v1/wake, shared across every branch of every
       # project. Per-branch containers get their own routing/heartbeat
       # labels automatically from ControlPlane::deploy — see
-      # `traefik_labels` in crates/oxid-daemon/src/service/control_plane.rs
+      # `traefik_labels` in
+      # crates/oxid-daemon/src/service/control_plane/infra.rs
       # for exactly what gets attached to each deployed environment.
       - traefik.enable=true
       - traefik.docker.network=oxid-net

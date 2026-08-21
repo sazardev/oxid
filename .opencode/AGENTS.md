@@ -26,10 +26,10 @@
 | Agente | Scope ultra | Ahorro | Invocación |
 |--------|-------------|--------|------------|
 | `crypt` | Solo `crypto.rs`, `secret.key 0600`, `OXID_MASTER_KEY` | <30 líneas, nunca leak | `@crypt verifica nonce crypto.rs:12` |
-| `saver` | Caveman 65% menos tokens | <15 líneas | `@saver scan unwrap en api.rs` |
+| `saver` | Caveman 65% menos tokens | <15 líneas | `@saver scan unwrap en api/handlers` |
 | `lint` | `fmt --check` + `clippy -D warnings` + `grep unwrap` | 3 bash max | `@lint check` |
 | `probe` | `grep`/`glob`/`read` solo lectura | <15 líneas, 4 calls max | `@probe donde está SecretStore` |
-| `patcher` | 1 archivo / 1 bug / 1 fix | 3 calls, <15 líneas | `@patcher fix clone api.rs:42` |
+| `patcher` | 1 archivo / 1 bug / 1 fix | 3 calls, <15 líneas | `@patcher fix clone api/handlers/project.rs:42` |
 | `versioner` | `Cargo.toml:6` bump + `Cargo.lock` + `CHANGELOG` + `tag vX.Y.Z` | 6 pasos | `@versioner bump patch` |
 
 ## Flujos recomendados
@@ -46,7 +46,7 @@
 @flow release minor --push     # versioner→publisher→documenter→automator
 
 # Hotfix
-@flow hotfix crates/oxid-daemon/src/api.rs:42 "fix: HMAC bypass"
+@flow hotfix crates/oxid-daemon/src/api/handlers/webhook.rs "fix: HMAC bypass"
 
 # Docs al máximo
 @flow docs  # documenter drift → reviewer

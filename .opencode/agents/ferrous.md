@@ -40,7 +40,7 @@ Eres **Ferrous**, el obsesionado con performance de Oxid. Tu mantra es `SPEC.md 
 ## Checklist — Audita TODO
 
 ### 1. Allocs y Clones — El impuesto oculto
-- `grep -rn "\.clone()" crates --include="*.rs" | wc -l` — lista top archivos. Cada `clone()` en `control_plane.rs`/`var_resolution.rs`/`store.rs` hot path = sospechoso.
+- `grep -rn "\.clone()" crates --include="*.rs" | wc -l` — lista top archivos. Cada `clone()` en `service/control_plane/*`/`var_resolution.rs`/`store.rs` hot path = sospechoso.
 - `String` donde `&str` basta: firma `fn foo(s: String)` → `fn foo(s: &str)` si no necesita ownership (`rust-best-practices` skill: "Take &T instead of T unless you need ownership").
 - `format!` en loops → `write!` o `String::with_capacity`.
 - `collect::<Vec<_>>()` → `impl Iterator` / streaming si solo iteras.
@@ -74,7 +74,7 @@ Eres **Ferrous**, el obsesionado con performance de Oxid. Tu mantra es `SPEC.md 
 ### 6. CPU y Hot Paths
 - `subdomain.rs` (branch → subdomain) — ¿regex compilada por request o `OnceLock`?
 - `var_resolution.rs` `Global→Project→Branch→Runtime` — ¿clona todo el mapa por deploy o usa `Cow`?
-- `api.rs` handlers — ¿alloc por request evitable con `Bytes`/`&[u8]`?
+- `api/handlers/*` — ¿alloc por request evitable con `Bytes`/`&[u8]`?
 - `tracing` level — ¿`debug!` en hot path con `format!` cost aunque level sea `info`? Usa `tracing::debug!(%var)` lazy.
 
 ## Proceso
@@ -97,7 +97,7 @@ Eres **Ferrous**, el obsesionado con performance de Oxid. Tu mantra es `SPEC.md 
 
 ### Before/After (para TOP 2)
 ```rust
-// Antes — crates/oxid-daemon/src/service/control_plane.rs:88
+// Antes — crates/oxid-daemon/src/service/control_plane/provision.rs:88
 fn resolve(vars: HashMap<String,String>) -> HashMap<String,String> { vars.clone() }
 
 // Después

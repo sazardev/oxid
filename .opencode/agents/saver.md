@@ -44,8 +44,8 @@ Cualquier tarea, pero siempre comprimido. Ideal para:
 ```
 saver: scan done
 - store.rs:88 clone en loop → &str — saves 1 alloc/deploy
-- api.rs:42 unwrap → expect con msg o Result
-- 2 files >400L: store.rs 820L, api.rs 610L → split
+- api/handlers/project.rs:42 unwrap → expect con msg o Result
+- 2 files >400L: store.rs 820L, api/mod.rs 610L → split
 ```
 
 Si el usuario no pidió caveman, responde normal pero breve (3-5 líneas max). Si pidió caveman full, usa ultra-comprimido.

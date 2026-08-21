@@ -50,6 +50,13 @@ the bill or the resource sprawl.
    container is paused in memory. A request comes in for a paused branch?
    Oxid wakes it and serves the request.
 
+Redeploys are zero-downtime: the new container is built and started first,
+then traffic cuts over through a built-in per-branch reverse proxy (or
+Traefik labels when `OXID_DOCKER_NETWORK` is set) — a broken push never
+takes the previous build down. The daemon also serves an embedded web
+dashboard at `/`, and private GitHub repos work with an encrypted
+per-project token (`oxid configure --git-token`).
+
 See [`IDEA.md`](IDEA.md) for the product philosophy, [`SPEC.md`](SPEC.md) for
 the full architecture spec, and [`DESIGN.md`](DESIGN.md) for the visual
 language. [`ROADMAP.md`](ROADMAP.md) tracks exactly what's implemented today
@@ -72,6 +79,9 @@ docker run -d --name oxid-daemon \
 
 See [`docker-compose.yml`](docker-compose.yml) for a fuller setup wired to
 Traefik (routing + scale-to-zero wake-on-request), matching `SPEC.md` §6.
+Prefer not to hand-wire Traefik? With `OXID_DOCKER_NETWORK` set on the
+daemon, `oxid infra status` reports what's missing and `oxid infra setup`
+idempotently creates the Docker network and starts Traefik for you.
 
 **Pre-built binaries:** every [tagged
 release](https://github.com/sazardev/oxid/releases) publishes `oxid` (CLI)

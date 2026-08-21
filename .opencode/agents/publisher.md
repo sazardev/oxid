@@ -75,7 +75,7 @@ publisher: pre-flight 7/7 ✓ — ready to tag v0.2.0
 
 Si algo falla:
 ```
-publisher: BLOCKED — clippy 3 warnings in api.rs:42
+publisher: BLOCKED — clippy 3 warnings in api/handlers/project.rs:42
 fix: cargo clippy --fix --allow-dirty && cargo fmt
 → @reviewer para revisar diff antes de re-intentar
 ```

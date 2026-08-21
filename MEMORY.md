@@ -1,4 +1,4 @@
-# MEMORY.md — working state as of 2026-08-19
+# MEMORY.md — working state as of 2026-08-21
 
 Quick-glance status for whoever (human or Claude) picks this repo back up.
 For the granular, tracked-item gap analysis see `ROADMAP.md` — this file is
@@ -91,7 +91,8 @@ just "where did we leave off and why."
   modal-based instead of a real app:** client-side router
   (`/ui/environments`, `/ui/projects/:id`, `/ui/projects/:id/secrets`,
   `/ui/environments/:id?tab=logs|history`, `/ui/queue`, `/ui/audit`,
-  `/ui/admin`) with filters as query params, all deep-linkable — `api.rs`
+  `/ui/admin`) with filters as query params, all deep-linkable — the API
+  router (`api/mod.rs`, then still part of the single `api.rs`)
   now `.fallback()`s to `index.html` for any unmatched GET so a hard
   refresh on a nested path still works (tested live: reloading mid-route
   and watching the client router take over correctly). Added the
@@ -273,16 +274,53 @@ just "where did we leave off and why."
   internet, the daemon decrypted the stored token, cloned the private repo,
   built, and cut over with zero downtime (same `public_port` across both
   deploys, new commit's content actually served).
-- Full test/clippy/fmt pass green (136 daemon/core tests + 32 CLI tests).
+- **Observability + CLI ops + infra bootstrap + SRP refactor rounds (these
+  rounds, all covered by tests):**
+  - *Structured tracing & request correlation* (`73c02fc`): `tracing`
+    subscriber with `OXID_LOG_FORMAT=json` for machine-parseable logs;
+    per-request `request_id` middleware (honors an inbound
+    `X-Request-Id`, echoes it on the response) propagated to every
+    `ControlPlane` call via a task-local (`request_context.rs`) so daemon
+    logs and the audit trail carry the same id (migration `0009` added
+    `audit.request_id`); `CatchPanicLayer` turns a panicking handler into a
+    JSON 500 tagged with the request id instead of a raw connection reset;
+    `oxid audit` gained `--branch/--project/--since/--until/--kind` filters.
+  - *CLI ops round* (`663c9fe`, `e6c263c`): named connection contexts
+    persisted in a config file (`oxid context add/use/list/current/remove`)
+    — `--api`/`--token`/`OXID_API`/`OXID_TOKEN` still override;
+    `oxid completions <shell>`; `oxid doctor` extended with an
+    `/api/v1/infra/status` check; errors differentiated by cause with
+    actionable hints and distinct exit codes (2 not-found, 3 unreachable,
+    4 auth); `oxid ps --sort branch|state|updated`.
+  - *Traefik/network bootstrap* (`b4b1eb4`): `oxid infra status`
+    (read-only: does the `OXID_DOCKER_NETWORK` network exist, is Traefik
+    running, is this daemon's own container wired for wake-on-request) and
+    `oxid infra setup` (idempotent: creates the network and starts the
+    built-in Traefik container if missing). Wiring the daemon's own
+    container is deliberately **not** automated — Docker can't relabel a
+    running container without recreating it, and recreating the process
+    executing the call is unsafe — `InfraStatus::next_steps` prints exactly
+    what's left instead. This closes most of what ROADMAP's old "wiring
+    pendiente" note described as manual.
+  - *SRP refactor* (`f33d547`, `556713f`): no behavior change —
+    `control_plane.rs` split into `service/control_plane/` (deploy,
+    provision, lifecycle, gc, infra, admission, auth, project, …) and
+    `api.rs` into `api/` (router in `mod.rs`, one file per resource under
+    `handlers/`, plus `middleware.rs`, `dashboard.rs`, `error.rs`,
+    `types.rs`). Docs referencing the old god-file paths were updated in
+    the same sweep.
+- Full test/clippy/fmt pass green (227 tests: 39 CLI + 44 core + 144
+  daemon, 6 `#[ignore]`d Docker-integration ones excluded).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
 No TUI, no Tauri desktop app (the web dashboard now covers most of what
 SPEC.md asks of both). Single-host only, no HA.
 API is open by default if `OXID_API_TOKEN` is unset (warned, not enforced).
-Traefik auto-wake-on-request without any manual config still needs the
-operator to wire the `errors` middleware themselves (documented, not
-automated by Oxid's code — see `control_plane.rs::traefik_labels`). Named
+Traefik bootstrap is automated (`oxid infra setup` creates the network and
+the Traefik container), but wiring the daemon's *own* container onto that
+network still needs the operator (Docker can't relabel a running container;
+`oxid infra status` prints the exact remaining steps). Named
 API tokens are flat (no roles/permissions beyond "master" vs "operator") —
 real RBAC (scoping a token to specific projects) doesn't exist yet.
 

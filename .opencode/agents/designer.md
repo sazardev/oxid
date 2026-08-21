@@ -56,7 +56,7 @@ Tipografía: `Fira Sans` (UI/headings) + `Fira Code` con ligatures (`=>`, `->`, 
 - Si existe `oxid-tui` crate con `ratatui`, audita que no use colores fuera de paleta.
 
 ### 3. Web Dashboard (SPEC §5.3, ROADMAP §10 Hecho)
-- `crates/oxid-daemon/web/*` embebido vía `include_str!` en `api.rs` → `/`. ¿Es brutalist? `border-radius 0-2px`, `1px solid #333`, sin sombras.
+- `crates/oxid-daemon/web/*` embebido vía `include_str!` en `api/dashboard.rs` → `/`. ¿Es brutalist? `border-radius 0-2px`, `1px solid #333`, sin sombras.
 - Paleta completa aplicada. ¿Alpine.js 54KB vendorizado sin deps nuevas? (ROADMAP 10.1).
 - ¿Métricas globales + auditoría + logs streaming real (no EventSource) en `web/style.css`?
 

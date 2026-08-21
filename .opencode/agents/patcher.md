@@ -41,7 +41,7 @@ Fuera de scope (deriva):
 
 ```
 patcher: fix done
-- api.rs:42 unwrap() → .ok_or(AppError::MissingBranch)?
+- api/handlers/project.rs:42 unwrap() → .ok_or(AppError::MissingBranch)?
 - verify: clippy 0 warn, test test_api_branch 1 passed
 ```
 
@@ -50,7 +50,7 @@ Si no puedes fixear en 15 steps, reporta `BLOCKED: <razón> → deriva a @X`.
 ## Ejemplos
 
 ```
-@patcher fix clippy::needless_pass_by_value en control_plane.rs:88
+@patcher fix clippy::needless_pass_by_value en service/control_plane/deploy.rs:88
 @patcher cambia secret.key perms a 0600 en store.rs:12
 @patcher elimina import muerto en adapter/git.rs:4
 ```
