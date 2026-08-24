@@ -350,6 +350,38 @@ pub struct BuildSpec {
     pub image: String,
 }
 
+/// What a container image build actually did — surfaced so deploys can
+/// report cache effectiveness (DESIGN.md §3.3's "Building image (Cache
+/// hit: 85%)"). Counts come from parsing `BuildKit`'s human progress
+/// stream, which is heuristic by nature; adapters that can't observe
+/// progress report zeroed totals and consumers are expected to hide the
+/// ratio then.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BuildReport {
+    /// Wall-clock milliseconds the whole build took.
+    pub duration_ms: u64,
+    /// Distinct build steps observed in the progress stream.
+    pub steps_total: u32,
+    /// Of those, how many replayed from layer/cache-mount cache instead of
+    /// executing (`#N CACHED` in the stream).
+    pub steps_cached: u32,
+}
+
+impl BuildReport {
+    /// Cache hit rate as a whole percent, or `None` when no steps were
+    /// observable (the adapter couldn't parse the build stream).
+    #[must_use]
+    pub fn cache_hit_percent(&self) -> Option<u8> {
+        if self.steps_total == 0 {
+            return None;
+        }
+        let percent = (u64::from(self.steps_cached) * 100) / u64::from(self.steps_total);
+        // percent ≤ 100 by construction, so the cast never truncates.
+        #[allow(clippy::cast_possible_truncation)]
+        Some(percent as u8)
+    }
+}
+
 /// Inputs for running an environment container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerSpec {
@@ -388,7 +420,7 @@ pub trait ContainerPort {
     ///
     /// # Errors
     /// [`OciError::Failure`] on build failure.
-    async fn build(&self, spec: &BuildSpec) -> Result<(), OciError>;
+    async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError>;
     /// Creates and starts a container. Returns the host port actually bound
     /// when `spec.network` is `None` (Docker picks it — see
     /// [`ContainerSpec::network`]), or `None` when attached to a Traefik

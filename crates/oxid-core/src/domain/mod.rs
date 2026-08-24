@@ -20,9 +20,9 @@ pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
 pub use infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
 pub use ports::{
-    AuditFilter, AuditStore, BuildSpec, CommitRef, ContainerPort, ContainerSpec, ContainerStatus,
-    EnvironmentStore, GitError, GitPort, HostCapacity, LogStream, OciError, ProjectStore,
-    RepositoryError, SecretStore,
+    AuditFilter, AuditStore, BuildReport, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
+    ContainerStatus, EnvironmentStore, GitError, GitPort, HostCapacity, LogStream, OciError,
+    ProjectStore, RepositoryError, SecretStore,
 };
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};

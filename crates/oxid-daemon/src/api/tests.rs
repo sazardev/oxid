@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::Request;
-use oxid_core::{BuildSpec, ContainerSpec, GitError, OciError, RepoUrl};
+use oxid_core::{BuildReport, BuildSpec, ContainerSpec, GitError, OciError, RepoUrl};
 use tower::ServiceExt;
 
 use crate::adapter::crypto::Cipher;
@@ -55,12 +55,12 @@ struct FakeOci {
 }
 
 impl ContainerPort for FakeOci {
-    async fn build(&self, spec: &BuildSpec) -> Result<(), OciError> {
+    async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         self.calls
             .lock()
             .unwrap()
             .push(format!("build:{}", spec.image));
-        Ok(())
+        Ok(BuildReport::default())
     }
     async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
         self.calls
@@ -788,6 +788,69 @@ async fn rate_limit_blocks_a_burst_past_its_configured_size() {
     }
 }
 
+/// Like `json_request`, but tags the request with a `ConnectInfo` peer
+/// address, as the real serve paths do via
+/// `into_make_service_with_connect_info` — this is what the per-IP rate
+/// limiter keys on (`ClientIpKeyExtractor`).
+async fn json_request_from_ip(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Value,
+    ip: std::net::IpAddr,
+) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(ip, 0)))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Two clients behind the same daemon get independent token buckets: IP A
+/// exhausting its burst must not consume any of IP B's allowance (the
+/// pre-per-IP global bucket failed exactly this — one noisy host throttled
+/// every other client of the shared API token).
+#[tokio::test]
+async fn rate_limit_keys_per_client_ip_when_connect_info_present() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: None,
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        // 1 request/sec sustained, burst of 2 per IP.
+        rate_limit: Some((1, 2)),
+    });
+
+    let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+    let ip_b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+
+    // IP A burns through its whole burst…
+    for _ in 0..2 {
+        let (status, _) =
+            json_request_from_ip(&app, "GET", "/api/v1/projects", json!({}), ip_a).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) = json_request_from_ip(&app, "GET", "/api/v1/projects", json!({}), ip_a).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // …and IP B still has a fresh bucket of its own.
+    let (status, _) = json_request_from_ip(&app, "GET", "/api/v1/projects", json!({}), ip_b).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn register_and_deploy_flow() {
     let repo = repo_dir_with_config();
@@ -1418,6 +1481,255 @@ async fn webhook_rejects_wrong_secret() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Sends a GitLab webhook with an `X-Gitlab-Token` header.
+async fn gitlab_request(
+    app: &Router,
+    payload: Value,
+    token: Option<&str>,
+) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/api/v1/webhooks/gitlab")
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("x-gitlab-token", token);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Sends a Gitea/Gogs webhook with its bare-hex HMAC-SHA256 signature.
+/// `provider` is the URL segment (`gitea`/`gogs`) paired with that
+/// provider's signature header.
+async fn gitea_family_request(
+    app: &Router,
+    provider: (&str, &str),
+    payload: Value,
+    signing_secret: &str,
+) -> (StatusCode, Vec<u8>) {
+    let (name, signature_header) = provider;
+    let raw = payload.to_string();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(signing_secret.as_bytes()).unwrap();
+    mac.update(raw.as_bytes());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/webhooks/{name}").as_str())
+                .header("content-type", "application/json")
+                .header(signature_header, hex::encode(mac.finalize().into_bytes()))
+                .body(Body::from(raw))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn gitlab_webhook_deploys_branch_when_token_valid() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = gitlab_request(
+        &app,
+        json!({
+            "object_kind": "push",
+            "ref": "refs/heads/feature-gl",
+            "after": SHA,
+            "project": { "path_with_namespace": "org/app" }
+        }),
+        Some("test-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "deployed");
+}
+
+#[tokio::test]
+async fn gitlab_webhook_rejects_missing_and_wrong_tokens() {
+    let (app, _) = test_app().await;
+
+    // No header at all.
+    let (status, _) = gitlab_request(&app, json!({}), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Wrong shared secret.
+    let (status, _) = gitlab_request(&app, json!({}), Some("nope")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// GitLab fires many object kinds (`tag_push`, `pipeline`, ...) at one
+/// webhook URL; only branch pushes may trigger deploys.
+#[tokio::test]
+async fn gitlab_webhook_ignores_non_push_object_kinds() {
+    let (app, _) = test_app().await;
+    let (status, body) = gitlab_request(
+        &app,
+        json!({
+            "object_kind": "pipeline",
+            "ref": "refs/heads/main",
+            "project": { "path_with_namespace": "org/app" }
+        }),
+        Some("test-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "ignored");
+}
+
+/// A branch deletion on GitLab arrives as a push whose `after` is the null
+/// SHA — destroy the environment instead of deploying a nonexistent ref.
+#[tokio::test]
+async fn gitlab_webhook_destroys_environment_on_branch_deletion() {
+    let repo = repo_dir_with_config();
+    let (app, oci) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    gitlab_request(
+        &app,
+        json!({
+            "object_kind": "push",
+            "ref": "refs/heads/feature-gl",
+            "after": SHA,
+            "project": { "path_with_namespace": "org/app" }
+        }),
+        Some("test-secret"),
+    )
+    .await;
+
+    let (status, body) = gitlab_request(
+        &app,
+        json!({
+            "object_kind": "push",
+            "ref": "refs/heads/feature-gl",
+            "after": "0".repeat(40),
+            "project": { "path_with_namespace": "org/app" }
+        }),
+        Some("test-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "destroyed");
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("remove:")),
+        "{:?}",
+        oci.calls
+    );
+}
+
+#[tokio::test]
+async fn gitea_webhook_deploys_branch_when_signed() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = gitea_family_request(
+        &app,
+        ("gitea", "x-gitea-signature"),
+        json!({
+            "ref": "refs/heads/feature-gitea",
+            "repository": { "full_name": "org/app" }
+        }),
+        "test-secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "deployed");
+}
+
+/// Gogs speaks the same wire format as Gitea under `x-gogs-*` headers.
+#[tokio::test]
+async fn gogs_webhook_deploys_branch_when_signed() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = gitea_family_request(
+        &app,
+        ("gogs", "x-gogs-signature"),
+        json!({
+            "ref": "refs/heads/feature-gogs",
+            "repository": { "full_name": "org/app" }
+        }),
+        "test-secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "deployed");
+}
+
+#[tokio::test]
+async fn gitea_webhook_rejects_bad_signature() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, _) = gitea_family_request(
+        &app,
+        ("gitea", "x-gitea-signature"),
+        json!({
+            "ref": "refs/heads/feature-gitea",
+            "repository": { "full_name": "org/app" }
+        }),
+        "wrong-secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

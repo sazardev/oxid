@@ -20,7 +20,12 @@ time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"
 toml = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "fs", "signal", "io-util"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros"] }
-bollard = "0.17"
+# `buildkit`: builds are requested with `BuilderVersion::BuilderBuildKit`
+# (see `oxid-daemon`'s `oci.rs`) — the legacy V1 builder is deprecated
+# upstream and BuildKit is what unlocks `RUN --mount=type=cache` layer
+# caching in user Dockerfiles (SPEC.md §4.5). Costs the tonic/proto gRPC
+# stack in the binary: measured 17MB → 19MB release binary (~12%).
+bollard = { version = "0.17", features = ["buildkit"] }
 tar = "0.4"
 bytes = "1"
 git2 = { version = "0.21", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }

@@ -25,7 +25,7 @@ pub mod provision;
 pub mod types;
 
 pub use error::CpError;
-pub use types::{DeployOutcome, GcSummary, InfraStatus, NodeStats};
+pub use types::{DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
 
 /// Orchestrates registration, deployment and lifecycle of environments.
 #[derive(Clone)]

@@ -12,15 +12,15 @@ use bollard::container::{
     StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::image::{BuildImageOptions, RemoveImageOptions};
+use bollard::image::{BuildImageOptions, BuilderVersion, RemoveImageOptions};
 use bollard::models::{
-    EndpointSettings, HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
+    BuildInfo, EndpointSettings, HostConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use oxid_core::{
-    BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream,
+    BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream,
     NetworkStatus, OciError, SelfWiringStatus, TraefikSpec, TraefikStatus,
 };
 
@@ -67,20 +67,120 @@ fn tar_context(dir: &Path) -> Result<Bytes, OciError> {
     Ok(Bytes::from(buf))
 }
 
+/// Accumulates cache-effectiveness data from a build's progress stream.
+///
+/// With `BuildKit` (the only builder we request), progress arrives as
+/// *structured* solve events in `BuildInfo.aux`: each
+/// [`bollard::models::BuildInfoAux::BuildKit`] payload carries `vertexes`,
+/// one per step, with its Dockerfile-step `name` (`[stage-0 2/2] RUN ...`),
+/// a stable `digest`, and whether it was served from cache. Only those
+/// bracketed names are counted — `[internal] load ...`, frontend resolves,
+/// and image export are plumbing, not user-visible steps.
+///
+/// For anything that still emits classic text progress (an engine without
+/// `BuildKit`, a future builder change), lines like `#12 CACHED` /
+/// `#12 DONE 0.1s` fall back to the same accumulator under a synthetic
+/// `"#12"` key. Either way an empty result means "nothing observable" and
+/// consumers hide the ratio rather than show a bogus 0%.
+#[derive(Default)]
+struct BuildProgress {
+    /// Step key (digest or synthetic id) → served-from-cache?
+    steps: HashMap<String, bool>,
+}
+
+impl BuildProgress {
+    fn observe(&mut self, info: &BuildInfo) {
+        if let Some(bollard::models::BuildInfoAux::BuildKit(status)) = info.aux.as_ref() {
+            for vertex in &status.vertexes {
+                // Dockerfile steps are named `[<stage> <i/j>] INSTRUCTION`;
+                // `[internal] load ...` is bracketed plumbing and must be
+                // excluded explicitly, along with resolves/exports.
+                if !vertex.name.starts_with('[') || vertex.name.starts_with("[internal") {
+                    continue;
+                }
+                let cached = self.steps.entry(vertex.digest.clone()).or_insert(false);
+                *cached |= vertex.cached;
+            }
+        } else if let Some(chunk) = info.stream.as_deref() {
+            self.observe_text(chunk);
+        }
+    }
+
+    fn observe_text(&mut self, chunk: &str) {
+        for line in chunk.lines() {
+            let Some(rest) = line.trim().strip_prefix('#') else {
+                continue;
+            };
+            let (id_str, tail) = match rest.split_once(' ') {
+                Some(pair) => pair,
+                None => (rest, ""),
+            };
+            // Only well-formed numbered ids; everything else is noise.
+            if !id_str.bytes().all(|b| b.is_ascii_digit()) || id_str.is_empty() {
+                continue;
+            }
+            let tail = tail.trim_start();
+            let key = format!("#{id_str}");
+            if tail.starts_with('[') {
+                self.steps.entry(key).or_insert(false);
+            } else if tail.starts_with("CACHED") {
+                self.steps.insert(key, true);
+            }
+        }
+    }
+
+    /// `(steps_total, steps_cached)`
+    fn summary(&self) -> (u32, u32) {
+        let total = u32::try_from(self.steps.len()).unwrap_or(u32::MAX);
+        let cached = u32::try_from(self.steps.values().filter(|cached| **cached).count())
+            .unwrap_or(u32::MAX);
+        (total, cached)
+    }
+}
+
 impl ContainerPort for DockerClient {
-    async fn build(&self, spec: &BuildSpec) -> Result<(), OciError> {
+    async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         let options = BuildImageOptions {
             dockerfile: spec.dockerfile.clone(),
             t: spec.image.clone(),
             rm: true,
+            // BuildKit, not the legacy V1 builder: upstream has deprecated
+            // V1 and BuildKit is what makes `RUN --mount=type=cache,...`
+            // work in user Dockerfiles (SPEC.md §4.5's shared dependency
+            // caches). Layer cache for unchanged instructions comes free
+            // either way; with BuildKit the caches survive even when an
+            // early `COPY . .` layer changes. Requires bollard's
+            // `buildkit` cargo feature (workspace `Cargo.toml`) plus a
+            // unique session id per build — bollard uses it to open the
+            // accompanying gRPC session, and Docker rejects the request
+            // without one ("Buildkit requires a unique session").
+            version: BuilderVersion::BuilderBuildKit,
+            session: Some(uuid::Uuid::new_v4().to_string()),
             ..Default::default()
         };
         let context = tar_context(&spec.context)?;
+        let started = std::time::Instant::now();
+        let mut progress = BuildProgress::default();
         let mut stream = self.docker.build_image(options, None, Some(context));
         while let Some(item) = stream.next().await {
-            item.map_err(map_err)?;
+            match item {
+                // bollard folds a terminal `BuildInfo.error` into
+                // `DockerStreamError`, whose `Display` is just "Docker
+                // stream error" — unwrap the real message so a broken
+                // Dockerfile reports *why* it broke.
+                Err(bollard::errors::Error::DockerStreamError { error }) => {
+                    return Err(OciError::Failure(format!("image build failed: {error}")));
+                }
+                Ok(info) => progress.observe(&info),
+                Err(e) => return Err(map_err(e)),
+            }
         }
-        Ok(())
+        let (steps_total, steps_cached) = progress.summary();
+        Ok(BuildReport {
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            steps_total,
+            steps_cached,
+        })
     }
 
     async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
@@ -552,6 +652,285 @@ mod tests {
             std::path::Path::new(DOCKER_SOCKET).exists(),
             "Docker socket `{DOCKER_SOCKET}` not found"
         );
+    }
+
+    /// The structured `BuildKit` path: only `[stage N/M]` Dockerfile steps
+    /// count — internal loads, frontend resolves and image export are
+    /// plumbing — and a vertex observed `cached` marks its digest.
+    #[test]
+    fn build_progress_parses_buildkit_vertexes() {
+        use bollard::models::BuildInfoAux;
+        let mk = |digest: &str, name: &str, cached: bool| bollard::models::BuildInfo {
+            id: Some("moby.buildkit.trace".to_owned()),
+            stream: None,
+            error: None,
+            error_detail: None,
+            status: None,
+            progress: None,
+            progress_detail: None,
+            aux: Some(BuildInfoAux::BuildKit(
+                bollard::moby::buildkit::v1::StatusResponse {
+                    vertexes: vec![bollard::moby::buildkit::v1::Vertex {
+                        digest: digest.to_owned(),
+                        inputs: vec![],
+                        name: name.to_owned(),
+                        cached,
+                        ..Default::default()
+                    }],
+                    statuses: vec![],
+                    logs: vec![],
+                    warnings: vec![],
+                },
+            )),
+        };
+        let mut progress = BuildProgress::default();
+        progress.observe(&mk(
+            "d-from",
+            "[stage-0 1/2] FROM docker.io/library/alpine:latest",
+            false,
+        ));
+        progress.observe(&mk(
+            "d-run",
+            "[stage-0 2/2] RUN --mount=type=cache,target=/cache echo hi",
+            false,
+        ));
+        progress.observe(&mk(
+            "d-internal",
+            "[internal] load remote build context",
+            true,
+        ));
+        progress.observe(&mk("d-export", "exporting to image", true));
+        progress.observe(&mk(
+            "d-run",
+            "[stage-0 2/2] RUN --mount=type=cache,target=/cache echo hi",
+            true,
+        ));
+        // FROM and RUN count; the bracketed internal vertex must NOT.
+        assert_eq!(progress.summary(), (2, 1));
+    }
+
+    /// The classic text fallback still works for engines that stream lines
+    /// instead of structured events.
+    #[test]
+    fn build_progress_parses_cached_vs_executed_steps() {
+        let mut progress = BuildProgress::default();
+        progress.observe(&bollard::models::BuildInfo {
+            stream: Some(
+                concat!(
+                    "#5 [1/3] FROM alpine:latest\n",
+                    "#5 CACHED\n",
+                    "#8 [2/3] RUN echo hi\n",
+                    "#8 DONE 0.1s\n",
+                    "#13 exporting to image\n",
+                    "#13 DONE 0.0s\n",
+                )
+                .to_owned(),
+            ),
+            ..Default::default()
+        });
+        // FROM + RUN count (one cached); the unbracketed export step is
+        // plumbing and doesn't.
+        assert_eq!(progress.summary(), (2, 1));
+    }
+
+    /// Non-progress chatter (empty lines, ANSI-framed classic-builder
+    /// output, unnumbered lines) contributes nothing and never panics.
+    #[test]
+    fn build_progress_ignores_unparseable_lines() {
+        let mut progress = BuildProgress::default();
+        progress.observe(&bollard::models::BuildInfo {
+            stream: Some(
+                "\n---\u{1b}-> Running in abc123\nStep 1/2 : FROM alpine\n#notanid CACHED\n"
+                    .to_owned(),
+            ),
+            ..Default::default()
+        });
+        assert_eq!(progress.summary(), (0, 0));
+    }
+
+    /// Proves the reason builds go through `BuildKit` (`BuilderBuildKit` +
+    /// bollard's `buildkit` feature, SPEC.md §4.5): `RUN
+    /// --mount=type=cache` cache mounts persist data *across* `build`
+    /// calls. Build #1 plants a marker inside the cache mount; build #2
+    /// (whose Dockerfile was touched, forcing its RUN to actually
+    /// re-execute instead of replaying from layer cache) fails outright if
+    /// the marker is gone. Impossible on the legacy V1 builder, which has
+    /// no cache mounts at all.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn buildkit_cache_mounts_persist_across_builds() {
+        const CACHE_ID: &str = "oxid-test-buildkit-cache";
+        const IMAGE: &str = "oxid-test/buildkit-cache";
+        let client = DockerClient::connect().unwrap();
+        // Best-effort: start clean so the test proves persistence within
+        // itself rather than inheriting state from a previous run.
+        let _ = client.docker.remove_volume(CACHE_ID, None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let image = IMAGE.to_owned();
+
+        // A trailing comment is enough to change the Dockerfile (and thus
+        // the layer cache key of every instruction below it) between
+        // builds while keeping the RUN itself byte-identical.
+        let dockerfile_for = |touch: bool| -> String {
+            format!(
+                concat!(
+                    "# syntax=docker/dockerfile:1.7\n",
+                    "FROM alpine\n",
+                    "RUN --mount=type=cache,target=/cache,id={CACHE_ID} ",
+                    "[ -f /cache/marker ] || date +%s%N > /cache/marker\n",
+                    "{touch}"
+                ),
+                CACHE_ID = CACHE_ID,
+                touch = if touch { "# touched\n" } else { "" }
+            )
+        };
+        let spec = |dockerfile: String| {
+            std::fs::write(dir.path().join("Dockerfile"), dockerfile).unwrap();
+            BuildSpec {
+                context: dir.path().to_owned(),
+                dockerfile: "Dockerfile".to_owned(),
+                image: image.clone(),
+            }
+        };
+
+        // Build #1: cold cache mount — plants the marker, must succeed.
+        let cold = client
+            .build(&spec(dockerfile_for(false)))
+            .await
+            .expect("first (cold-cache) build should succeed");
+        assert!(
+            cold.steps_total >= 1,
+            "no steps parsed from a real BuildKit stream: {cold:?}"
+        );
+
+        // Build #2: warm cache mount — the marker must still be there.
+        let warm = client
+            .build(&spec(dockerfile_for(true)))
+            .await
+            .expect("cache mount did not persist data across builds");
+        assert!(
+            warm.steps_cached <= warm.steps_total,
+            "incoherent build report: {warm:?}"
+        );
+        println!("build reports: cold={cold:?} warm={warm:?}");
+
+        let _ = client.docker.remove_volume(CACHE_ID, None).await;
+        let _ = client.remove_image(&image).await;
+    }
+
+    /// Documents SPEC.md §3.2's "<300ms unpause" target with real numbers:
+    /// times only the *wake* operation — `unpause` for a `Paused`
+    /// container, `start` for a `Hibernating` (stopped) one, matching what
+    /// `ControlPlane::wake` actually performs — over repeated cycles,
+    /// prints p50/p95/p99, and asserts both paths' p95 under their bars.
+    /// Prior informal measurements ran 25–36ms; this makes that claim
+    /// reproducible instead of anecdotal. Not part of CI — it needs Docker
+    /// and measures wall-clock latency, which is machine-dependent; treat
+    /// a local failure as "this host is slow", not "the code regressed".
+    ///
+    /// The two paths get different bars on purpose: the 300ms target was
+    /// written about `unpause`, which resumes the already-initialized
+    /// container in place. `start` boots a stopped container from scratch
+    /// (runtime init, entrypoint exec) — same order of magnitude, but
+    /// structurally slower, so its assertion carries more headroom.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn pause_wake_latency_stays_under_the_300ms_target() {
+        const UNPAUSE_CYCLES: usize = 20;
+        // Fewer cycles for the start path: each re-arm `stop` waits out
+        // Docker's 2s grace period by design, so 10 cycles ≈ half a minute
+        // of wall clock — enough samples for a p95 without a glacial test.
+        const START_CYCLES: usize = 10;
+        const IMAGE: &str = "oxid-test/wake-latency";
+        let client = DockerClient::connect().unwrap();
+        let name = "oxid-test-wake-latency";
+        let _ = client.remove(name).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM alpine\nCMD [\"sleep\", \"3600\"]\n",
+        )
+        .unwrap();
+        client
+            .build(&BuildSpec {
+                context: dir.path().to_owned(),
+                dockerfile: "Dockerfile".to_owned(),
+                image: IMAGE.to_owned(),
+            })
+            .await
+            .unwrap();
+        let spec = ContainerSpec {
+            name: name.to_owned(),
+            image: IMAGE.to_owned(),
+            env: std::collections::BTreeMap::default(),
+            container_port: 8080,
+            labels: std::collections::BTreeMap::default(),
+            network: None,
+            memory_limit_mb: None,
+            cpu_limit_millicores: None,
+        };
+        client.run(&spec).await.unwrap();
+
+        // Each cycle: re-arm the suspended state (untimed), then time only
+        // the wake call itself — that alone is what a user waiting on a
+        // woken URL experiences.
+        let mut unpauses_ms = Vec::with_capacity(UNPAUSE_CYCLES);
+        client.pause(name).await.expect("initial pause");
+        for _ in 0..UNPAUSE_CYCLES {
+            let start = std::time::Instant::now();
+            client.unpause(name).await.expect("unpause");
+            unpauses_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            client.pause(name).await.expect("re-arm pause");
+        }
+
+        // Re-arm = `stop`, which waits out Docker's grace period by
+        // design (2s here) — deliberately outside the timed window.
+        let mut starts_ms = Vec::with_capacity(START_CYCLES);
+        client.stop(name).await.expect("initial stop");
+        for _ in 0..START_CYCLES {
+            let start = std::time::Instant::now();
+            client.start(name).await.expect("start");
+            starts_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            client.stop(name).await.expect("re-arm stop");
+        }
+        // Leave the container running so removal sees a clean state.
+        client.start(name).await.expect("final start");
+
+        let unpause_p95 = report_percentiles("unpause", &mut unpauses_ms);
+        let start_p95 = report_percentiles("start", &mut starts_ms);
+
+        client.remove(name).await.unwrap();
+        let _ = client.remove_image(IMAGE).await;
+
+        assert!(
+            unpause_p95 < 300.0,
+            "unpause p95 over the SPEC §3.2 300ms target: {unpause_p95:.1}ms"
+        );
+        assert!(
+            start_p95 < 1000.0,
+            "hibernating-start p95 unexpectedly slow: {start_p95:.1}ms"
+        );
+    }
+
+    /// Sorts, prints p50/p95/p99, returns the p95.
+    fn report_percentiles(label: &str, samples_ms: &mut [f64]) -> f64 {
+        samples_ms.sort_by(f64::total_cmp);
+        // Integer permille arithmetic for percentile indexes — no
+        // float→usize casts.
+        let pct = |permille: usize| {
+            let n = samples_ms.len();
+            let idx = ((permille * (n - 1)) + 500) / 1000;
+            samples_ms[idx.min(n - 1)]
+        };
+        println!(
+            "{label}: n={} p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+            samples_ms.len(),
+            pct(500),
+            pct(950),
+            pct(990)
+        );
+        pct(950)
     }
 
     /// Regression test for a real bug found via manual E2E testing: `exec`

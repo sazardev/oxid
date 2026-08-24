@@ -70,12 +70,21 @@
 //!   A restore never touches the live database in place — it stages the
 //!   upload and applies it on the *next* startup (see [`apply_staged_restore`]).
 //! - `OXID_RATE_LIMIT_PER_SECOND` / `OXID_RATE_LIMIT_BURST` — when **both**
-//!   are set, caps the protected control-plane routes to a shared token
-//!   bucket (sustained requests/sec, burst size) so a single misbehaving
-//!   script holding the API token can't saturate the daemon. Unset by
-//!   default (unlimited) — it's a single global bucket, not per-client, so
-//!   it only matters once the token is handed to more than one trusted
-//!   party.
+//!   are set, caps the protected control-plane routes with a token bucket
+//!   (sustained requests/sec, burst size) **per client IP** so one
+//!   misbehaving script holding the API token can't saturate the daemon
+//!   from its host while everyone else keeps working. Unset by default
+//!   (unlimited). Behind a single reverse proxy all requests share the
+//!   proxy's IP, so there the limit degrades to a global bucket — safe,
+//!   just coarser (see `ClientIpKeyExtractor` in `api/middleware.rs` for
+//!   why `X-Forwarded-For` is deliberately not trusted).
+//! - `OXID_BACKUP_INTERVAL_SECS` / `OXID_BACKUP_KEEP` — when the interval
+//!   is set to ≥1, snapshots the database every that many seconds into
+//!   `{OXID_DATA_DIR}/backups/oxid-backup-<timestamp>.sqlite` via
+//!   `VACUUM INTO` (consistent against the live pool) and rotates,
+//!   keeping `OXID_BACKUP_KEEP` newest (default 7). Unset by default —
+//!   restore with `oxid restore`, or run a Litestream sidecar for
+//!   streaming off-site replication (see `docker-compose.yml`).
 //!
 //! **Resilience notes:** deployed containers carry Docker's
 //! `unless-stopped` restart policy — they come back on their own after a
@@ -205,6 +214,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::time::Duration::from_secs(gc_interval_secs),
     ));
 
+    // Periodic on-disk database snapshots (DR posture) — off unless
+    // OXID_BACKUP_INTERVAL_SECS is set.
+    if let Some(backup_config) = oxid_daemon::service::backup::config_from_env(&data_dir_path) {
+        tokio::spawn(oxid_daemon::service::backup::run(cp.clone(), backup_config));
+    }
+
     let webhook_secret = std::env::var("OXID_WEBHOOK_SECRET").ok();
     let api_token = std::env::var("OXID_API_TOKEN").ok();
     if api_token.is_none() {
@@ -256,7 +271,11 @@ async fn serve(
         });
         axum_server::bind_rustls(socket_addr, config)
             .handle(handle)
-            .serve(app.into_make_service())
+            // `into_make_service_with_connect_info` (not plain
+            // `into_make_service`) inserts each request's peer address as a
+            // `ConnectInfo` extension — the per-IP rate-limit key
+            // (`ClientIpKeyExtractor`) is dead weight without it.
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -276,11 +295,18 @@ async fn serve(
         // race the same cap in manually here so the plain-HTTP path actually
         // matches this function's own doc comment.
         let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
-        let serve_fut = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = drain_rx.await;
-            })
-            .into_future();
+        // `into_make_service_with_connect_info` (not plain `app`) inserts
+        // each request's peer address as a `ConnectInfo` extension — the
+        // per-IP rate-limit key (`ClientIpKeyExtractor`) is dead weight
+        // without it. axum_server's TLS path below does the same.
+        let serve_fut = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = drain_rx.await;
+        })
+        .into_future();
         tokio::pin!(serve_fut);
         tokio::select! {
             result = &mut serve_fut => result?,

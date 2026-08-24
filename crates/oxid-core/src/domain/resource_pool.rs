@@ -50,7 +50,12 @@ impl FromStr for PoolKind {
         match s {
             "postgres" => Ok(Self::Postgres),
             "redis" => Ok(Self::Redis),
-            _ => invalid(format!("unknown pool kind `{s}`")),
+            // Listed inline so the oxid.toml author can fix the typo
+            // without opening docs — rustc-style errors are the house style
+            // (DESIGN.md §5).
+            _ => invalid(format!(
+                "unknown pool kind `{s}` — valid kinds are `postgres` and `redis`"
+            )),
         }
     }
 }

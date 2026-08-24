@@ -113,9 +113,21 @@ const DEFAULT_CONTEXT: &str = ".";
 
 impl Config {
     fn into_domain(self) -> Result<ParsedProject, ConfigError> {
-        let name = required(self.project.name, "[project] name")?;
-        let base_domain = required(self.routing.base_domain, "[routing] base_domain")?;
-        let port = required(self.routing.port, "[routing] port")?;
+        let name = required(
+            self.project.name,
+            "[project] name",
+            r#"add it under `[project]`, e.g. `name = "my-app"`"#,
+        )?;
+        let base_domain = required(
+            self.routing.base_domain,
+            "[routing] base_domain",
+            r#"add it under `[routing]`, e.g. `base_domain = "preview.mycompany.dev"`"#,
+        )?;
+        let port = required(
+            self.routing.port,
+            "[routing] port",
+            "add it under `[routing]`, e.g. `port = 8080` — the container port your app listens on",
+        )?;
 
         let pause_after = match self.project.pause_after {
             Some(raw) => Ttl::parse(raw)?,
@@ -161,10 +173,10 @@ impl Config {
     }
 }
 
-fn required<T>(value: Option<T>, what: &str) -> Result<T, ConfigError> {
+fn required<T>(value: Option<T>, what: &str, hint: &str) -> Result<T, ConfigError> {
     value.ok_or_else(|| {
         ConfigError::Validation(DomainError::Invalid(format!(
-            "oxid.toml is missing `{what}`"
+            "oxid.toml is missing `{what}` — {hint}"
         )))
     })
 }
@@ -418,6 +430,18 @@ port = 3000
         assert!(parse_str("[project]\nname = \"x\"\n").is_err());
         assert!(parse_str("[routing]\nbase_domain = \"x\"\nport = 1\n").is_err());
         assert!(parse_str("[project]\nname = \"x\"\n[routing]\nport = 1\n").is_err());
+    }
+
+    /// Missing-field errors must be rustc-style (DESIGN.md §5): say what's
+    /// missing AND how to fix it, not just that something is wrong.
+    #[test]
+    fn missing_field_errors_carry_an_actionable_example() {
+        let err = parse_str("[project]\nname = \"x\"\n[routing]\nport = 1\n").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("`[routing] base_domain`") && message.contains("e.g."),
+            "{message}"
+        );
     }
 
     #[test]

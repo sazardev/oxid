@@ -59,13 +59,42 @@ pub async fn deploy<
         .deploy_or_queue(ProjectId(id), branch, operator_name(authed.as_ref()))
         .await?
     {
-        DeployOutcome::Deployed(env) => Ok((StatusCode::CREATED, Json(env)).into_response()),
+        DeployOutcome::Deployed(env, report) => Ok((
+            StatusCode::CREATED,
+            Json(environment_with_report(&env, &report)),
+        )
+            .into_response()),
         DeployOutcome::Queued { position } => Ok((
             StatusCode::ACCEPTED,
             Json(json!({ "status": "queued", "position": position })),
         )
             .into_response()),
     }
+}
+
+/// Serializes an `Environment` and merges the [`DeployReport`] into the
+/// same JSON object as sibling keys — `"build"` (duration/cache stats) and
+/// `"dependencies"` (human-readable provisioning lines). Consumers that
+/// deserialize strictly into `Environment` keep working (serde ignores
+/// unknown fields); the CLI reads the extras for DESIGN.md §3.3's
+/// "Cache hit: N%" / created-database output.
+fn environment_with_report(env: &Environment, report: &crate::DeployReport) -> Value {
+    let mut body = match serde_json::to_value(env) {
+        Ok(value) => value,
+        // An `Environment` is plain data; this arm is unreachable in
+        // practice but a failed serialize must not 500 with no detail.
+        Err(e) => {
+            return json!({ "error": format!("cannot serialize environment: {e}") });
+        }
+    };
+    body["build"] = json!({
+        "duration_ms": report.build.duration_ms,
+        "steps_total": report.build.steps_total,
+        "steps_cached": report.build.steps_cached,
+        "cache_hit_percent": report.build.cache_hit_percent(),
+    });
+    body["dependencies"] = json!(report.dependencies);
+    body
 }
 
 pub async fn rollback<
@@ -76,9 +105,9 @@ pub async fn rollback<
     Path(id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RollbackBody>,
-) -> ApiResult<(StatusCode, Json<Environment>)> {
+) -> ApiResult<Response> {
     let branch = parse_branch(&body.branch)?;
-    let env = state
+    let (env, report) = state
         .cp
         .rollback_with_operator(
             ProjectId(id),
@@ -87,5 +116,9 @@ pub async fn rollback<
             operator_name(authed.as_ref()),
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(env)))
+    Ok((
+        StatusCode::CREATED,
+        Json(environment_with_report(&env, &report)),
+    )
+        .into_response())
 }

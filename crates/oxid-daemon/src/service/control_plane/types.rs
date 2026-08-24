@@ -1,4 +1,4 @@
-use oxid_core::{ContainerStatus, Environment, EnvironmentId, SelfWiringStatus};
+use oxid_core::{BuildReport, ContainerStatus, Environment, EnvironmentId, SelfWiringStatus};
 
 /// Outcome of one [`crate::service::control_plane::ControlPlane::sweep`] pass across all environments.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,9 +111,14 @@ impl InfraStatus {
 /// Result of a capacity-aware deploy attempt (see
 /// [`crate::service::control_plane::ControlPlane::deploy_or_queue`]).
 #[derive(Debug, Clone)]
+// The variant-size gap is `Environment`'s own doing; `DeployReport` is only
+// three integers, and boxing it would buy an allocation per deploy for no
+// readability gain.
+#[allow(clippy::large_enum_variant)]
 pub enum DeployOutcome {
-    /// The deploy ran immediately and is now live.
-    Deployed(Environment),
+    /// The deploy ran immediately and is now live, with a report of what
+    /// the build/provisioning actually did.
+    Deployed(Environment, DeployReport),
     /// The host doesn't currently have room; the request was persisted to
     /// `deploy_queue` (see [`crate::adapter::store::SqliteStore::enqueue_deploy`]) at this 1-based
     /// position and will be retried automatically as capacity frees up.
@@ -121,6 +126,23 @@ pub enum DeployOutcome {
         /// 1-based position in the queue at the moment of enqueueing.
         position: u64,
     },
+}
+
+/// What a deploy did beyond flipping state: how the image build went
+/// (duration, cache effectiveness) and what shared resources were leased
+/// for the branch. Surfaced so the CLI can print DESIGN.md §3.3's
+/// "[+] Shared Postgres instance detected. Created db_feature_login → [>]
+/// Building image (Cache hit: 85%)" lines; note that deploys retried from
+/// the queue server-side have no waiting caller to show it to and their
+/// report is simply dropped.
+#[derive(Debug, Clone)]
+pub struct DeployReport {
+    /// Image-build outcome (parsed from BuildKit's progress stream —
+    /// zeroed totals when nothing could be observed).
+    pub build: BuildReport,
+    /// One human-readable line per declared dependency, e.g.
+    /// "created postgres database `db_app_feature_x` (shared `local-pg`)".
+    pub dependencies: Vec<String>,
 }
 
 /// Whether a new deploy should proceed now or wait for capacity — see

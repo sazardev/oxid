@@ -485,6 +485,41 @@ code {
 
 .tk-orange { color: var(--orange); }
 .tk-green { color: var(--green); }
+.tk-gray { color: var(--ash); }
+
+/* ---------- CLI command groups ---------- */
+
+.cli-grid {
+  margin-top: 1.5rem;
+}
+
+.cli-grid .card h3 {
+  margin-top: 0;
+}
+
+.cli-grid .card p {
+  margin-bottom: 0.9rem;
+}
+
+.cli-grid .card ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.cli-grid .card li {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: #c7c7ca;
+}
+
+.cli-note {
+  margin: 1.25rem 0 0;
+  color: var(--ash);
+  font-size: 0.95rem;
+}
 
 /* ---------- Status / interfaces ---------- */
 

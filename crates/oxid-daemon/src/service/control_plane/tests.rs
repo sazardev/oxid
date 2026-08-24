@@ -1,10 +1,10 @@
 use super::*;
 use crate::adapter::store::SqliteStore;
 use oxid_core::{
-    AuditFilter, Branch, BranchName, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus,
-    EnvVarScope, Environment, EnvironmentState, EnvironmentStore, GitError, GitPort, HostCapacity,
-    LogStream, OciError, OffsetDateTime, PoolError, PoolKind, ProjectId, ProjectStore, RepoUrl,
-    StateTransition,
+    AuditFilter, Branch, BranchName, BuildReport, BuildSpec, ContainerPort, ContainerSpec,
+    ContainerStatus, EnvVarScope, Environment, EnvironmentState, EnvironmentStore, GitError,
+    GitPort, HostCapacity, LogStream, OciError, OffsetDateTime, PoolError, PoolKind, ProjectId,
+    ProjectStore, RepoUrl, StateTransition,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,14 +59,20 @@ struct FakeOci {
 }
 
 impl ContainerPort for FakeOci {
-    async fn build(&self, spec: &BuildSpec) -> Result<(), OciError> {
+    async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         self.calls.lock().unwrap().push(format!(
             "build:{}:context={}:dockerfile={}",
             spec.image,
             spec.context.display(),
             spec.dockerfile
         ));
-        Ok(())
+        // Non-zero totals so tests can tell a propagated report apart from
+        // the zeroed "unparseable stream" default.
+        Ok(BuildReport {
+            duration_ms: 1_234,
+            steps_total: 10,
+            steps_cached: 8,
+        })
     }
     async fn run(&self, spec: &ContainerSpec) -> Result<Option<u16>, OciError> {
         self.calls.lock().unwrap().push(format!(
@@ -1661,7 +1667,10 @@ async fn deploy_or_queue_deploys_immediately_when_capacity_is_available() {
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
         .await
         .unwrap();
-    assert!(matches!(outcome, DeployOutcome::Deployed(_)), "{outcome:?}");
+    assert!(
+        matches!(&outcome, DeployOutcome::Deployed(_, report) if report.build.steps_total == 10),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -1733,7 +1742,10 @@ async fn deploy_or_queue_always_deploys_when_admission_control_is_disabled() {
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
         .await
         .unwrap();
-    assert!(matches!(outcome, DeployOutcome::Deployed(_)), "{outcome:?}");
+    assert!(
+        matches!(&outcome, DeployOutcome::Deployed(_, report) if report.build.steps_total == 10),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -1783,7 +1795,7 @@ async fn retry_queued_deploys_deploys_once_capacity_frees_up() {
         .await
         .unwrap()
     {
-        DeployOutcome::Deployed(env) => env,
+        DeployOutcome::Deployed(env, _report) => env,
         other @ DeployOutcome::Queued { .. } => panic!("expected Deployed, got {other:?}"),
     };
     cp.deploy_or_queue(project.id, BranchName::parse("other").unwrap(), None)

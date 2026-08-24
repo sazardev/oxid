@@ -44,8 +44,10 @@ Rule: new capability → domain + port in `oxid-core`, adapter in `oxid-daemon/s
 Daemon env (`crates/oxid-daemon/src/main.rs`):
 - `OXID_DATA_DIR` default `/data` → `audit.sqlite` (WAL), `git-cache/`, `secret.key` (0600, AES-GCM, `OXID_MASTER_KEY` 64-hex or auto-generated)
 - `OXID_ADDR` default `0.0.0.0:8080`, `OXID_GC_INTERVAL_SECS` default `30`
-- `OXID_WEBHOOK_SECRET` — HMAC-SHA256; webhooks rejected if unset
+- `OXID_WEBHOOK_SECRET` — HMAC-SHA256 (GitHub/Gitea/Gogs) + token echo (GitLab); webhooks rejected if unset; routes `/api/v1/webhooks/{github,gitlab,gitea,gogs}`
 - `OXID_API_TOKEN` / `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. (see `main.rs`)
+- `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required) — per-client-IP bucket on protected routes
+- `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
 
 CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. Run: `cargo run -p oxid-daemon` / `cargo run -p oxid-cli -- <subcommand>` (e.g. `ps`, `up`, `logs -f`). Docker required for daemon (build/run/pause), not for `cargo test` (pure `oxid-core` tests are instant; `oxid-daemon` integration tests use in-memory SQLite unless `#[ignore]` Docker tests).
 

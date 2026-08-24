@@ -12,10 +12,11 @@
 
 use std::any::Any;
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -33,8 +34,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tower_governor::GovernorLayer;
+use tower_governor::errors::GovernorError;
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::GlobalKeyExtractor;
+use tower_governor::key_extractor::{GlobalKeyExtractor, KeyExtractor};
 use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::request_context::current_request_id;
@@ -203,6 +205,38 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Rate-limit key: the client's direct peer IP, one token bucket per IP.
+///
+/// Both serve paths in `main.rs` build the app via
+/// `into_make_service_with_connect_info`, so every production request
+/// carries its peer address in a [`ConnectInfo`] extension and gets an
+/// independent bucket. Requests *without* that extension — the test
+/// harness drives the router through `tower::ServiceExt::oneshot`,
+/// bypassing any make service — would otherwise fail key extraction
+// outright (`GovernorError::UnableToExtractKey` → 500 on every request);
+/// they degrade to one shared bucket keyed on `0.0.0.0`, i.e. the old
+/// global-bucket behavior.
+///
+/// This is deliberately the *peer* IP, not `X-Forwarded-For`: behind a
+/// single reverse proxy every request shares the proxy's IP and the limit
+/// degrades back to global (safe direction), while honoring the header
+/// without a trusted-hop policy would let any client forge a fresh
+/// identity per request by rotating it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientIpKeyExtractor;
+
+impl KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
+
+    fn extract<T>(&self, req: &axum::http::Request<T>) -> Result<Self::Key, GovernorError> {
+        Ok(req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.ip())
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
+    }
 }
 
 // ---------------------------------------------------------------------------

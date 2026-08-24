@@ -49,6 +49,13 @@ services:
     environment:
       OXID_DATA_DIR: /data
       OXID_ADDR: 0.0.0.0:8080
+      # Periodic on-disk database snapshots (disaster recovery): every 300s
+      # into /data/backups/, keeping the newest 7. Restore with `oxid
+      # restore` (staged, applied at next daemon restart). For streaming
+      # replication to S3-compatible storage run a Litestream sidecar
+      # instead/alongside — see the commented service below.
+      OXID_BACKUP_INTERVAL_SECS: "300"
+      OXID_BACKUP_KEEP: "7"
       # Required for webhook ingestion to be accepted at all — generate with
       # `openssl rand -hex 32` and configure the same value as your GitHub
       # webhook's secret.
@@ -84,6 +91,26 @@ services:
       - traefik.docker.network=oxid-net
       - traefik.http.services.oxid-wake.loadbalancer.server.port=8080
     restart: unless-stopped
+
+  # OPTIONAL: streaming replication of the SQLite database to off-site
+  # storage (S3/GCS/Azure) via Litestream — a stronger disaster-recovery
+  # posture than the periodic on-disk snapshots above, since it survives
+  # losing the host entirely. Point LITESTREAM_ACCESS_KEY_ID/SECRET at your
+  # bucket credentials and uncomment:
+  #
+  #   litestream:
+  #     image: litestream/litestream:latest
+  #     command: replicate /data/audit.sqlite s3://your-bucket/oxid/audit.sqlite
+  #     environment:
+  #       LITESTREAM_ACCESS_KEY_ID: ${LITESTREAM_ACCESS_KEY_ID:?set it}
+  #       LITESTREAM_SECRET_ACCESS_KEY: ${LITESTREAM_SECRET_ACCESS_KEY:?set it}
+  #     volumes:
+  #       - oxid-data:/data
+  #     # Shares the oxid-data volume with the daemon so it can read the
+  #     # live database (WAL-safe); restore with `litestream restore`.
+  #     networks:
+  #       - oxid-net
+  #     restart: unless-stopped
 
 networks:
   oxid-net:

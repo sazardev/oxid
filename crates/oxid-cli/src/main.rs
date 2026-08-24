@@ -174,6 +174,9 @@ enum Command {
     /// List deploys waiting for host capacity (see `oxid up`'s "queued"
     /// response), oldest/highest-priority first.
     Queue,
+    /// Show the daemon's Docker capacity (CPUs, memory) and how many
+    /// environments are currently running.
+    Stats,
     /// Changes the current project's idle/lifetime policy — `oxid.toml`
     /// only ever seeds these at first registration otherwise.
     Configure {
@@ -467,6 +470,13 @@ fn build_client(token: Option<&str>) -> Result<Client, String> {
         builder = builder.default_headers(headers);
     }
     builder
+        // Bound only the *connection* phase: a hung daemon (or a firewalled
+        // port that silently drops SYNs) must fail fast with the actionable
+        // `connect_error` hint instead of blocking on the OS's ~2min TCP
+        // timeout — or forever, once connected. There is deliberately NO
+        // total request timeout: `logs -f`, a long build behind `up`, and
+        // `backup` downloads are all legitimately slow responses.
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))
 }
@@ -480,6 +490,9 @@ const EXIT_GENERIC: i32 = 1;
 const EXIT_NOT_FOUND: i32 = 2;
 const EXIT_UNREACHABLE: i32 = 3;
 const EXIT_UNAUTHORIZED: i32 = 4;
+/// Conventional `SIGINT` exit code — `cmd_up` exits with this when the user
+/// interrupts a long-running deploy (which continues server-side).
+const EXIT_INTERRUPTED: i32 = 130;
 
 #[derive(Debug)]
 struct CliError {
@@ -656,6 +669,7 @@ async fn main() {
         Command::Doctor => cmd_doctor(&client, &base).await,
         Command::RotateKey => cmd_rotate_key(&client, &base).await,
         Command::Queue => cmd_queue(&client, &base).await,
+        Command::Stats => cmd_stats(&client, &base).await,
         Command::Configure {
             pause_after,
             destroy_after,
@@ -780,22 +794,33 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliErro
 
     action(format!("Building image for {branch}..."));
     let url = format!("{base}/api/v1/projects/{project_id}/deploy");
-    let response = client
-        .post(&url)
-        .json(&json!({ "branch": branch }))
-        .send()
-        .await
-        .map_err(|e| connect_error(&url, &e))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| format!("cannot read daemon response: {e}"))?;
-    if !status.is_success() {
-        return Err(response_error(&body, status, "deployment failed"));
-    }
-    let env: Value =
-        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    let request = async {
+        let response = client
+            .post(&url)
+            .json(&json!({ "branch": branch }))
+            .send()
+            .await
+            .map_err(|e| connect_error(&url, &e))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("cannot read daemon response: {e}"))?;
+        if !status.is_success() {
+            return Err(response_error(&body, status, "deployment failed"));
+        }
+        serde_json::from_str::<Value>(&body)
+            .map_err(|e| format!("invalid daemon response: {e}").into())
+    };
+    // A build can take minutes; Ctrl+C must not leave the user thinking
+    // they cancelled it. The daemon keeps deploying — say so, loudly.
+    let env: Value = tokio::select! {
+        result = request => result?,
+        _ = tokio::signal::ctrl_c() => {
+            error("Interrupted — the deploy keeps running server-side; check it with `oxid status` or `oxid queue`");
+            std::process::exit(EXIT_INTERRUPTED);
+        }
+    };
     if env["status"].as_str() == Some("queued") {
         if !emit_json(&env) {
             let position = env["position"].as_u64().unwrap_or(0);
@@ -806,12 +831,45 @@ async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliErro
         return Ok(());
     }
     if !emit_json(&env) {
+        print_deploy_report(&env);
         ok(format!(
             "Environment live at: {}",
             env_display_address(base, &env)
         ));
     }
     Ok(())
+}
+
+/// Prints the build/provisioning half of a deploy response — the
+/// `"build"`/`"dependencies"` sibling keys the daemon attaches alongside
+/// the environment (DESIGN.md §3.3's "[+] Shared Postgres instance
+/// detected. Created `db_feature_login` → [>] Building image (Cache hit:
+/// 85%)"). Both keys are optional: older daemons and *queued* deploys
+/// don't carry them, in which case nothing extra is printed.
+fn print_deploy_report(env: &Value) {
+    if let Some(build) = env.get("build") {
+        let took = format_duration_ms(build["duration_ms"].as_u64().unwrap_or(0));
+        match build["cache_hit_percent"].as_u64().map(u8::try_from) {
+            Some(Ok(pct)) => ok(format!("Image built (cache hit: {pct}%, {took})")),
+            _ => ok(format!("Image built ({took})")),
+        }
+    }
+    for dep in env["dependencies"].as_array().into_iter().flatten() {
+        if let Some(line) = dep.as_str() {
+            ok(line);
+        }
+    }
+}
+
+/// Human-friendly milliseconds: whole ms below 10s, one decimal in s above.
+fn format_duration_ms(ms: u64) -> String {
+    if ms >= 10_000 {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = ms as f64 / 1000.0;
+        format!("{seconds:.1}s")
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 async fn cmd_rollback(
@@ -844,6 +902,7 @@ async fn cmd_rollback(
     let env: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     if !emit_json(&env) {
+        print_deploy_report(&env);
         let sha = env["branch"]["commit_sha"].as_str().unwrap_or("?");
         ok(format!(
             "Rolled back to {sha} — environment live at: {}",
@@ -1706,30 +1765,45 @@ fn print_doctor_report(
         ));
     }
     match node_stats {
-        Some(Ok(node_stats)) => {
-            let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
-            let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
-            if mem_bytes == 0 || cpus == 0 {
-                bg(
-                    "Daemon reports 0 host memory/CPUs — its Docker socket may be \
-                     unreachable; check OXID's container has /var/run/docker.sock mounted \
-                     and the daemon user can access it",
-                );
-            } else {
-                #[allow(clippy::cast_precision_loss)]
-                let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                ok(format!(
-                    "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
-                    node_stats["environments_running"].as_u64().unwrap_or(0),
-                ));
-            }
-        }
+        Some(Ok(node_stats)) => print_node_stats(node_stats),
         Some(Err(message)) => bg(format!(
             "Could not fetch capacity stats ({message}) — the daemon may predate \
              `/api/v1/stats`; upgrade it to enable this check"
         )),
         None => {}
     }
+}
+
+/// Renders one `GET /api/v1/stats` payload — shared by `doctor`'s capacity
+/// section and `oxid stats`.
+fn print_node_stats(node_stats: &Value) {
+    let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
+    let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
+    if mem_bytes == 0 || cpus == 0 {
+        bg(
+            "Daemon reports 0 host memory/CPUs — its Docker socket may be \
+             unreachable; check OXID's container has /var/run/docker.sock mounted \
+             and the daemon user can access it",
+        );
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        ok(format!(
+            "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
+            node_stats["environments_running"].as_u64().unwrap_or(0),
+        ));
+    }
+}
+
+/// Read-only: `GET /api/v1/stats` — host capacity and running-environment
+/// count, standalone for scripts/monitoring (`--json` emits the raw
+/// object). `doctor` runs this same check as one of its diagnostics.
+async fn cmd_stats(client: &Client, base: &str) -> Result<(), CliError> {
+    let value = get_json(client, format!("{base}/api/v1/stats")).await?;
+    if !emit_json(&value) {
+        print_node_stats(&value);
+    }
+    Ok(())
 }
 
 async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
@@ -2319,6 +2393,14 @@ mod tests {
                 action: InfraAction::Setup
             }
         ));
+    }
+
+    #[test]
+    fn formats_durations_for_humans() {
+        assert_eq!(format_duration_ms(850), "850ms");
+        assert_eq!(format_duration_ms(9_999), "9999ms");
+        assert_eq!(format_duration_ms(10_000), "10.0s");
+        assert_eq!(format_duration_ms(41_230), "41.2s");
     }
 
     #[test]

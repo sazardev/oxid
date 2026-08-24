@@ -39,8 +39,8 @@
 |---|---|---|---|---|
 | 2.1 | Verificación HMAC-SHA256 de webhooks GitHub | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab. Se verifica el payload criptográficamente."_ | `api/handlers/webhook.rs` — `verify_hmac` + `X-Hub-Signature-256` (comparación constante vía `hmac`) | ✅ Done (a0c064d) |
 | 2.2 | Secret configurable (`OXID_WEBHOOK_SECRET`) | **SPEC §4.1:** implícito en _"Se verifica el payload criptográficamente"_. HMAC requiere un shared secret. | `main.rs` lee `OXID_WEBHOOK_SECRET`; webhooks rechazados si no está configurado | ✅ Done (a0c064d) |
-| 2.3 | Soporte webhooks GitLab (formato distinto) | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab."_ Menciona ambos proveedores. | Solo parsea formato GitHub (`ref`, `repository.full_name`) | No existe |
-| 2.4 | Rate limiting en la API HTTP | **SPEC §1:** _"Ecosistema Unificado: No requiere herramientas de terceros."_ Implica protección integrada. | No existe | No existe |
+| 2.3 | Soporte webhooks GitLab (formato distinto) | **SPEC §4.1:** _"axum recibe un push webhook de GitHub/GitLab."_ Menciona ambos proveedores. | `api/handlers/webhook.rs` — núcleo común `handle_push` + tres handlers: `/webhooks/github` (HMAC `X-Hub-Signature-256`), `/webhooks/gitlab` (token plano `X-Gitlab-Token` comparado constant-time, branch borrada = `after` null-SHA, otros `object_kind` ignorados), `/webhooks/gitea` + `/webhooks/gogs` (HMAC hex sin prefijo). Un solo `OXID_WEBHOOK_SECRET`; 13 tests de webhook | ✅ Done |
+| 2.4 | Rate limiting en la API HTTP | **SPEC §1:** _"Ecosistema Unificado: No requiere herramientas de terceros."_ Implica protección integrada. | Ya existía (`OXID_RATE_LIMIT_PER_SECOND`/`BURST`, `GovernorLayer` sobre rutas protegidas, test de burst) — el ROADMAP estaba desactualizado. Ahora con bucket **por client IP**: nuevo `ClientIpKeyExtractor` (fallback a bucket compartido cuando no hay `ConnectInfo`, p.ej. tests) y `into_make_service_with_connect_info` cableado en ambos serve paths (HTTP y TLS) de `main.rs`. Tras un reverse proxy único degrada a global (dirección segura; XFF no se confía por spoofable) | ✅ Done (mejorado a per-IP) |
 | 2.5 | Autenticación API (bearer token mínimo) | **SPEC §6:** La configuración incluye _"tokens"_ en `/data/config.toml`. | `OXID_API_TOKEN` + middleware `Authorization: Bearer` (comparación en tiempo constante) sobre todo `/api/v1/*` salvo `/health`, `/webhooks/*`, `/wake`, `/heartbeat`. CLI: `--token`/`OXID_TOKEN` | ✅ Done |
 
 ---
@@ -77,7 +77,7 @@
 | 5.2 | Endpoint de wake-on-request que Traefik llama | **SPEC §3.2:** _"Traefik está configurado para redirigir peticiones fallidas (por contenedor pausado) a un endpoint especial del orquestador en Rust."_ | `api/handlers/lifecycle.rs` — `POST /api/v1/wake` lee `Host`/`X-Forwarded-Host`, resuelve el entorno y lo despierta (`wake_by_url`); pensado como target de la `errors` middleware de Traefik | ✅ Done |
 | 5.3 | Devolver señal de recarga al navegador (302 → wake → retry) | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms) y devuelve una señal de recarga al navegador."_ | `api/handlers/lifecycle.rs::wake_page_html` — página HTML con `meta refresh` estilo DESIGN (Carbon Black/Oxid Orange) | ✅ Done |
 | 5.4 | Monitor de tráfico real (métricas de Traefik para GC) | **SPEC §3.2:** _"Un cron interno de Rust evalúa la actividad de red. Si la rama feature-x no recibe peticiones en 30 minutos, ejecuta docker pause feature-x."_ **IDEA §6:** _"Oxid lo nota, hace unpause"_ | `api/handlers/lifecycle.rs::heartbeat_by_host` + `service/control_plane/lifecycle.rs::touch_by_url` — endpoint `GET/POST /api/v1/heartbeat` pensado como `forwardAuth` middleware de Traefik en cada request; refresca `last_accessed_at` real en vez de solo tocarlo al desplegar | ✅ Done (requiere wiring de Traefik, ver nota abajo) |
-| 5.5 | Latencia objetivo < 300ms para unpause | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms)"_ — métrica de referencia. | No hay benchmarks ni mediciones | No medido |
+| 5.5 | Latencia objetivo < 300ms para unpause | **SPEC §3.2:** _"El orquestador hace docker unpause (latencia ~300ms)"_ — métrica de referencia. | Benchmark reproducible: test `#[ignore]` `pause_wake_latency_stays_under_the_300ms_target` (`adapter/oci.rs`) — mide solo la operación wake (re-arm del estado fuera del cronómetro) e imprime p50/p95/p99. Medido en vivo contra Docker 29.6.1: **unpause p50=22.7ms p95=28.2ms p99=28.9ms** (target 300ms, ~10x margen); start de contenedor hibernado p50=262.3ms p95=274.2ms (cold start estructuralmente más lento, barra propia de 1000ms) | ✅ Done (medido) |
 
 ---
 
@@ -87,7 +87,7 @@
 |---|---|---|---|---|
 | 6.1 | Locking concurrente en SQLite | **SPEC §4.2:** _"Se adquiere un bloqueo transaccional en SQLite para evitar condiciones de carrera si entran múltiples pushes a la misma rama simultáneamente."_ | IDs `AUTOINCREMENT` + `RETURNING id` (asignación atómica); pool con `max_connections(1)` serializa escrituras | ✅ Done (a0c064d) |
 | 6.2 | Ejecución de `on_start` hooks (migrations, seeds) | **IDEA §6 (oxid.toml):** _"`on_start = ["npm run db:migrate", "npm run db:seed"]` Command injected to run once the container starts"_ **IDEA §6:** _"compila si es necesario, inyecta variables secretas y despliega"_ | `ContainerPort::exec` (`docker exec`) invocado tras `run` en `deploy()` | ✅ Done (a0c064d) |
-| 6.3 | Caché de capas Docker (BuildKit volumes) | **SPEC §4.5:** _"Se aplican técnicas de caché de capas (BuildKit) y volúmenes compartidos para dependencias (ej. ~/.m2, ~/.cargo/registry, node_modules en volúmenes Docker huérfanos mapeados automáticamente)."_ | `oci.rs:61-73` — `build_image` sin volúmenes de caché configurados | No existe |
+| 6.3 | Caché de capas Docker (BuildKit volumes) | **SPEC §4.5:** _"Se aplican técnicas de caché de capas (BuildKit) y volúmenes compartidos para dependencias (ej. ~/.m2, ~/.cargo/registry, node_modules en volúmenes Docker huérfanos mapeados automáticamente)."_ | `adapter/oci.rs::build` — builds vía `BuilderVersion::BuilderBuildKit` + sesión gRPC por build (feature `buildkit` de bollard; el builder V1 clásico está deprecado upstream). Los Dockerfiles con `# syntax=docker/dockerfile:1` + `RUN --mount=type=cache,...` ganan cachés de dependencias persistentes entre redeploys sin configuración extra. Verificado en vivo: test e2e `buildkit_cache_mounts_persist_across_builds` prueba que un marker escrito en el cache mount del build #1 sobrevive al build #2. Además `build()` ya no traga el mensaje real de error de build (`DockerStreamError` se desenvuelve). Costo medido: binario release 17MB → 19MB (~12%) | ✅ Done |
 | 6.4 | WebSocket para notificaciones en vivo | **SPEC §4.7:** _"Registro en la base de datos de eventos ... y emisión por WebSocket hacia los clientes."_ | No existe — solo audit trail en SQLite | No existe |
 | 6.5 | Cálculo de métricas de ahorro de RAM | **SPEC §5.2:** _"Visualización de ... uso de CPU/RAM en tiempo real por contenedor."_ **DESIGN §3.4:** _"Bottom pane: System stats (CPU / RAM saved by Oxid)."_ | No existe | No existe |
 
@@ -108,8 +108,8 @@
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
 | 8.1 | Prefijos coloreados: `[+]` verde, `[~]` gris, `[>]` naranja | **DESIGN §3.3:** _"`[+]` in Patina Green for success. `[~]` in Ash Gray for background tasks (e.g., pausing). `[>]` in Oxid Orange for actionable prompts or active builds."_ | `cli/main.rs` — helpers `ok`/`bg`/`action`/`error` con ANSI | ✅ Done (a0c064d) |
-| 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | Lado CLI avanzó (`cli/main.rs::connect_error`): errores diferenciados por causa (timeout/DNS/conexión) con hint accionable y exit codes por clase (2 not-found, 3 unreachable, 4 auth). Los errores de parseo de `oxid.toml` (`adapter/config.rs` → `ConfigError::Validation`) siguen sin sugerencia del tipo "Did you mean?" | Parcial |
-| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | `cli/main.rs::cmd_up` — imprime parse/registro/building/live (o "Queued, position N" si hay admission control). El pooling de DB ya existe server-side (4.1–4.5 ✅) pero la CLI no imprime la línea de shared-DB; el cache-hit % sigue sin existir (6.3) | Parcial |
+| 8.2 | Mensajes de error estilo Rust compiler | **DESIGN §5:** _"Following Rust's famous compiler errors, Oxid's errors must tell you exactly what went wrong and how to fix it."_ Ejemplo: _"Error reading oxid.toml on line 12: Invalid duration '30'. Did you mean '30m' or '30s'?"_ | CLI: errores de conexión diferenciados (timeout/DNS/conexión) con hint y exit codes por clase. Duraciones (`Ttl::parse`) ya sugerían unidades; `required()` ahora añade ejemplo accionable por campo (`missing \`[routing] port\` — add it under \`[routing]\`, e.g. \`port = 8080\` — the container port...`) y `PoolKind` lista los válidos | ✅ Done |
+| 8.3 | Output de `deploy` con pasos: parse → shared DB → build → live | **DESIGN §3.3:** Ejemplo de output: _"[+] Parsed oxid.toml successfully → [+] Shared Postgres instance detected. Created db_feature_login → [>] Building image (Cache hit: 85%) → [+] Environment live at: https://feature-login.local.dev"_ | El daemon devuelve el deploy enriquecido: `ContainerPort::build` reporta `BuildReport {duration_ms, steps_total, steps_cached}` parseado del stream estructurado BuildKit (vertexes; fallback de texto para builders clásicos), y `run_and_activate` recopila líneas de dependencias ("created postgres database \`db_x\` (shared \`local-pg\)"). Handler las fusiona como `"build"`/`"dependencies"` junto al environment; `oxid up`/`rollback` imprimen "Image built (cache hit: N%, Xs)" + una línea por dependencia. Deploys *queued* reintentados server-side no llevan report (no hay caller) | ✅ Done |
 
 ---
 
@@ -153,6 +153,7 @@
 | 12.2 | `docker run` con montaje de socket + `/data` | **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ _"Estructura del directorio /data: /data/config.toml, /data/audit.sqlite, /data/git-cache/"_ | `docker-compose.yml` — daemon + Traefik, socket + volumen `/data`, labels `oxid-wake` documentadas; ejemplo probado con `docker compose config` | ✅ Done |
 | 12.3 | Configuración global `config.toml` | **SPEC §6:** _"/data/config.toml (Configuración de dominios, tokens, reglas de recolección de basura)."_ | Superseded: dominios/tokens/GC ya se resuelven vía `OXID_*` env vars (`OXID_API_TOKEN`, `OXID_DOCKER_NETWORK`, `OXID_DAEMON_URL`, `OXID_GC_INTERVAL_SECS` — ver `main.rs`), consistente con el resto del diseño 12-factor del daemon. Un `config.toml` sería una segunda fuente de verdad redundante | Superseded por env vars |
 | 12.4 | Binario estático cross-compilado | **IDEA §6:** _"El usuario instala Oxid ejecutando un solo binario."_ **SPEC §6:** _"Todo el sistema es un binario único (estático)."_ | `.github/workflows/release.yml` — build+publish de `oxid`/`oxidd` para linux-gnu, linux-musl (x86_64 y aarch64, estático), macOS (x86_64 + Apple Silicon) y Windows en cada tag `vX.Y.Z`. `flake.nix` (validado con `nix build`) para instalación nativa en NixOS/Nix | ✅ Done |
+| 12.5 | Postura DR del nodo único (SQLite sin HA) | **SPEC §6:** Self-hosting de un binario único implica un solo estado persistente; el producto no promete HA multi-nodo. Decisión explícita: single-node es diseño, no omisión — DR vía snapshots, no replicación. | Backups periódicos automáticos: `service/backup.rs` — cada `OXID_BACKUP_INTERVAL_SECS` snapshot consistente (`VACUUM INTO`, seguro contra el pool vivo) en `{data}/backups/`, rotación por retención (`OXID_BACKUP_KEEP`, default 7; lógica de rotación unitestada, archivos ajenos al esquema nunca se tocan). Restore existente end-to-end (`oxid backup`/`restore` staged-on-restart). Ejemplo comentado de sidecar Litestream para replicación streaming off-site en `docker-compose.yml`. Default off: sin datos no hay nada que respaldar | ✅ Done |
 
 ---
 
@@ -163,6 +164,41 @@
 > daemon y CLI reales (binarios compilados, Docker real, repo git real con ramas de verdad,
 > webhook firmado con HMAC real) en vez de solo `cargo test` — ver hallazgos abajo.
 >
+> **Quinta ronda: auditoría de producción del CLI** — cerrados los 2 Parcial (8.2/8.3) y el
+> hardening restante:
+> - **Token del CLI en disco a `0600`**: `~/.config/oxid/config.toml` guarda bearer tokens y
+>   nacía world-readable por umask; `save` fuerza 0600 y `load` avisa+corrige archivos laxos
+>   existentes (parity con `secret.key` del daemon).
+> - **Timeout de conexión (10s)** en el cliente HTTP: un daemon colgado ya no cuelga al CLI
+>   indefinidamente (sin timeout total: `logs -f`/`up`/`backup` son lentos por diseño).
+> - **`oxid stats`** standalone (antes solo dentro de `doctor`); hint de Ctrl+C en `oxid up`
+>   ("el deploy sigue server-side", exit 130).
+> - **Deploy report end-to-end**: `ContainerPort::build → BuildReport` parseando los eventos
+>   estructurados BuildKit (`aux` vertexes, excluyendo `[internal]`; fallback de texto clásico),
+>   resumen de leases de dependencias en `run_and_activate`, fusionados como
+>   `"build"`/`"dependencies"` en las respuestas de deploy/rollback e impresos por la CLI.
+>
+> **Cuarta ronda: cerrados los 5 gaps de producción de la auditoría previa**
+> (rate-limit per-IP, webhooks GitLab/Gitea/Gogs, caché BuildKit, backups automáticos DR,
+> benchmark unpause):
+> - **Rate limiting por client IP:** ya existía bucket global (`OXID_RATE_LIMIT_PER_SECOND`/`BURST`
+>   + test) — el ROADMAP estaba desactualizado. Mejorado: nuevo `ClientIpKeyExtractor` con
+>   fallback a bucket compartido cuando no hay `ConnectInfo` (tests), y
+>   `into_make_service_with_connect_info` cableado en ambos serve paths (HTTP y TLS). Tras un
+>   reverse proxy único degrada a global — XFF deliberadamente no confiado (spoofable).
+> - **Webhooks multi-proveedor (2.3):** refactor a núcleo común `handle_push` + GitLab
+>   (`X-Gitlab-Token` constant-time, branch borrada = null-SHA en `after`, `object_kind` filter)
+>   y Gitea/Gogs (HMAC hex sin prefijo, payload tipo GitHub). 13 tests.
+> - **BuildKit (6.3):** builds vía `BuilderVersion::BuilderBuildKit` + sesión gRPC (feature
+>   `buildkit` de bollard). Cache mounts (`RUN --mount=type=cache`) verificados e2e con marker
+>   persistente entre builds. Bonus: `build()` ya reporta el error real del stream en vez de un
+>   genérico "Docker stream error".
+> - **Backups automáticos DR (12.5 nuevo):** snapshots periódicos `VACUUM INTO` con rotación por
+>   retención (`service/backup.rs`, rotación unitestada), default off, Litestream documentado en
+>   el compose. Postura explícita: single-node es diseño; DR ≠ HA.
+> - **Benchmark unpause (5.5):** test reproducible que cronometra solo la operación wake. Medido:
+>   unpause p50=22.7ms / p95=28.2ms (target 300ms); hibernating-start p50=262.3ms / p95=274.2ms.
+
 > **Segunda pasada de verificación agresiva (multi-proyecto, multi-rama, concurrencia,
 > seguridad, rendimiento) encontró y corrigió 9 bugs reales más:**
 > - **Fuga de secretos entre ramas (seguridad, crítico):** el filtro SQL que resuelve "secretos
@@ -287,4 +323,4 @@
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x ✅, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, release binaries | 12.1, 12.2, 12.4 ✅ · 12.3 superseded | Necesario para self-hosting real |
 
-**Total: 56 tareas granulares** (34 ✅ Done + 3 Hecho · 2 Parcial · 15 No existe · 1 No medido · 1 Superseded). Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.
+**Total: 57 tareas granulares** (41 ✅ Done + 3 Hecho · 0 Parcial · 12 No existe · 0 No medido · 1 Superseded). Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.

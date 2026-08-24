@@ -16,7 +16,7 @@ use super::helpers::{
     hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
     sanitize_label, state_err,
 };
-use super::types::{Admission, DeployOutcome, GcSummary, InfraStatus, NodeStats};
+use super::types::{Admission, DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
 use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
@@ -42,7 +42,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .deploy_at(project_id, branch, None, None, false)
             .await?
         {
-            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Deployed(env, _) => Ok(env),
             DeployOutcome::Queued { .. } => {
                 unreachable!("admission control is off, so this never queues")
             }
@@ -66,7 +66,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .deploy_at(project_id, branch, None, operator, false)
             .await?
         {
-            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Deployed(env, _) => Ok(env),
             DeployOutcome::Queued { .. } => {
                 unreachable!("admission control is off, so this never queues")
             }
@@ -145,7 +145,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .deploy_at(queued.project_id, branch, None, queued.operator, false)
                 .await
             {
-                Ok(DeployOutcome::Deployed(_)) => {}
+                Ok(DeployOutcome::Deployed(_, _)) => {}
                 Ok(DeployOutcome::Queued { .. }) => {
                     unreachable!("check_admission is off, so this never queues")
                 }
@@ -255,7 +255,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .unwrap_or_else(|| "Dockerfile".to_owned()),
             image: image.clone(),
         };
-        self.oci.build(&build).await?;
+        let build_report = self.oci.build(&build).await?;
 
         // 3. Create the environment (Building) and persist it.
         let url = subdomain_for(&branch, &project.config.base_domain);
@@ -291,7 +291,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `Building` on error would brick the branch permanently otherwise
         // (`Building` cannot transition to `Destroy`), see regression test
         // `failed_deploy_does_not_permanently_block_branch`.
-        if let Err(err) = self
+        let dependencies = match self
             .run_and_activate(
                 &project,
                 &branch,
@@ -303,27 +303,30 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             )
             .await
         {
-            let now = OffsetDateTime::now_utc();
-            if env.transition(StateTransition::BuildFailed, now).is_ok() {
-                let _ = EnvironmentStore::update(&self.store, &env).await;
-                let _ = self
-                    .store
-                    .record(
-                        &AuditEvent::with_operator(
-                            u64::try_from(now.unix_timestamp()).unwrap_or_default(),
-                            env.id,
-                            StateTransition::BuildFailed,
-                            Some(err.to_string()),
-                            now,
-                            operator.clone(),
+            Ok(dependency_lines) => dependency_lines,
+            Err(err) => {
+                let now = OffsetDateTime::now_utc();
+                if env.transition(StateTransition::BuildFailed, now).is_ok() {
+                    let _ = EnvironmentStore::update(&self.store, &env).await;
+                    let _ = self
+                        .store
+                        .record(
+                            &AuditEvent::with_operator(
+                                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                                env.id,
+                                StateTransition::BuildFailed,
+                                Some(err.to_string()),
+                                now,
+                                operator.clone(),
+                            )
+                            .with_request_id(current_request_id()),
                         )
-                        .with_request_id(current_request_id()),
-                    )
-                    .await;
+                        .await;
+                }
+                tracing::error!(%project_id, %branch, environment_id = %env.id, error = %err, "deploy failed");
+                return Err(err);
             }
-            tracing::error!(%project_id, %branch, environment_id = %env.id, error = %err, "deploy failed");
-            return Err(err);
-        }
+        };
 
         // The new instance is live (and, per the cutover inside
         // `run_and_activate`, the previous container is already gone) —
@@ -337,7 +340,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         tracing::info!(%project_id, %branch, environment_id = %env.id, "deploy succeeded");
-        Ok(DeployOutcome::Deployed(env))
+        Ok(DeployOutcome::Deployed(
+            env,
+            DeployReport {
+                build: build_report,
+                dependencies,
+            },
+        ))
     }
 
     /// Redeploys `branch` at a prior commit instead of its current head —
@@ -364,8 +373,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         to_sha: Option<String>,
     ) -> Result<Environment, CpError> {
-        self.rollback_with_operator(project_id, branch, to_sha, None)
-            .await
+        let (env, _report) = self
+            .rollback_with_operator(project_id, branch, to_sha, None)
+            .await?;
+        Ok(env)
     }
 
     /// Identical to [`Self::rollback`], attributing the resulting audit
@@ -379,7 +390,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         to_sha: Option<String>,
         operator: Option<String>,
-    ) -> Result<Environment, CpError> {
+    ) -> Result<(Environment, DeployReport), CpError> {
         let mut history = self.store.list_by_project(project_id).await?;
         history.retain(|e| e.branch.name == branch);
         history.sort_by_key(|e| std::cmp::Reverse(e.id.0));
@@ -410,7 +421,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .deploy_at(project_id, branch, Some(target_sha), operator, false)
             .await?
         {
-            DeployOutcome::Deployed(env) => Ok(env),
+            DeployOutcome::Deployed(env, report) => Ok((env, report)),
             DeployOutcome::Queued { .. } => {
                 unreachable!("admission control is off, so this never queues")
             }

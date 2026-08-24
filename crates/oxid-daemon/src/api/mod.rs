@@ -34,7 +34,6 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::GlobalKeyExtractor;
 use tower_http::catch_panic::CatchPanicLayer;
 
 use crate::request_context::current_request_id;
@@ -63,7 +62,8 @@ pub use dashboard::{
 pub use error::{ApiError, ApiResult};
 use middleware::AuthedAs;
 use middleware::{
-    handle_panic, operator_name, request_id_middleware, require_bearer_token, require_master,
+    ClientIpKeyExtractor, handle_panic, operator_name, request_id_middleware, require_bearer_token,
+    require_master,
 };
 pub use types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
@@ -76,8 +76,10 @@ pub struct ApiState<
 > {
     /// The application service backing all endpoints.
     pub cp: ControlPlane<G, O>,
-    /// Shared secret verifying GitHub webhook signatures (`OXID_WEBHOOK_SECRET`).
-    /// Webhooks are rejected while unset.
+    /// Shared secret verifying webhook authenticity for every supported
+    /// provider (`OXID_WEBHOOK_SECRET`): GitHub/Gitea/Gogs HMAC-SHA256
+    /// signatures and GitLab's plain token echo. Webhooks are rejected
+    /// while unset.
     pub webhook_secret: Option<String>,
     /// Bearer token every `/api/v1/*` control-plane request must present
     /// (`Authorization: Bearer <token>`), except `/health`, `/webhooks/*`
@@ -99,11 +101,11 @@ pub struct ApiState<
     /// second sustained, burst size)`. `None` disables it entirely — the
     /// default, since it only matters once an API token is handed to more
     /// than one trusted party (`OXID_RATE_LIMIT_PER_SECOND`/
-    /// `OXID_RATE_LIMIT_BURST`). Deliberately a single global bucket, not
-    /// per-client: distinguishing clients would need `ConnectInfo` wired
-    /// through both the plain-HTTP and TLS serve paths in `main.rs` for
-    /// comparatively little benefit on what's meant to be a small
-    /// team/CI's shared credential, not a public API.
+    /// `OXID_RATE_LIMIT_BURST`). Keyed per client IP
+    /// ([`ClientIpKeyExtractor`]) — each peer gets its own token bucket.
+    /// Behind a single reverse proxy every request shares the proxy's IP,
+    /// so there it degrades back to one shared bucket; see the extractor's
+    /// doc comment for why `X-Forwarded-For` is deliberately not trusted.
     pub rate_limit: Option<(u64, u32)>,
 }
 
@@ -215,7 +217,7 @@ pub fn router<
         let governor_conf = GovernorConfigBuilder::default()
             .per_second(per_second.max(1))
             .burst_size(burst.max(1))
-            .key_extractor(GlobalKeyExtractor)
+            .key_extractor(ClientIpKeyExtractor)
             .finish()
             .expect("valid rate limit config");
         protected = protected.layer(GovernorLayer::new(governor_conf));
@@ -237,6 +239,18 @@ pub fn router<
         .route(
             "/api/v1/webhooks/github",
             post(handlers::webhook::github_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gitlab",
+            post(handlers::webhook::gitlab_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gitea",
+            post(handlers::webhook::gitea_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gogs",
+            post(handlers::webhook::gogs_webhook),
         )
         .merge(protected)
         // Any GET that doesn't match an API route or a static asset above is

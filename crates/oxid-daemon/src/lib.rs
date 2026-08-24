@@ -15,5 +15,5 @@ pub mod request_context;
 pub mod service;
 
 pub use service::control_plane::{
-    ControlPlane, CpError, DeployOutcome, GcSummary, InfraStatus, NodeStats,
+    ControlPlane, CpError, DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats,
 };

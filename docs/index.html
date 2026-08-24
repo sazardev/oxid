@@ -34,6 +34,7 @@
         <a href="#why">Why</a>
         <a href="#features">Features</a>
         <a href="#how">How it works</a>
+        <a href="docs/">Docs</a>
         <a href="#status">Status</a>
         <a href="#join">Join</a>
         <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
@@ -174,17 +175,75 @@
           </li>
         </ol>
 
-        <div class="terminal" role="img" aria-label="Example Oxid CLI output">
+        <div class="terminal" role="img" aria-label="Example Oxid CLI session">
           <div class="terminal-titlebar">
             <span class="terminal-dot"></span><span class="terminal-dot"></span><span class="terminal-dot"></span>
-            <span class="terminal-title">oxid up feature-login</span>
+            <span class="terminal-title">oxid — the whole lifecycle from one command</span>
           </div>
           <pre class="terminal-body"><code><span class="tk-orange">[&gt;]</span> oxid up feature-login
 <span class="tk-green">[+]</span> Parsed oxid.toml successfully
 <span class="tk-green">[+]</span> Shared Postgres instance detected. Created db_feature_login
 <span class="tk-orange">[&gt;]</span> Building image (cache hit: 85%) ...
-<span class="tk-green">[+]</span> Environment live at: https://feature-login.local.dev</code></pre>
+<span class="tk-green">[+]</span> Environment live at: https://feature-login.local.dev
+
+<span class="tk-orange">[&gt;]</span> oxid logs -f feature-login
+listening on 0.0.0.0:3000 ...
+<span class="tk-orange">[&gt;]</span> oxid env set STRIPE_API_KEY=sk_... --scope branch
+<span class="tk-green">[+]</span> STRIPE_API_KEY set (scope: branch)
+
+<span class="tk-orange">[&gt;]</span> oxid pause feature-login
+<span class="tk-gray">[~]</span> Environment `feature-login` paused — RAM returned
+
+<span class="tk-orange">[&gt;]</span> oxid wake feature-login
+<span class="tk-green">[+]</span> Environment `feature-login` woken</code></pre>
         </div>
+
+        <div class="grid-4 cli-grid">
+          <article class="card">
+            <h3><span class="tag tag-good">deploy</span></h3>
+            <p>The push button, plus an undo.</p>
+            <ul>
+              <li><code>oxid up &lt;branch&gt;</code></li>
+              <li><code>oxid rollback [--to &lt;sha&gt;]</code></li>
+              <li><code>oxid pause</code> / <code>wake</code></li>
+              <li><code>oxid down</code> · <code>rm-project</code></li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3><span class="tag tag-good">observe</span></h3>
+            <p>What's live, what it's doing, what happened.</p>
+            <ul>
+              <li><code>oxid status --sort --filter</code></li>
+              <li><code>oxid logs -f</code> — live stream</li>
+              <li><code>oxid audit --since --kind</code></li>
+              <li><code>oxid ps</code> · <code>queue</code></li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3><span class="tag tag-good">secrets &amp; policy</span></h3>
+            <p>Scoped variables, lifetimes, many daemons.</p>
+            <ul>
+              <li><code>oxid env set K=V --scope branch</code></li>
+              <li><code>oxid configure --pause-after 30m</code></li>
+              <li><code>oxid context add staging --api ...</code></li>
+              <li><code>oxid env list</code> / <code>delete</code></li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3><span class="tag tag-good">operate</span></h3>
+            <p>Day-2 care, built in from day one.</p>
+            <ul>
+              <li><code>oxid doctor</code></li>
+              <li><code>oxid backup</code> / <code>restore</code></li>
+              <li><code>oxid rotate-key</code> · <code>token</code></li>
+              <li><code>oxid infra setup</code></li>
+            </ul>
+          </article>
+        </div>
+        <p class="cli-note">
+          Every command speaks <code>--json</code> with distinct exit codes for CI pipelines, and
+          your shell gets tab completion via <code>oxid completions zsh</code>.
+        </p>
       </div>
     </section>
 
@@ -195,9 +254,11 @@
         <p class="status-copy">
           Oxid is in active, early development. The Rust control plane already handles webhook
           ingestion, secret injection, container orchestration, scale-to-zero garbage collection,
-          and zero-downtime redeploys end to end — and ships with an embedded web dashboard.
-          The TUI and desktop app described below are
-          part of the plan, not yet shipped — the
+          and zero-downtime redeploys end to end — with an embedded web dashboard and a CLI that
+          covers the full lifecycle: deploy and roll back, live-stream logs, scope secrets per
+          branch, manage multiple daemons as contexts, back up and restore state, rotate the
+          encryption key with zero downtime. The TUI and desktop app described below are
+          still part of the plan — the
           <a href="https://github.com/sazardev/oxid/blob/main/ROADMAP.md" target="_blank" rel="noopener">ROADMAP</a>
           tracks exactly what's real today versus what's still ahead, line by line.
         </p>
@@ -205,7 +266,7 @@
           <div class="interface-card">
             <span class="tag tag-good">Available</span>
             <h3>CLI</h3>
-            <p>Deploy, manage secrets, list projects.</p>
+            <p>Full lifecycle from one binary: deploy, rollback, <code>logs -f</code>, scoped secrets, backup/restore, contexts, <code>--json</code> everywhere.</p>
           </div>
           <div class="interface-card is-planned">
             <span class="tag tag-muted">Planned</span>
@@ -251,6 +312,7 @@
       </a>
       <p class="footer-tagline">Ephemeral environments that breathe.</p>
       <nav class="footer-links">
+        <a href="docs/">Docs</a>
         <a href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub</a>
         <a href="https://github.com/sazardev/oxid/blob/main/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         <a href="https://github.com/sazardev/oxid/blob/main/LICENSE" target="_blank" rel="noopener">License (0BSD)</a>

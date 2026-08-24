@@ -1,0 +1,299 @@
+/* Oxid docs — layout on top of the landing's design system (../styles.css) */
+
+body {
+  background: var(--carbon);
+}
+
+.brand-suffix {
+  color: var(--ash);
+  font-weight: 400;
+}
+
+/* ---------- Layout ---------- */
+
+.docs-layout {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 3rem;
+  align-items: start;
+}
+
+.docs-sidebar {
+  position: sticky;
+  top: 64px;
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  padding: 2.25rem 0 3rem;
+}
+
+.docs-sidebar nav {
+  display: flex;
+  flex-direction: column;
+}
+
+.side-group {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ash);
+  margin: 1.5rem 0 0.4rem;
+}
+
+.side-group:first-child {
+  margin-top: 0;
+}
+
+.docs-sidebar a {
+  display: block;
+  font-size: 0.9rem;
+  color: #c7c7ca;
+  text-decoration: none;
+  padding: 0.28rem 0 0.28rem 0.85rem;
+  border-left: 2px solid var(--border);
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.docs-sidebar a:hover {
+  color: var(--orange);
+}
+
+.docs-sidebar a.active {
+  color: var(--orange);
+  border-left-color: var(--orange);
+}
+
+/* The sidebar entry naming the page you're already on. */
+.docs-sidebar a.current {
+  color: var(--steel);
+  font-weight: 600;
+  border-left-color: var(--steel);
+}
+
+/* Subsection links under the current page's entry. */
+.docs-sidebar a.sub {
+  font-size: 0.82rem;
+  padding-left: 1.7rem;
+  color: var(--ash);
+}
+
+.docs-content {
+  padding: 2.25rem 0 4rem;
+  min-width: 0;
+}
+
+/* ---------- Sections & entries ---------- */
+
+.doc-section {
+  padding: 2.5rem 0;
+  border-bottom: 1px solid var(--border);
+  scroll-margin-top: 84px;
+}
+
+.doc-section:first-child {
+  padding-top: 0.5rem;
+}
+
+.doc-section h2 {
+  font-size: 1.6rem;
+  margin: 0 0 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+.doc-entry {
+  margin: 0 0 2.25rem;
+  scroll-margin-top: 84px;
+}
+
+.doc-entry:last-child {
+  margin-bottom: 0;
+}
+
+.doc-entry h3 {
+  font-size: 1.05rem;
+  margin: 0 0 0.5rem;
+}
+
+.doc-entry h3 code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--orange);
+  font-size: 1rem;
+}
+
+.doc-entry p {
+  margin: 0 0 0.9rem;
+  color: #c7c7ca;
+  max-width: 70ch;
+}
+
+.note {
+  font-size: 0.9rem;
+  color: var(--ash);
+  border-left: 2px solid var(--border);
+  padding-left: 0.9rem;
+}
+
+.docs-footer-note {
+  padding: 2.5rem 0 0;
+  color: var(--ash);
+  font-size: 0.9rem;
+}
+
+.docs-footer-note a {
+  color: var(--orange);
+}
+
+/* ---------- Module cards (docs home) ---------- */
+
+.module-cards {
+  margin-top: 1.5rem;
+}
+
+.module-card {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color 0.15s ease, transform 0.1s ease;
+}
+
+.module-card:hover {
+  border-color: var(--orange);
+}
+
+.module-card:active {
+  transform: translateY(1px);
+}
+
+.module-card h3 {
+  margin: 0 0 0.5rem;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.module-card .arrow {
+  font-family: var(--font-mono);
+  color: var(--orange);
+}
+
+.module-card p {
+  margin: 0;
+}
+
+/* ---------- Tables ---------- */
+
+.docs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin: 0 0 1.25rem;
+}
+
+.docs-table th,
+.docs-table td {
+  border: 1px solid var(--border);
+  padding: 0.55rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.docs-table th {
+  background: var(--iron);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ash);
+  font-weight: 500;
+}
+
+.docs-table td {
+  color: #c7c7ca;
+}
+
+.docs-table td:first-child {
+  white-space: nowrap;
+}
+
+/* ---------- Command blocks ---------- */
+
+.cmd-block {
+  margin: 0 0 1.25rem;
+  padding: 0.9rem 1.1rem;
+  background: #0d0d0d;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  color: var(--steel);
+}
+
+.cmd-block .tk-gray {
+  color: var(--ash);
+}
+
+.cmd-block .tk-green {
+  color: var(--green);
+}
+
+.cmd-block .tk-orange {
+  color: var(--orange);
+}
+
+.doc-entry .docs-table + .cmd-block,
+.doc-entry .cmd-block + .docs-table {
+  margin-top: -0.35rem;
+}
+
+/* ---------- Responsive ---------- */
+
+@media (max-width: 860px) {
+  .docs-layout {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .docs-sidebar {
+    position: static;
+    max-height: none;
+    padding: 1.5rem 0 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .docs-sidebar nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 0.35rem;
+  }
+
+  .side-group {
+    width: 100%;
+    margin: 0.75rem 0 0.25rem;
+  }
+
+  .docs-sidebar a {
+    display: inline-block;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0.25rem 0.6rem;
+    font-size: 0.82rem;
+  }
+
+  .docs-sidebar a.active {
+    border-color: var(--orange);
+  }
+
+  .docs-content {
+    padding-top: 1.5rem;
+  }
+
+  .docs-table {
+    display: block;
+    overflow-x: auto;
+  }
+}

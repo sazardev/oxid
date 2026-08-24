@@ -42,7 +42,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         env: &mut Environment,
         previous: Option<&Environment>,
         operator: Option<&str>,
-    ) -> Result<(), CpError> {
+    ) -> Result<Vec<String>, CpError> {
         // Global -> Project -> Branch secrets plus orchestrator runtime
         // variables (SPEC.md §2.1/§4.4).
         let mut sources = VarSources::default();
@@ -55,11 +55,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // dependency's connection string is injected as a Runtime
         // variable, same as the other orchestrator-owned values below —
         // Runtime always wins the inheritance precedence, so a project
-        // can't accidentally shadow it with a same-named secret.
+        // can't accidentally shadow it with a same-named secret. What each
+        // lease did ("created database X" / "reusing index 3") is collected
+        // for the deploy report.
+        let mut dependency_lines = Vec::with_capacity(project.config.dependencies.len());
         for dependency in &project.config.dependencies {
-            let url = self
+            let (url, line) = self
                 .provision_dependency(project, branch, dependency)
                 .await?;
+            dependency_lines.push(line);
             set_secret(
                 &mut sources,
                 &dependency.inject_url_as,
@@ -192,18 +196,32 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .with_request_id(current_request_id()),
             )
             .await?;
-        Ok(())
+        Ok(dependency_lines)
     }
 
     /// Resolves the connection string a branch should inject for
     /// `dependency` (SPEC.md §3.1), leasing a resource on first deploy and
-    /// reusing the same one on every redeploy of the same branch.
+    /// reusing the same one on every redeploy of the same branch. Returns
+    /// that URL plus a human-readable line describing what happened —
+    /// "created" vs "reusing" and which concrete resource — for the
+    /// deploy report.
     pub(crate) async fn provision_dependency(
         &self,
         project: &Project,
         branch: &BranchName,
         dependency: &Dependency,
-    ) -> Result<String, CpError> {
+    ) -> Result<(String, String), CpError> {
+        let describe = |resource_name: &str, reused: bool| {
+            let noun = match dependency.kind {
+                PoolKind::Postgres => "database",
+                PoolKind::Redis => "index",
+            };
+            let verb = if reused { "reusing" } else { "created" };
+            format!(
+                "{verb} {} {noun} `{resource_name}` (shared `{}`)",
+                dependency.kind, dependency.shared_instance
+            )
+        };
         if let Some(existing) = self
             .store
             .find_resource_lease(
@@ -214,7 +232,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             )
             .await?
         {
-            return self.resource_url(dependency, &existing);
+            return Ok((
+                self.resource_url(dependency, &existing)?,
+                describe(&existing, true),
+            ));
         }
 
         let resource_name = match dependency.kind {
@@ -269,7 +290,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 &resource_name,
             )
             .await?;
-        self.resource_url(dependency, &resource_name)
+        Ok((
+            self.resource_url(dependency, &resource_name)?,
+            describe(&resource_name, false),
+        ))
     }
 
     /// Builds the connection string injected into the container for an
