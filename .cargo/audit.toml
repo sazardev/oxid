@@ -17,4 +17,14 @@ ignore = [
     # bump in case a future sqlx release stops listing unused optional deps
     # in the lockfile, at which point this ignore becomes unnecessary.
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0134 (rustls-pemfile unmaintained/archived): pulled in
+    # transitively via bollard -> rustls-native-certs 0.7; we never touch
+    # the crate directly (Oxid parses no PEM files through this path) and
+    # there is no safe upgrade until bollard bumps rustls-native-certs to
+    # >=0.8, which dropped pemfile in favor of rustls-pki-types'
+    # `PemObject`. Unmaintained-but-not-vulnerable: the latest release is a
+    # thin wrapper over the code now living in pki-types. Re-check on every
+    # bollard bump; remove once the transitive dep is gone from Cargo.lock
+    # (`cargo tree -i rustls-pemfile`).
+    "RUSTSEC-2025-0134",
 ]

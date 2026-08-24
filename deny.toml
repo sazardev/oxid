@@ -11,7 +11,17 @@ all-features = true
 # unmaintained-but-secure dependency shouldn't block a release by itself.
 version = 2
 yanked = "deny"
-ignore = []
+# Same policy as .cargo/audit.toml: every ignore carries a justification
+# and a removal condition. See the audit.toml entries for the full notes.
+ignore = [
+    # RUSTSEC-2023-0071: optional sqlx-mysql dep, never activated in this
+    # workspace (sqlite-only features); see .cargo/audit.toml.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained, transitive via
+    # bollard -> rustls-native-certs 0.7; no safe upgrade until bollard
+    # bumps rustls-native-certs >=0.8. Not reachable from Oxid code.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
 version = 2
