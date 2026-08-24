@@ -105,6 +105,24 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # taiki-e/upload-rust-binary-action attaches archives to the release
+      # for this tag but does not *create* it — on a fresh tag every
+      # parallel matrix job polls "release not found" until its timeout and
+      # dies at upload, even though the binaries built fine (found live on
+      # v0.1.0: all six platform builds failed exactly there). Create it
+      # once up front, idempotently: the trailing view resolves the race
+      # where two jobs pass the initial check together.
+      - name: Ensure the GitHub Release exists
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --title "oxid $TAG" --generate-notes ||
+            gh release view "$TAG" >/dev/null
+
       - name: Build and upload (oxid CLI + oxidd daemon)
         uses: taiki-e/upload-rust-binary-action@v1
         with:
