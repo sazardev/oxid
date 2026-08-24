@@ -16,8 +16,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::AuthedAs;
-use crate::api::middleware::operator_name;
+use crate::api::middleware::{AuthedAs, authorize_project, operator_name};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -48,7 +47,15 @@ pub async fn pause<
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
+    // Environment-addressed routes are authorized by the environment's
+    // *project* (404 for out-of-scope ids, before any state changes).
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
     state.cp.pause(EnvironmentId(env_id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -59,7 +66,13 @@ pub async fn wake<
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
     state.cp.wake(EnvironmentId(env_id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -70,7 +83,13 @@ pub async fn logs<
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<Value>> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
     let logs = state.cp.logs(EnvironmentId(env_id)).await?;
     Ok(Json(json!({ "logs": logs })))
 }
@@ -83,7 +102,13 @@ pub async fn stream_logs<
 >(
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
     let log_stream = state.cp.stream_logs(EnvironmentId(env_id)).await?;
     let events = log_stream.map(|item| {
         Ok(match item {
@@ -113,6 +138,11 @@ pub async fn destroy<
     Query(query): Query<DestroyQuery>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
     state
         .cp
         .destroy_with_operator(

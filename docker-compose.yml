@@ -60,8 +60,9 @@ services:
       # `openssl rand -hex 32` and configure the same value as your GitHub
       # webhook's secret.
       OXID_WEBHOOK_SECRET: ${OXID_WEBHOOK_SECRET:?set OXID_WEBHOOK_SECRET}
-      # Bearer token the CLI/dashboard must send once this daemon is
-      # reachable beyond localhost. Generate with `openssl rand -hex 32`.
+      # Mandatory now: the daemon refuses to start without a token when
+      # binding a non-loopback address (override with OXID_ALLOW_OPEN_API=1).
+      # Generate with `openssl rand -hex 32`.
       OXID_API_TOKEN: ${OXID_API_TOKEN:?set OXID_API_TOKEN}
       # Joining Traefik's network switches deployed containers from
       # publishing a host port to being routed by Traefik labels instead

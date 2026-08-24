@@ -160,6 +160,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(None)
     }
 
+    /// Resolves the registered project a local checkout belongs to, by its
+    /// remote URL — the read half of [`Self::register_project`], exposed so
+    /// the HTTP layer can let a project-scoped token re-resolve *its own*
+    /// project (what `oxid up` does first on every run) without granting
+    /// the ability to create new ones.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] when the git remote cannot be determined.
+    pub async fn project_for_repo(&self, repo_dir: &Path) -> Result<Option<Project>, CpError> {
+        let repo_url = self.git.remote_url(repo_dir).await?;
+        Ok(self.find_project_by_repo(&repo_url).await?)
+    }
+
     pub(crate) async fn ensure_project(&self, project_id: ProjectId) -> Result<Project, CpError> {
         ProjectStore::get(&self.store, project_id)
             .await?

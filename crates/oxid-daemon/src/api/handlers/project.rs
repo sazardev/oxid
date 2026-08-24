@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::{AuthedAs, authorize_project, operator_scopes, require_unscoped};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -45,8 +46,33 @@ pub async fn register_project<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RegisterBody>,
 ) -> ApiResult<(StatusCode, Json<Project>)> {
+    // `oxid up` registers first on every run (idempotent by repo URL), so a
+    // scoped token must still be able to *resolve* its own project here —
+    // it just may never CREATE one. In scope: return the project. Out of
+    // scope: 404, indistinguishable from "doesn't exist". Brand-new repo:
+    // 403 with the reason.
+    if let Some(scopes) = operator_scopes(authed.as_ref()) {
+        let existing = state
+            .cp
+            .project_for_repo(std::path::Path::new(&body.repo_dir))
+            .await?;
+        match existing {
+            Some(project) if scopes.contains(&project.id.0) => {
+                return Ok((StatusCode::CREATED, Json(project)));
+            }
+            Some(_) => return Err(ApiError::not_found("project")),
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "registering new projects requires an unscoped credential \
+                     (the master OXID_API_TOKEN or an unscoped named token)",
+                ));
+            }
+        }
+    }
     let project = state
         .cp
         .register_project(std::path::Path::new(&body.repo_dir))
@@ -59,8 +85,20 @@ pub async fn list_projects<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<Vec<Project>>> {
-    Ok(Json(state.cp.list_projects().await?))
+    let projects = state.cp.list_projects().await?;
+    // A scoped operator sees only its own projects — listing others would
+    // leak their existence (names, repo URLs) even if every per-project
+    // endpoint 404s.
+    let projects = match operator_scopes(authed.as_ref()) {
+        None => projects,
+        Some(scopes) => projects
+            .into_iter()
+            .filter(|p| scopes.contains(&p.id.0))
+            .collect(),
+    };
+    Ok(Json(projects))
 }
 
 pub async fn delete_project<
@@ -69,7 +107,9 @@ pub async fn delete_project<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
+    authorize_project(&authed, ProjectId(id))?;
     state.cp.delete_project(ProjectId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -100,8 +140,10 @@ pub async fn update_project<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<UpdateProjectBody>,
 ) -> ApiResult<Json<Project>> {
+    authorize_project(&authed, ProjectId(id))?;
     let pause_after = body
         .pause_after
         .map(|raw| Ttl::parse(&raw))

@@ -280,6 +280,11 @@ enum TokenAction {
     Create {
         /// Name identifying who/what this token is for.
         name: String,
+        /// Scope the token to a project id (repeatable). Omit for full
+        /// access; a scoped token can only act on its projects and gets
+        /// 404s everywhere else.
+        #[arg(long = "project")]
+        project: Vec<u64>,
     },
     /// List every token (revoked ones included), without the raw value.
     List,
@@ -662,7 +667,9 @@ async fn main() {
         Command::Backup { file } => cmd_backup(&client, &base, &file).await,
         Command::Restore { file } => cmd_restore(&client, &base, &file).await,
         Command::Token { action } => match action {
-            TokenAction::Create { name } => cmd_token_create(&client, &base, &name).await,
+            TokenAction::Create { name, project } => {
+                cmd_token_create(&client, &base, &name, &project).await
+            }
             TokenAction::List => cmd_token_list(&client, &base).await,
             TokenAction::Revoke { id } => cmd_token_revoke(&client, &base, id).await,
         },
@@ -1548,11 +1555,20 @@ async fn cmd_restore(client: &Client, base: &str, file: &str) -> Result<(), CliE
     Ok(())
 }
 
-async fn cmd_token_create(client: &Client, base: &str, name: &str) -> Result<(), CliError> {
+async fn cmd_token_create(
+    client: &Client,
+    base: &str,
+    name: &str,
+    projects: &[u64],
+) -> Result<(), CliError> {
     let url = format!("{base}/api/v1/tokens");
+    let mut payload = json!({ "name": name });
+    if !projects.is_empty() {
+        payload["projects"] = json!(projects);
+    }
     let response = client
         .post(&url)
-        .json(&json!({ "name": name }))
+        .json(&payload)
         .send()
         .await
         .map_err(|e| connect_error(&url, &e))?;
@@ -1570,6 +1586,14 @@ async fn cmd_token_create(client: &Client, base: &str, name: &str) -> Result<(),
         let token = value["token"].as_str().unwrap_or("?");
         let id = value["id"].as_u64().unwrap_or(0);
         ok(format!("Token `{name}` created (id {id}): {token}"));
+        if projects.is_empty() {
+            bg("Unscoped: this token has full access. Re-create it with --project to limit it.");
+        } else {
+            bg(format!(
+                "Scoped to project ids {projects:?} — every other project answers 404 to this \
+                 token."
+            ));
+        }
         bg("This is the only time the raw token is shown — store it now.");
     }
     Ok(())
@@ -1587,18 +1611,31 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
         bg("No tokens issued yet.");
         return Ok(());
     }
-    println!("{:<5} {:<24} {:<10} CREATED", "ID", "NAME", "STATUS");
+    println!(
+        "{:<5} {:<24} {:<10} {:<12} CREATED",
+        "ID", "NAME", "STATUS", "SCOPES"
+    );
     for token in tokens {
         let status = if token["revoked"].as_bool().unwrap_or(false) {
             "revoked"
         } else {
             "active"
         };
+        // `null` = unscoped (full access); an array renders as its ids.
+        let scopes = match token["scoped_projects"].as_array() {
+            Some(ids) => ids
+                .iter()
+                .map(|v| v.as_u64().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "-".to_owned(),
+        };
         println!(
-            "{:<5} {:<24} {:<10} {}",
+            "{:<5} {:<24} {:<10} {:<12} {}",
             token["id"].as_u64().unwrap_or_default(),
             token["name"].as_str().unwrap_or("?"),
             status,
+            scopes,
             format_occurred_at(&token["created_at"]),
         );
     }
@@ -1714,8 +1751,9 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
         match infra.as_ref() {
             Some(Ok(value)) => print_infra_report(value),
             Some(Err(err)) if err.code == EXIT_NOT_FOUND => bg(
-                "OXID_DOCKER_NETWORK is not configured on this daemon — real scale-to-zero is \
-                 not active, using direct host-port publishing instead",
+                "Direct-publish mode: OXID_DOCKER_NETWORK is not configured — scale-to-zero is \
+                 DISABLED (no idle auto-pause; environments run until manually paused/destroyed). \
+                 Run `oxid infra setup` on the host to enable the supported Traefik topology",
             ),
             Some(Err(err)) => bg(format!(
                 "Could not fetch infra status ({}) — the daemon may predate \
@@ -2270,8 +2308,32 @@ mod tests {
         let cli = Cli::try_parse_from(["oxid", "token", "create", "alice"]).unwrap();
         match cli.command {
             Command::Token {
-                action: TokenAction::Create { name },
-            } => assert_eq!(name, "alice"),
+                action: TokenAction::Create { name, project },
+            } => {
+                assert_eq!(name, "alice");
+                assert!(project.is_empty(), "no --project flags means unscoped");
+            }
+            other => panic!("expected Token::Create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "oxid",
+            "token",
+            "create",
+            "ci-bot",
+            "--project",
+            "1",
+            "--project",
+            "3",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Token {
+                action: TokenAction::Create { name, project },
+            } => {
+                assert_eq!(name, "ci-bot");
+                assert_eq!(project, vec![1, 3]);
+            }
             other => panic!("expected Token::Create, got {other:?}"),
         }
 

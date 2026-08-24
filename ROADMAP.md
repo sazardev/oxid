@@ -49,8 +49,8 @@
 
 | # | Tarea | Cita del documento | Código actual | Estado |
 |---|---|---|---|---|
-| 3.1 | Almacenamiento encriptado de secretos (AES-GCM) | **SPEC §4.4:** _"Se compilan los secretos cacheados en disco (encriptados mediante AES-GCM usando una clave maestra local) y se inyectan dinámicamente."_ | `secret_context.rs` — dominio puro, sin persistencia ni encriptación | No existe |
-| 3.2 | Clave maestra local para desencriptar | **SPEC §4.4:** _"una clave maestra local"_ — parte de la infraestructura de encriptación AES-GCM. | No existe | No existe |
+| 3.1 | Almacenamiento encriptado de secretos (AES-GCM) | **SPEC §4.4:** _"Se compilan los secretos cacheados en disco (encriptados mediante AES-GCM usando una clave maestra local) y se inyectan dinámicamente."_ | `adapter/crypto.rs` (`Cipher` AES-GCM) + `SecretStore` en `SqliteStore` — todo valor cifrado en reposo; rotación en caliente vía `rotate_master_key` | ✅ Done (a0c064d) |
+| 3.2 | Clave maestra local para desencriptar | **SPEC §4.4:** _"una clave maestra local"_ — parte de la infraestructura de encriptación AES-GCM. | `{data}/secret.key` (`0600`, autogenerado) o `OXID_MASTER_KEY` (64-hex); `oxid rotate-key` re-cifra sin downtime | ✅ Done (a0c064d) |
 | 3.3 | Inyección real de variables al contenedor en `deploy()` | **SPEC §4.4:** _"se inyectan dinámicamente"_ al contenedor. **IDEA §6:** _"inyecta variables secretas y despliega."_ | `service/control_plane/provision.rs` — resuelve `VarSources` (Global→Project→Branch→Runtime) e inyecta el mapa resultante en `ContainerSpec.env` | ✅ Done (a0c064d) |
 | 3.4 | Resolución de `SecretContext` con herencia `Global→Project→Branch→Runtime` | **SPEC §2.1:** _"Las variables de entorno se calculan por una matriz de herencia: Global → Project → Branch → Runtime."_ | `var_resolution.rs` conectado a `ControlPlane::deploy`; runtime gana sobre todo | ✅ Done (a0c064d) |
 | 3.5 | Persistencia de secretos en SQLite (tabla `secrets`) | **SPEC §4.4:** _"secretos cacheados en disco"_ — implica persistencia. **IDEA §3:** _"guarda cada variable inyectada."_ | Tabla `secrets` en `0001_init.sql` + `SecretStore` en `SqliteStore` (valores cifrados AES-GCM) | ✅ Done (a0c064d) |
@@ -323,4 +323,4 @@
 | **P4 — Interfaces** | TUI, Dashboard, Desktop | 9.x, 10.x ✅, 11.x | Features de producto completo, no MVP |
 | **P5 — Ops/Deploy** | Dockerfile, release binaries | 12.1, 12.2, 12.4 ✅ · 12.3 superseded | Necesario para self-hosting real |
 
-**Total: 57 tareas granulares** (41 ✅ Done + 3 Hecho · 0 Parcial · 12 No existe · 0 No medido · 1 Superseded). Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.
+**Total: 57 tareas granulares** (43 ✅ Done + 3 Hecho · 0 Parcial · 10 No existe · 0 No medido · 1 Superseded). Las tareas P0 son las que convierten a Oxid de "demo" a "usable". Las P1 lo hacen agradable. Las P2-P3 lo hacen competitivo. Las P4-P5 son features de producto completo.

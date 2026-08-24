@@ -40,4 +40,8 @@ pub enum CpError {
     /// one fit, so it's rejected immediately instead of queued forever.
     #[error("insufficient host capacity: {0}")]
     InsufficientCapacity(String),
+    /// A request was structurally valid JSON but semantically wrong
+    /// (e.g. an empty project-scope list on a new API token).
+    #[error("{0}")]
+    Validation(String),
 }

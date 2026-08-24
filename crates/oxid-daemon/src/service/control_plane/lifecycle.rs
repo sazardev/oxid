@@ -335,4 +335,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("environment `{environment_id}`")))
     }
+
+    /// The project an environment belongs to — lets the HTTP layer enforce
+    /// project-scoped tokens on `/environments/{id}/...` routes, which are
+    /// addressed by environment id but authorized by project.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the environment does not exist.
+    pub async fn environment_project_id(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<ProjectId, CpError> {
+        Ok(self.ensure_environment(environment_id).await?.project_id)
+    }
 }

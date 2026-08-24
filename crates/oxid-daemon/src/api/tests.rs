@@ -8,6 +8,7 @@ use tower::ServiceExt;
 
 use crate::adapter::crypto::Cipher;
 use crate::adapter::store::SqliteStore;
+use oxid_core::ProjectStore;
 
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -261,17 +262,25 @@ async fn test_app_with_admission_control(
 }
 
 fn repo_dir_with_config() -> tempfile::TempDir {
+    repo_dir_named("app")
+}
+
+/// Like [`repo_dir_with_config`], but lets tests register several distinct
+/// projects (registration derives the identity from `[project].name`).
+fn repo_dir_named(name: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("oxid.toml"),
-        r#"
+        format!(
+            r#"
 [project]
-name = "app"
+name = "{name}"
 
 [routing]
-base_domain = "app.local.dev"
+base_domain = "{name}.local.dev"
 port = 8080
-"#,
+"#
+        ),
     )
     .unwrap();
     dir
@@ -673,6 +682,347 @@ async fn revoked_tokens_stop_authenticating() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Mints a token as the master credential and returns its raw value.
+async fn mint_token(app: &Router, body: Value) -> String {
+    let (status, response) =
+        json_request_with_auth(app, "POST", "/api/v1/tokens", body, Some("master-secret")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    serde_json::from_slice::<Value>(&response).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// An app whose storage holds *two* distinct projects (ids 1 = `app-a`,
+/// 2 = `app-b`) behind a master-token credential — the minimal fixture for
+/// project-scoping tests. Project 1 deliberately carries `FakeGit`'s fixed
+/// remote URL, so a `POST /projects` registration resolves to it from any
+// checkout, exactly as the real dedupe path would.
+async fn two_project_app() -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    for (name, url) in [
+        ("app-a", "https://github.com/org/app.git"), // == FakeGit's fixed remote
+        ("app-b", "https://github.com/org/app-b.git"),
+    ] {
+        let repo = repo_dir_named(name);
+        let parsed = crate::adapter::config::parse_project(repo.path()).unwrap();
+        let url = RepoUrl::parse(url).unwrap();
+        let project = Project::new(ProjectId(0), parsed.name, url, parsed.config).unwrap();
+        ProjectStore::create(&store, &project).await.unwrap();
+    }
+    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some("master-secret".to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        rate_limit: None,
+    })
+}
+
+#[tokio::test]
+async fn an_empty_project_scope_list_is_rejected() {
+    let app = test_app_with_token("master-secret").await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "useless", "projects": [] }),
+        Some("master-secret"),
+    )
+    .await;
+    // A can-do-nothing token is a client bug — refuse it loudly instead of
+    // minting credentials that silently do nothing.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn scoped_tokens_only_see_and_act_on_their_own_projects() {
+    let app = two_project_app().await;
+    // ids 1 (`app-a`) and 2 (`app-b`) — see `two_project_app`.
+
+    let bob = mint_token(&app, json!({ "name": "bob", "projects": [1] })).await;
+
+    // Listing hides out-of-scope projects entirely.
+    let (status, body) =
+        json_request_with_auth(&app, "GET", "/api/v1/projects", json!({}), Some(&bob)).await;
+    assert_eq!(status, StatusCode::OK);
+    let visible: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        visible.iter().map(|p| p["id"].as_u64()).collect::<Vec<_>>(),
+        vec![Some(1)],
+        "a scoped operator must see only its own projects"
+    );
+
+    // Out-of-scope project endpoints answer 404 (not 403 — no existence leak).
+    // Each entry carries a body that passes *that* handler's own JSON
+    // validation, so the rejection provably comes from scoping, not from a
+    // malformed request.
+    let cases: [(&str, &str, Value); 6] = [
+        (
+            "PATCH",
+            "/api/v1/projects/2",
+            json!({ "pause_after": "45m" }),
+        ),
+        ("DELETE", "/api/v1/projects/2", json!({})),
+        ("GET", "/api/v1/projects/2/environments", json!({})),
+        (
+            "POST",
+            "/api/v1/projects/2/secrets",
+            json!({ "name": "K", "scope": "project", "value": "v" }),
+        ),
+        (
+            "POST",
+            "/api/v1/projects/2/deploy",
+            json!({ "branch": "main" }),
+        ),
+        (
+            "POST",
+            "/api/v1/projects/2/rollback",
+            json!({ "branch": "main" }),
+        ),
+    ];
+    for (method, uri, payload) in cases {
+        let (status, _) = json_request_with_auth(&app, method, uri, payload, Some(&bob)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+
+    // In-scope actions still work end-to-end.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/deploy",
+        json!({ "branch": "feature-x" }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/secrets",
+        json!({ "name": "DB_PASS", "scope": "project", "value": "hunter2" }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "PATCH",
+        "/api/v1/projects/1",
+        json!({ "pause_after": "45m" }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // `oxid up` registers before every deploy — a scoped token must resolve
+    // its own project through that path.
+    let repo = repo_dir_with_config();
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let resolved: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        resolved["id"].as_u64(),
+        Some(1),
+        "registration resolves the in-scope project instead of creating a new one"
+    );
+
+    // The same call from a token scoped to the *other* project is a 404 —
+    // registering must not leak that project 1 exists, and it certainly
+    // must not create anything.
+    let carol = mint_token(&app, json!({ "name": "carol", "projects": [2] })).await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some(&carol),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn token_scopes_are_normalized_on_creation() {
+    let app = test_app_with_token("master-secret").await;
+    mint_token(&app, json!({ "name": "ci", "projects": [7, 3, 7] })).await;
+
+    let (_, body) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/tokens",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    let tokens: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        tokens[0]["scoped_projects"],
+        json!([3, 7]),
+        "scopes are sorted and deduplicated at creation"
+    );
+}
+
+#[tokio::test]
+async fn scoped_tokens_are_locked_out_of_node_wide_endpoints() {
+    let app = test_app_with_token("master-secret").await;
+    let bob = mint_token(&app, json!({ "name": "bob", "projects": [1] })).await;
+
+    // Registering new projects is outside any scope by definition.
+    let repo = repo_dir_named("anywhere");
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Global secrets affect every project's deploys.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "SHARED", "scope": "global", "value": "x" }),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Node-wide reads/writes: stats, infra and backups.
+    for (method, uri) in [
+        ("GET", "/api/v1/stats"),
+        ("GET", "/api/v1/infra/status"),
+        ("POST", "/api/v1/infra/bootstrap"),
+        ("GET", "/api/v1/backup"),
+    ] {
+        let (status, _) = json_request_with_auth(&app, method, uri, json!({}), Some(&bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn scoped_audit_and_environment_reads_stay_within_the_scope() {
+    let app = two_project_app().await;
+
+    // Two environments with audit events, one per project (ids 1 and 2).
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/deploy",
+        json!({ "branch": "main" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/2/deploy",
+        json!({ "branch": "main" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let bob = mint_token(&app, json!({ "name": "bob", "projects": [1] })).await;
+
+    // Unfiltered global audit collapses to just the scoped project's events.
+    let (status, body) =
+        json_request_with_auth(&app, "GET", "/api/v1/audit", json!({}), Some(&bob)).await;
+    assert_eq!(status, StatusCode::OK);
+    let events: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(!events.is_empty(), "expected at least the deploy event");
+    assert!(
+        events
+            .iter()
+            .all(|e| e["environment_id"].as_u64() == Some(1)),
+        "scoped operator saw another project's audit events: {events:?}"
+    );
+
+    // An explicit out-of-scope project filter is a 404, like every other
+    // out-of-scope project access.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/audit?project_id=2",
+        json!({}),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Environment-addressed routes authorize through the environment's
+    // owning project.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/environments/2/audit",
+        json!({}),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = json_request_with_auth(
+        &app,
+        "DELETE",
+        "/api/v1/environments/2",
+        json!({}),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unscoped_tokens_keep_full_access() {
+    let repo = repo_dir_with_config();
+    let app = test_app_with_token("master-secret").await;
+    let alice = mint_token(&app, json!({ "name": "alice" })).await;
+
+    // No `projects` field = same reach as the master credential (this is
+    // what pre-scoping named tokens were, so existing deployments keep
+    // working unchanged after upgrade).
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) =
+        json_request_with_auth(&app, "GET", "/api/v1/stats", json!({}), Some(&alice)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/secrets",
+        json!({ "name": "SHARED", "scope": "global", "value": "x" }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

@@ -294,11 +294,15 @@ oxid context remove staging --force</pre>
         <article class="doc-entry">
           <h3><code>oxid token create|list|revoke</code></h3>
           <p>
-            Named API tokens for handing out scoped access without sharing the master
-            credential. <code>create</code> prints the raw token once — it is never retrievable
+            Named API tokens for handing out access without sharing the master
+            credential. Repeatable <code>--project &lt;id&gt;</code> scopes a token to those
+            projects only — every other project answers 404, and node-wide operations
+            (stats, infra, backups, token management) are rejected. Unscoped tokens keep
+            full access; audit events attribute actions to the token's name.
+            <code>create</code> prints the raw token once — it is never retrievable
             again. Requires the master token.
           </p>
-          <pre class="cmd-block">oxid token create ci-bot
+          <pre class="cmd-block">oxid token create ci-bot --project 1 --project 3
 oxid token list
 oxid token revoke 3</pre>
         </article>

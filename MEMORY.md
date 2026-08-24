@@ -6,6 +6,37 @@ just "where did we leave off and why."
 
 ## What's solid and live-verified
 
+- **Production-readiness round for the CLI-only v0.1.0 release (this
+  round), all covered by tests:** decided the public release posture is
+  CLI-first with Traefik mode as *the* supported production topology, then
+  closed the three gates that stood between "works on my machine" and
+  "shippable":
+  1. **Open-API startup gate** — a daemon binding a non-loopback address
+     (`OXID_ADDR` default `0.0.0.0:8080`!) now *refuses to start* without
+     `OXID_API_TOKEN`, printing three actionable fixes; `OXID_ALLOW_OPEN_API=1`
+     is the explicit opt-out and loopback binds stay open for local dev.
+     `bind_is_loopback` resolves hostnames via `ToSocketAddrs` and fails
+     closed (unresolvable/wildcard = public). Previously it only warned — an
+     unauthenticated deploy/destroy/read-secrets API was one forgotten env
+     var away.
+  2. **Topology honesty** — direct-publish mode now warns at startup that
+     scale-to-zero is disabled there (nothing refreshes `last_accessed_at`,
+     so the sweep no-ops by design), and `oxid doctor` says the same; Traefik
+     mode is documented as the supported path.
+  3. **RBAC-lite** (equipo pequeño) — named tokens are project-scopable:
+     migration `0010` (`api_tokens.scoped_projects`, NULL = unscoped),
+     `oxid token create <name> --project <id>...`, empty scope list rejected,
+     scopes normalized (sorted/deduped). Enforcement lives in
+     `api/middleware.rs` (`AuthedAs::Operator(OperatorIdentity)`,
+     `authorize_project` → **404 outside scope so existence never leaks**,
+     `require_unscoped` → 403 on node-wide routes): project list filtered,
+     per-project routes (deploy/rollback/environments/secrets/PATCH/DELETE)
+     scoped, environment-addressed routes authorized through the owning
+     project (`ControlPlane::environment_project_id`), global secrets /
+     stats / infra / backup+restore / register-project locked to unscoped
+     credentials (backup download previously reachable by *any* named token
+     — closed), audit collapses to the scoped projects' merged trail, queue
+     filtered per project. Token management stays master-only.
 - Core deploy flow: `oxid.toml` explicit, `docker-compose.yml` detection,
   and bare-`Dockerfile` zero-config all work end-to-end (real Docker, real
   git repos, real HTTP responses checked).
@@ -309,20 +340,21 @@ just "where did we leave off and why."
     `handlers/`, plus `middleware.rs`, `dashboard.rs`, `error.rs`,
     `types.rs`). Docs referencing the old god-file paths were updated in
     the same sweep.
-- Full test/clippy/fmt pass green (227 tests: 39 CLI + 44 core + 144
-  daemon, 6 `#[ignore]`d Docker-integration ones excluded).
+- Full test/clippy/fmt pass green (257 tests: 42 CLI + 44 core + 171
+  daemon, 8 `#[ignore]`d Docker-integration ones excluded).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 
 No TUI, no Tauri desktop app (the web dashboard now covers most of what
-SPEC.md asks of both). Single-host only, no HA.
-API is open by default if `OXID_API_TOKEN` is unset (warned, not enforced).
-Traefik bootstrap is automated (`oxid infra setup` creates the network and
-the Traefik container), but wiring the daemon's *own* container onto that
-network still needs the operator (Docker can't relabel a running container;
-`oxid infra status` prints the exact remaining steps). Named
-API tokens are flat (no roles/permissions beyond "master" vs "operator") —
-real RBAC (scoping a token to specific projects) doesn't exist yet.
+SPEC.md asks of both). Single-host only, no HA. Traefik bootstrap is
+automated (`oxid infra setup` creates the network and the Traefik
+container), but wiring the daemon's *own* container onto that network still
+needs the operator (Docker can't relabel a running container; `oxid infra
+status` prints the exact remaining steps). Named API tokens now support
+project scoping (RBAC-lite) but there are no roles/permission groups beyond
+"scoped/unscoped + master" — richer RBAC doesn't exist yet. Production
+posture is documented in `PRODUCTION.md` (CLI-first release, Traefik mode
+supported).
 
 ## Operational lesson learned (read before running heavy builds here)
 

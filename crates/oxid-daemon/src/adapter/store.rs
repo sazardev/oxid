@@ -379,7 +379,9 @@ impl SqliteStore {
 
     /// Creates a new named API token, storing only its `SHA-256` hash —
     /// the raw token is returned once here and never persisted or
-    /// retrievable again, same convention as a password.
+    /// retrievable again, same convention as a password. `scoped_projects`
+    /// (`Some` list, never empty) limits the token to those projects;
+    /// `None` leaves it unrestricted.
     ///
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
@@ -387,13 +389,20 @@ impl SqliteStore {
         &self,
         name: &str,
         token_hash: &str,
+        scoped_projects: Option<&[u64]>,
     ) -> Result<u64, RepositoryError> {
+        let scopes = scoped_projects
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| storage(format!("cannot serialize token scopes: {e}")))?;
         let row = sqlx::query(
-            "INSERT INTO api_tokens (name, token_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO api_tokens (name, token_hash, created_at, scoped_projects) \
+             VALUES (?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(token_hash)
         .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .bind(scopes)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -401,23 +410,37 @@ impl SqliteStore {
         u64::try_from(id).map_err(|_| storage("token id overflowed u64"))
     }
 
-    /// Looks up the operator name for a token hash, if it exists and hasn't
-    /// been revoked. Backs bearer-token authentication for named tokens.
+    /// Looks up the operator a token belongs to (name + project scopes), if
+    /// it exists and hasn't been revoked. Backs bearer-token authentication
+    /// for named tokens.
     ///
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
     pub async fn find_operator_by_token_hash(
         &self,
         token_hash: &str,
-    ) -> Result<Option<String>, RepositoryError> {
-        let row =
-            sqlx::query("SELECT name FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL")
-                .bind(token_hash)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
-        row.map(|r| r.try_get::<String, _>("name").map_err(storage))
-            .transpose()
+    ) -> Result<Option<OperatorIdentity>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT name, scoped_projects FROM api_tokens \
+             WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(|r| {
+            let name: String = r.try_get("name").map_err(storage)?;
+            let scopes: Option<String> = r.try_get("scoped_projects").map_err(storage)?;
+            let scoped_projects = scopes
+                .map(|s| serde_json::from_str::<Vec<u64>>(&s))
+                .transpose()
+                .map_err(|e| storage(format!("corrupt scope list on api token `{name}`: {e}")))?;
+            Ok(OperatorIdentity {
+                name,
+                scoped_projects,
+            })
+        })
+        .transpose()
     }
 
     /// Lists every token (including revoked ones), newest first — never
@@ -426,22 +449,30 @@ impl SqliteStore {
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
     pub async fn list_api_tokens(&self) -> Result<Vec<ApiTokenSummary>, RepositoryError> {
-        let rows =
-            sqlx::query("SELECT id, name, created_at, revoked_at FROM api_tokens ORDER BY id DESC")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(map_sqlx)?;
+        let rows = sqlx::query(
+            "SELECT id, name, created_at, revoked_at, scoped_projects \
+             FROM api_tokens ORDER BY id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.iter()
             .map(|r| {
                 let id: i64 = r.try_get("id").map_err(storage)?;
                 let name: String = r.try_get("name").map_err(storage)?;
                 let created_at = ts_from_row(r, "created_at")?;
                 let revoked_at: Option<i64> = r.try_get("revoked_at").map_err(storage)?;
+                let scopes: Option<String> = r.try_get("scoped_projects").map_err(storage)?;
+                let scoped_projects = scopes
+                    .map(|s| serde_json::from_str::<Vec<u64>>(&s))
+                    .transpose()
+                    .map_err(|e| storage(format!("corrupt scope list on token {id}: {e}")))?;
                 Ok(ApiTokenSummary {
                     id: u64::try_from(id).map_err(|_| storage("token id overflowed u64"))?,
                     name,
                     created_at,
                     revoked: revoked_at.is_some(),
+                    scoped_projects,
                 })
             })
             .collect()
@@ -576,6 +607,23 @@ pub struct ApiTokenSummary {
     pub created_at: OffsetDateTime,
     /// Whether the token has been revoked.
     pub revoked: bool,
+    /// Project ids this token is scoped to, or `None` when it has the same
+    /// reach as the master credential. An empty list means "no projects",
+    /// which creation rejects — it exists here only as a safe-direction
+    /// interpretation of a corrupt row.
+    pub scoped_projects: Option<Vec<u64>>,
+}
+
+/// What a named API token resolves to at authentication time: who it
+/// belongs to and which projects it may touch.
+#[derive(Debug, Clone)]
+pub struct OperatorIdentity {
+    /// Human-readable name audit events are attributed to.
+    pub name: String,
+    /// `None` = unrestricted (full access, like the master credential);
+    /// `Some(ids)` = limited to those projects — every other project is
+    /// answered with `404` so its existence isn't revealed.
+    pub scoped_projects: Option<Vec<u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,5 +1843,74 @@ mod tests {
             Some("db_2".to_owned()),
             "deleting project 1's lease must not touch project 2's"
         );
+    }
+
+    #[tokio::test]
+    async fn api_token_scopes_round_trip_and_revocation() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+
+        let unscoped_id = store
+            .create_api_token("root", "hash-unscoped", None)
+            .await
+            .unwrap();
+        let scoped_id = store
+            .create_api_token("alice", "hash-scoped", Some(&[3, 1, 3]))
+            .await
+            .unwrap();
+        let _ = (unscoped_id, scoped_id);
+
+        // Scopes survive the round trip verbatim at this layer (sorting/
+        // dedup is `ControlPlane::create_operator_token`'s job) and an
+        // unscoped token reads back as `None`.
+        let alice = store
+            .find_operator_by_token_hash("hash-scoped")
+            .await
+            .unwrap()
+            .expect("live token");
+        assert_eq!(alice.name, "alice");
+        assert_eq!(alice.scoped_projects, Some(vec![3, 1, 3]));
+
+        let root = store
+            .find_operator_by_token_hash("hash-unscoped")
+            .await
+            .unwrap()
+            .expect("live token");
+        assert_eq!(root.scoped_projects, None);
+
+        // The summary exposes scopes too (`oxid token list` renders them).
+        let summaries = store.list_api_tokens().await.unwrap();
+        let summary_for = |id: u64| summaries.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            summary_for(scoped_id).scoped_projects,
+            Some(vec![3, 1, 3]),
+            "scopes are visible in the non-secret view"
+        );
+        assert_eq!(summary_for(unscoped_id).scoped_projects, None);
+
+        // Revocation hides the identity again — scopes included.
+        store.revoke_api_token(scoped_id).await.unwrap();
+        assert!(
+            store
+                .find_operator_by_token_hash("hash-scoped")
+                .await
+                .unwrap()
+                .is_none(),
+            "a revoked token must not authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_tokens_without_scope_column_read_as_unscoped() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        store
+            .create_api_token("old-row", "hash-old", None)
+            .await
+            .unwrap();
+        let identity = store
+            .find_operator_by_token_hash("hash-old")
+            .await
+            .unwrap()
+            .expect("token exists");
+        assert_eq!(identity.scoped_projects, None);
     }
 }

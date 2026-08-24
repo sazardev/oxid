@@ -47,6 +47,11 @@ use tower_governor::GovernorLayer;
 pub struct CreateTokenBody {
     /// Human-readable name for the operator this token identifies.
     name: String,
+    /// Project ids the token is scoped to. Omitted/`null` = full access
+    /// (same reach as the master credential); an empty array is rejected —
+    /// a can-do-nothing token is almost certainly a client bug.
+    #[serde(default)]
+    projects: Option<Vec<u64>>,
 }
 
 /// Mints a named token, master-token-only. The raw token is only ever
@@ -63,10 +68,18 @@ pub async fn create_token<
     if body.name.trim().is_empty() {
         return Err(ApiError::from_validation("token name cannot be empty"));
     }
-    let (id, token) = state.cp.create_operator_token(body.name.trim()).await?;
+    let (id, token) = state
+        .cp
+        .create_operator_token(body.name.trim(), body.projects.clone())
+        .await?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({ "id": id, "name": body.name, "token": token })),
+        Json(json!({
+            "id": id,
+            "name": body.name,
+            "token": token,
+            "projects": body.projects,
+        })),
     ))
 }
 

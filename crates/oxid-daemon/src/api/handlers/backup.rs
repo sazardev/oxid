@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::{AuthedAs, require_unscoped};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -49,7 +50,11 @@ pub async fn backup<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Response> {
+    // A backup contains every project's encrypted secrets and the (hashed)
+    // token table — node-wide material, not any single operator's scope.
+    require_unscoped(&authed)?;
     let snapshot_path = state
         .data_dir
         .join(format!(".backup-snapshot-{}.sqlite", std::process::id()));
@@ -101,8 +106,10 @@ pub async fn restore<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_unscoped(&authed)?;
     if !state.allow_restore {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,

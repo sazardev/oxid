@@ -79,9 +79,15 @@ docker run -d --name oxid-daemon \
 
 See [`docker-compose.yml`](docker-compose.yml) for a fuller setup wired to
 Traefik (routing + scale-to-zero wake-on-request), matching `SPEC.md` §6.
-Prefer not to hand-wire Traefik? With `OXID_DOCKER_NETWORK` set on the
-daemon, `oxid infra status` reports what's missing and `oxid infra setup`
+Prefer not to hand-wire Traefik? With `OXID_DOCKER_NETWORK` set on the daemon,
+`oxid infra status` reports what's missing and `oxid infra setup`
 idempotently creates the Docker network and starts Traefik for you.
+
+**Going to production?** Read [`PRODUCTION.md`](PRODUCTION.md): the supported
+Traefik topology, the auth baseline (a non-loopback daemon *refuses to start*
+without `OXID_API_TOKEN`), team access via project-scoped tokens
+(`oxid token create bob --project 1 --project 3`), backup/restore, and the
+upgrade protocol.
 
 **Pre-built binaries:** every [tagged
 release](https://github.com/sazardev/oxid/releases) publishes `oxid` (CLI)

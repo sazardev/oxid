@@ -85,6 +85,7 @@ impl From<CpError> for ApiError {
             CpError::InsufficientCapacity(_) | CpError::DeployNotReady(_) => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
             }
+            CpError::Validation(_) => Self::from_validation(err.to_string()),
             CpError::Proxy(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         }
     }

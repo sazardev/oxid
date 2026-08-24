@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::{AuthedAs, authorize_project};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -47,8 +48,10 @@ pub async fn list_environments<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     Query(query): Query<ListEnvironmentsQuery>,
 ) -> ApiResult<Json<Vec<Environment>>> {
+    authorize_project(&authed, ProjectId(id))?;
     let envs = state.cp.list_environments(ProjectId(id)).await?;
     let envs = match query.branch {
         // The daemon keeps one row per historical deploy of a branch (audit

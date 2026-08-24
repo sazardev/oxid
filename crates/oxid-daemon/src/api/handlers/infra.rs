@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::{AuthedAs, require_unscoped};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -45,7 +46,9 @@ pub async fn stats<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::NodeStats>> {
+    require_unscoped(&authed)?;
     Ok(Json(state.cp.node_stats().await?))
 }
 
@@ -57,7 +60,9 @@ pub async fn infra_status<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::InfraStatus>> {
+    require_unscoped(&authed)?;
     Ok(Json(state.cp.infra_status().await?))
 }
 
@@ -69,6 +74,8 @@ pub async fn infra_bootstrap<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::InfraStatus>> {
+    require_unscoped(&authed)?;
     Ok(Json(state.cp.infra_bootstrap().await?))
 }

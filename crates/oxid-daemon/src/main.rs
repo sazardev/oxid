@@ -31,9 +31,17 @@
 //! - `OXID_API_TOKEN` — bearer token required on every `/api/v1/*` control
 //!   request (`Authorization: Bearer <token>`), except `/health`,
 //!   `/webhooks/*` and the Traefik-facing `/wake`/`/heartbeat` endpoints.
-//!   Unset by default: the control API is open, which is fine on localhost
-//!   or a private network but not otherwise — a startup warning is printed
-//!   when it's unset.
+//!   Unset by default on a loopback bind (`127.0.0.1`, `localhost`, ...):
+//!   the control API stays open there, which is fine for local use.
+//!   Unset on any non-loopback bind (`0.0.0.0:8080`, a LAN IP, ...), the
+//!   daemon **refuses to start** — anyone who could reach it could deploy,
+//!   destroy environments and read secret names. Override that refusal with
+//!   `OXID_ALLOW_OPEN_API=1` (explicit opt-in to an unauthenticated API) or
+//!   set `OXID_API_TOKEN`.
+//! - `OXID_ALLOW_OPEN_API` — set to `1` to let a non-loopback daemon start
+//!   without `OXID_API_TOKEN`. The startup warning still prints; this flag
+//!   exists so an operator behind their own network controls can choose the
+//!   old behavior deliberately instead of being locked out by the gate.
 //! - `OXID_POSTGRES_URL` — admin connection string for a shared Postgres
 //!   instance (SPEC.md §3.1). When set, projects declaring a `postgres`
 //!   dependency get a per-branch logical database instead of failing to
@@ -222,11 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let webhook_secret = std::env::var("OXID_WEBHOOK_SECRET").ok();
     let api_token = std::env::var("OXID_API_TOKEN").ok();
-    if api_token.is_none() {
-        tracing::warn!(
-            "OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
-        );
-    }
+    enforce_startup_security_posture(&addr, api_token.as_ref());
     let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
     let rate_limit = rate_limit_from_env();
     let app = router(ApiState {
@@ -400,6 +404,65 @@ fn rate_limit_from_env() -> Option<(u64, u32)> {
     Some((per_second, burst))
 }
 
+/// Whether every address `addr` may bind to is loopback — the one situation
+/// where leaving the control API unauthenticated is acceptable by default.
+///
+/// Handles both literal addresses (`127.0.0.1:8080`, `[::1]:8080`) and host
+/// names (`localhost:8080`, resolved via `ToSocketAddrs`). Fails closed:
+/// an unresolvable or wildcard (`0.0.0.0`/`[::]`) value counts as
+/// not-loopback, since those reach (at least) every interface.
+fn bind_is_loopback(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        return socket_addr.ip().is_loopback();
+    }
+    match addr.to_socket_addrs() {
+        Ok(mut addrs) => addrs.all(|a| a.ip().is_loopback()),
+        Err(_) => false,
+    }
+}
+
+/// The startup security posture, enforced before anything binds:
+///
+/// 1. **Open-API gate** — an open control API is fine on loopback, but a
+///    daemon reachable beyond it must either authenticate every request or
+///    have the operator explicitly accept the risk (`OXID_ALLOW_OPEN_API=1`);
+///    otherwise the process refuses to start with actionable output.
+/// 2. **Topology warning** — without `OXID_DOCKER_NETWORK` the daemon runs
+///    in direct-publish mode, where scale-to-zero is disabled by design
+///    (nothing refreshes `last_accessed_at`, so the sweep no-ops); operators
+///    get told once, loudly, instead of discovering it via a full disk of
+///    never-destroyed environments.
+fn enforce_startup_security_posture(addr: &str, api_token: Option<&String>) {
+    if api_token.is_none() {
+        if !bind_is_loopback(addr) && std::env::var("OXID_ALLOW_OPEN_API").as_deref() != Ok("1") {
+            eprintln!(
+                "refusing to start: OXID_ADDR ({addr}) is not a loopback address and \
+                 OXID_API_TOKEN is not set, so anyone who can reach this daemon could deploy,\n\
+                 destroy environments and read secret names.\n\n\
+                 Fix one of three ways:\n  \
+                 1. set OXID_API_TOKEN to a long random value (recommended; pass it to the CLI \
+                 as --token/OXID_TOKEN),\n  \
+                 2. bind OXID_ADDR to 127.0.0.1 (or localhost) and put your own proxy in front,\n  \
+                 3. set OXID_ALLOW_OPEN_API=1 to explicitly run an unauthenticated API anyway."
+            );
+            std::process::exit(1);
+        }
+        tracing::warn!(
+            "OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
+        );
+    }
+    let traefik_configured =
+        std::env::var("OXID_DOCKER_NETWORK").is_ok_and(|v| !v.trim().is_empty());
+    if !traefik_configured {
+        tracing::warn!(
+            "OXID_DOCKER_NETWORK is not set: running in direct-publish mode — scale-to-zero is \
+             DISABLED (no idle auto-pause/GC destroy; environments run until manually paused or \
+             destroyed). Traefik mode is the supported production topology: see `oxid infra setup`."
+        );
+    }
+}
+
 /// Loads `OXID_TLS_CERT`/`OXID_TLS_KEY` into a rustls server config when
 /// both are set, installing the `ring` crypto provider on first use.
 /// Returns `None` (serve plain HTTP) when either is unset.
@@ -445,4 +508,34 @@ fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::e
     std::fs::remove_file(&staged_path)?;
     tracing::info!("restore applied; starting normally");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_is_loopback;
+
+    #[test]
+    fn loopback_literals_are_loopback() {
+        assert!(bind_is_loopback("127.0.0.1:8080"));
+        assert!(bind_is_loopback("127.9.9.9:1"));
+        assert!(bind_is_loopback("[::1]:8080"));
+    }
+
+    #[test]
+    fn wildcard_and_remote_addresses_are_not_loopback() {
+        // The default bind reaches every interface — the gate must treat it
+        // as public even though 0.0.0.0 is technically "unspecified".
+        assert!(!bind_is_loopback("0.0.0.0:8080"));
+        assert!(!bind_is_loopback("[::]:8080"));
+        assert!(!bind_is_loopback("192.168.2.73:8080"));
+    }
+
+    #[test]
+    fn localhost_resolves_to_loopback_and_bogus_names_fail_closed() {
+        assert!(bind_is_loopback("localhost:8080"));
+        // An unresolvable host must count as not-loopback (fail closed) —
+        // the daemon would otherwise start open on an address nobody can
+        // pin down.
+        assert!(!bind_is_loopback("no-such-host.invalid:8080"));
+    }
 }

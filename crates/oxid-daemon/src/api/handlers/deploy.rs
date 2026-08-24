@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use crate::DeployOutcome;
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::AuthedAs;
 use crate::api::middleware::operator_name;
+use crate::api::middleware::{AuthedAs, authorize_project};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -53,6 +53,7 @@ pub async fn deploy<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<DeployBody>,
 ) -> ApiResult<Response> {
+    authorize_project(&authed, ProjectId(id))?;
     let branch = parse_branch(&body.branch)?;
     match state
         .cp
@@ -106,6 +107,7 @@ pub async fn rollback<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RollbackBody>,
 ) -> ApiResult<Response> {
+    authorize_project(&authed, ProjectId(id))?;
     let branch = parse_branch(&body.branch)?;
     let (env, report) = state
         .cp

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::{AuthedAs, authorize_project, require_unscoped};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -137,8 +138,12 @@ pub async fn set_global_secret<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<SecretBody>,
 ) -> ApiResult<StatusCode> {
+    // Global scope leaks into every project's deploys — not something a
+    // token scoped to a subset of projects may write or read.
+    require_unscoped(&authed)?;
     do_set_secret(state, None, body).await
 }
 
@@ -147,8 +152,10 @@ pub async fn list_global_secrets<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
     query: Query<SecretListQuery>,
 ) -> ApiResult<Json<Value>> {
+    require_unscoped(&authed)?;
     do_list_secrets(state, None, query.0).await
 }
 
@@ -158,8 +165,10 @@ pub async fn delete_global_secret<
 >(
     State(state): State<ApiState<G, O>>,
     Path(name): Path<String>,
+    authed: Option<Extension<AuthedAs>>,
     query: Query<SecretDeleteQuery>,
 ) -> ApiResult<StatusCode> {
+    require_unscoped(&authed)?;
     do_delete_secret(state, None, &name, query.0).await
 }
 
@@ -169,8 +178,10 @@ pub async fn set_project_secret<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     Json(body): Json<SecretBody>,
 ) -> ApiResult<StatusCode> {
+    authorize_project(&authed, ProjectId(id))?;
     do_set_secret(state, Some(ProjectId(id)), body).await
 }
 
@@ -180,8 +191,10 @@ pub async fn list_project_secrets<
 >(
     State(state): State<ApiState<G, O>>,
     Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
     query: Query<SecretListQuery>,
 ) -> ApiResult<Json<Value>> {
+    authorize_project(&authed, ProjectId(id))?;
     do_list_secrets(state, Some(ProjectId(id)), query.0).await
 }
 
@@ -191,8 +204,10 @@ pub async fn delete_project_secret<
 >(
     State(state): State<ApiState<G, O>>,
     Path((id, name)): Path<(u64, String)>,
+    authed: Option<Extension<AuthedAs>>,
     query: Query<SecretDeleteQuery>,
 ) -> ApiResult<StatusCode> {
+    authorize_project(&authed, ProjectId(id))?;
     do_delete_secret(state, Some(ProjectId(id)), &name, query.0).await
 }
 

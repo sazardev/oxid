@@ -123,8 +123,50 @@ pub enum AuthedAs {
     /// The single shared `OXID_API_TOKEN` — anonymous by design (it's
     /// meant to be one credential for the whole team/CI, not a person).
     Master,
-    /// A named, database-issued token (see [`create_token`]).
-    Operator(String),
+    /// A named, database-issued token (see [`create_token`]), carrying its
+    /// project scopes (see [`OperatorIdentity`]).
+    Operator(crate::adapter::store::OperatorIdentity),
+}
+
+/// The project ids a request's credential is limited to, or `None` when it
+/// is unrestricted (master credential, unscoped named token, or an open-API
+/// daemon with no auth configured at all).
+pub(crate) fn operator_scopes(authed: Option<&Extension<AuthedAs>>) -> Option<&[u64]> {
+    match authed {
+        Some(Extension(AuthedAs::Operator(identity))) => identity.scoped_projects.as_deref(),
+        _ => None,
+    }
+}
+
+/// Rejects a request touching a project its credential isn't scoped to.
+///
+/// Answers `404`, not `403`: a scoped operator probing another team's
+/// project id must not be able to distinguish "exists but forbidden" from
+/// "doesn't exist".
+pub(crate) fn authorize_project(
+    authed: &Option<Extension<AuthedAs>>,
+    project_id: ProjectId,
+) -> ApiResult<()> {
+    match operator_scopes(authed.as_ref()) {
+        None => Ok(()),
+        Some(scopes) if scopes.contains(&project_id.0) => Ok(()),
+        Some(_) => Err(ApiError::not_found(format!("project `{}`", project_id.0))),
+    }
+}
+
+/// Restricts a node-wide endpoint (stats, infra, backups, global secrets,
+/// project registration) to unrestricted credentials. Unlike
+/// [`authorize_project`] this answers `403` — there's no existence to hide,
+/// and a scoped operator deserves a message explaining *why*.
+pub(crate) fn require_unscoped(authed: &Option<Extension<AuthedAs>>) -> ApiResult<()> {
+    if operator_scopes(authed.as_ref()).is_some() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "this endpoint requires an unscoped credential \
+             (the master OXID_API_TOKEN or a named token without --project scopes)",
+        ));
+    }
+    Ok(())
 }
 
 /// Rejects requests missing a valid `Authorization: Bearer <token>` header
@@ -157,8 +199,10 @@ pub(crate) async fn require_bearer_token<
         return next.run(request).await;
     }
     match state.cp.find_operator_by_token(token).await {
-        Ok(Some(name)) => {
-            request.extensions_mut().insert(AuthedAs::Operator(name));
+        Ok(Some(identity)) => {
+            request
+                .extensions_mut()
+                .insert(AuthedAs::Operator(identity));
             next.run(request).await
         }
         _ => ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
@@ -170,7 +214,7 @@ pub(crate) async fn require_bearer_token<
 /// token (anonymous by design) or an unauthenticated (open API) request.
 pub(crate) fn operator_name(authed: Option<&Extension<AuthedAs>>) -> Option<String> {
     match authed {
-        Some(Extension(AuthedAs::Operator(name))) => Some(name.clone()),
+        Some(Extension(AuthedAs::Operator(identity))) => Some(identity.name.clone()),
         _ => None,
     }
 }

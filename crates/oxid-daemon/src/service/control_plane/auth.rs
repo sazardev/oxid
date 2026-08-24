@@ -19,7 +19,7 @@ use super::helpers::{
 use super::types::{Admission, DeployOutcome, GcSummary, InfraStatus, NodeStats};
 use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
-use crate::adapter::store::{ApiTokenSummary, SqliteStore};
+use crate::adapter::store::{ApiTokenSummary, OperatorIdentity, SqliteStore};
 use crate::request_context::current_request_id;
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
@@ -33,24 +33,56 @@ use oxid_core::{
 };
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
-    /// Returns [`CpError`] on storage failure.
-    pub async fn create_operator_token(&self, name: &str) -> Result<(u64, String), CpError> {
+    /// Returns [`CpError`] on validation or storage failure.
+    ///
+    /// # Errors
+    /// Returns [`CpError::Validation`] for an empty scope list and
+    /// [`CpError`] on storage failure.
+    pub async fn create_operator_token(
+        &self,
+        name: &str,
+        scoped_projects: Option<Vec<u64>>,
+    ) -> Result<(u64, String), CpError> {
+        // Normalize so equality checks downstream are value-based, and
+        // reject the useless middle ground: an explicit-but-empty list is
+        // almost certainly a client bug, and silently minting a
+        // can-do-nothing token would hide it.
+        let scopes = scoped_projects.map(|mut ids| {
+            ids.sort_unstable();
+            ids.dedup();
+            if ids.is_empty() {
+                Err(CpError::Validation(
+                    "scoped_projects cannot be empty — omit it for a token with full access"
+                        .to_owned(),
+                ))
+            } else {
+                Ok(ids)
+            }
+        });
+        let scopes = match scopes {
+            None => None,
+            Some(Err(e)) => return Err(e),
+            Some(Ok(ids)) => Some(ids),
+        };
         let mut raw = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
         let raw_token = hex::encode(raw);
         let id = self
             .store
-            .create_api_token(name, &hash_token(&raw_token))
+            .create_api_token(name, &hash_token(&raw_token), scopes.as_deref())
             .await?;
         Ok((id, raw_token))
     }
 
-    /// Resolves a bearer token to its operator name, if it matches a live
-    /// (non-revoked) named token.
+    /// Resolves a bearer token to its operator identity (name + project
+    /// scopes), if it matches a live (non-revoked) named token.
     ///
     /// # Errors
     /// Returns [`CpError`] on storage failure.
-    pub async fn find_operator_by_token(&self, raw_token: &str) -> Result<Option<String>, CpError> {
+    pub async fn find_operator_by_token(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<OperatorIdentity>, CpError> {
         Ok(self
             .store
             .find_operator_by_token_hash(&hash_token(raw_token))
