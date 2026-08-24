@@ -6,6 +6,21 @@ just "where did we leave off and why."
 
 ## What's solid and live-verified
 
+- **v0.1.0 shipped (2026-08-24).** Tag `v0.1.0` → `release.yml` all green:
+  6 platform binaries attached to the GitHub Release + `ghcr.io/sazardev/oxid`
+  images (`0.1.0`, `0.1`, `latest`). Smoke-tested the released musl binary
+  live: the auth gate refuses to start on `0.0.0.0` without
+  `OXID_API_TOKEN` (prints the three fixes), the direct-publish topology
+  warning prints at startup, and with token+loopback it serves while the
+  released `oxid` CLI connects (`ps` → empty list). Found and fixed one real
+  pipeline bug on the way: `taiki-e/upload-rust-binary-action` attaches to
+  the tag's GitHub Release but never creates it — on a fresh tag every
+  matrix job polled "release not found" through its timeout and died at
+  upload despite building fine (the earlier `workflow_dispatch` dry-run
+  never exercised this path because dry-run skips attaching). Fixed in
+  `release.yml` with an idempotent ensure-release step (race-safe across
+  parallel jobs); for v0.1.0 itself the release was created manually and
+  the failed jobs rerun green.
 - **Production-readiness round for the CLI-only v0.1.0 release (this
   round), all covered by tests:** decided the public release posture is
   CLI-first with Traefik mode as *the* supported production topology, then
