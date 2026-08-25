@@ -12,16 +12,16 @@
 
 services:
   traefik:
-    image: traefik:v3.3
+    # `latest` on purpose (verified live): Docker Engine ≥29 rejects API
+    # versions <1.40 and Traefik ≤v3.5's vendored docker client negotiates
+    # 1.24 — DOCKER_API_VERSION is ignored — so every router silently 404s
+    # with "client version 1.24 is too old" in the proxy logs.
+    image: traefik:latest
     # `oxid infra setup`/bootstrap detect Traefik by this exact name — with
     # it set, the installer's bootstrap step is a no-op instead of starting
     # a second proxy fighting over :80.
     container_name: oxid-traefik
     environment:
-      # Traefik's bundled Docker client negotiates an old default API
-      # version that recent Docker Engine releases reject outright
-      # ("client version 1.24 is too old"). Force a modern one explicitly
-      # rather than relying on negotiation.
       DOCKER_API_VERSION: "1.41"
     command:
       - --providers.docker=true
@@ -85,6 +85,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - oxid-data:/data
+      # Register projects from checkouts the daemon can read (the daemon
+      # container has no shell of its own): clone into ./repos on the host,
+      # then POST /api/v1/projects {"repo_dir": "/repos/<name>"} — after
+      # that, webhook pushes deploy like anywhere else.
+      - ./repos:/repos
     networks:
       - oxid-net
     labels:

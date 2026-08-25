@@ -24,22 +24,52 @@ or destroys them. That is fine for a laptop; for a server, use Traefik mode.
 The daemon prints a warning at startup in direct-publish mode, and
 `oxid doctor` reports which mode you're in.
 
-## 2. Install (Docker Compose)
+## 2. Install — one command
+
+### Docker stack (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+```
+
+That single command: verifies the checksum of the released CLI, generates
+`OXID_API_TOKEN` + `OXID_WEBHOOK_SECRET` into `./oxid-stack/.env` (0600,
+never rotated on re-run), pulls `ghcr.io/sazardev/oxid`, starts daemon +
+Traefik, waits for health, and verifies the network/proxy wiring. Re-running
+is always safe.
+
+Registering projects on the containerized daemon (it has no shell of its
+own): clone the repo into `./oxid-stack/repos/<name>`, then
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/projects \
+  -H "Authorization: Bearer $(grep ^OXID_API_TOKEN oxid-stack/.env | cut -d= -f2)" \
+  -H "Content-Type: application/json" \
+  -d '{"repo_dir": "/repos/<name>"}'
+```
+
+After that, webhook pushes deploy like anywhere else. (Shared
+Postgres/Redis pooling: add `OXID_POSTGRES_URL`/`OXID_REDIS_URL` to the
+stack's compose `environment:` — hostnames must resolve from inside the
+`oxid-net` network.)
+
+### Native systemd server
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --server
+```
+
+Installs both binaries to `/usr/local/bin`, writes `/etc/oxid/oxidd.env`
+(secrets, 0600) and `/etc/systemd/system/oxidd.service`, starts the service,
+waits for `/health`, and bootstraps Traefik + the docker network. Logs:
+`journalctl -u oxidd -f`. Data + backups: `/var/lib/oxid`.
+
+### Manual (what the installer automates)
 
 [`docker-compose.yml`](docker-compose.yml) is the reference stack: daemon +
 Traefik pre-wired for wake-on-request, socket mounted, `/data` volume,
-periodic backups enabled.
-
-```bash
-export OXID_WEBHOOK_SECRET=$(openssl rand -hex 32)   # verifies webhook signatures
-export OXID_API_TOKEN=$(openssl rand -hex 32)        # authenticates every control request
-
-docker compose up -d
-oxid context add prod --api http://your-host:8080 --token "$OXID_API_TOKEN"
-oxid context use prod
-oxid doctor        # reachability, auth, version match, infra checks
-oxid infra status  # what's still missing for Traefik routing
-```
+periodic backups enabled — copy `.env.example` to `.env`, fill both secrets,
+`docker compose up -d`.
 
 If you start Traefik yourself instead of via compose, `oxid infra setup`
 idempotently creates the network/container. One step always stays manual:

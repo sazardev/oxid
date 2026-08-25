@@ -65,7 +65,26 @@ open.
 
 ## Installation
 
-**Docker (recommended):**
+**One command** — full docker stack (daemon + Traefik, secrets generated,
+scale-to-zero wired):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+```
+
+Native server instead (systemd service + auto-generated secrets + Traefik):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --server
+```
+
+CLI-only (just the binaries, checksum-verified):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh
+```
+
+**Docker (manual):**
 
 ```bash
 docker run -d --name oxid-daemon \
