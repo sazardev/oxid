@@ -230,9 +230,34 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .expect("Keep is filtered out before calling apply_gc_action");
         let name = resolved_container_name(project, &env);
 
+        // Idempotency: Docker returns 409 if we pause an already-paused
+        // container, or 304/404 on stop. Treat those as success so the
+        // scheduler does not spam WARNs every 30s — the real guard is the
+        // state-aware `gc::evaluate` above, this is belt-and-suspenders.
         match action {
-            GcAction::Pause => self.oci.pause(&name).await?,
-            GcAction::Hibernate | GcAction::Destroy => self.oci.stop(&name).await?,
+            GcAction::Pause => {
+                if let Err(e) = self.oci.pause(&name).await {
+                    let msg = e.to_string();
+                    if msg.contains("already paused") || msg.contains("is already paused") {
+                        tracing::debug!(%name, "container already paused, treating as success");
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+            GcAction::Hibernate | GcAction::Destroy => {
+                if let Err(e) = self.oci.stop(&name).await {
+                    let msg = e.to_string();
+                    if msg.contains("already stopped")
+                        || msg.contains("is already stopped")
+                        || msg.contains("304")
+                    {
+                        tracing::debug!(%name, "container already stopped, treating as success");
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
             GcAction::Keep => unreachable!("Keep is filtered out before calling apply_gc_action"),
         }
         if self.docker_network.is_none() {

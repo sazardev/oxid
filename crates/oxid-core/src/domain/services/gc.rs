@@ -41,15 +41,24 @@ impl GcAction {
 
 /// Decides what to do with `environment` right now.
 ///
-/// Rules:
-/// - Destroyed environments are always ignored (terminal).
-/// - If idle longer than `project.destroy_after`, destroy.
-/// - If idle longer than `4 * pause_after`, hibernate.
-/// - If idle longer than `project.pause_after`, pause.
+/// Rules (state-aware, `SPEC.md §2.1 / §3.2`):
+/// - Destroyed / Building are terminal / in-flight — never GC'd.
+/// - If idle longer than `project.destroy_after`, destroy (allowed from
+///   Running/Paused/Hibernating).
+/// - If `Paused` idle longer than `4 * pause_after`, hibernate.
+/// - If `Running` idle longer than `project.pause_after`, pause.
 /// - Otherwise keep.
+///
+/// The previous implementation ignored `environment.state` and returned
+/// `Pause`/`Hibernate` repeatedly for the same idle window, causing the
+/// scheduler to `docker pause` an already-paused container every 30s
+/// (`409 already paused` spam).
 #[must_use]
 pub fn evaluate(environment: &Environment, project: &Project, now: OffsetDateTime) -> GcAction {
-    if environment.state == EnvironmentState::Destroyed {
+    if matches!(
+        environment.state,
+        EnvironmentState::Destroyed | EnvironmentState::Building
+    ) {
         return GcAction::Keep;
     }
 
@@ -63,11 +72,22 @@ pub fn evaluate(environment: &Environment, project: &Project, now: OffsetDateTim
         .get()
         .checked_mul(HIBERNATE_MULTIPLIER)
         .unwrap_or(Duration::MAX);
-    if idle >= hibernate_after {
-        return GcAction::Hibernate;
-    }
-    if idle >= project.config.pause_after.get() {
-        return GcAction::Pause;
+
+    match environment.state {
+        EnvironmentState::Running => {
+            if idle >= project.config.pause_after.get() {
+                return GcAction::Pause;
+            }
+        }
+        EnvironmentState::Paused => {
+            if idle >= hibernate_after {
+                return GcAction::Hibernate;
+            }
+        }
+        EnvironmentState::Hibernating => {
+            // Only Destroy (already handled) remains — never re-hibernate.
+        }
+        EnvironmentState::Destroyed | EnvironmentState::Building => unreachable!(),
     }
 
     GcAction::Keep
@@ -156,8 +176,39 @@ mod tests {
     fn idle_beyond_multiplier_hibernates() {
         let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let p = project(30, 7);
-        let e = env(now, now - Duration::hours(3)); // 180m > 4 * 30m
-        assert_eq!(evaluate(&e, &p, now), GcAction::Hibernate);
+        // Running with 3h idle pauses first — only a Paused env hibernates.
+        let running = env(now, now - Duration::hours(3));
+        assert_eq!(evaluate(&running, &p, now), GcAction::Pause);
+        let mut paused = running;
+        paused
+            .transition(StateTransition::IdleTimeout, now)
+            .unwrap();
+        // Re-evaluate the paused env at same now — now it hibernates.
+        assert_eq!(evaluate(&paused, &p, now), GcAction::Hibernate);
+    }
+
+    #[test]
+    fn paused_short_idle_keeps() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let p = project(30, 7);
+        let mut e = env(now, now - Duration::minutes(31));
+        e.transition(StateTransition::IdleTimeout, now).unwrap(); // Running → Paused
+        // Paused but only 31m idle (< 120m hibernate threshold) → Keep
+        assert_eq!(evaluate(&e, &p, now), GcAction::Keep);
+    }
+
+    #[test]
+    fn hibernating_never_re_hibernates() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let p = project(30, 7);
+        let mut e = env(now, now - Duration::hours(3));
+        e.transition(StateTransition::IdleTimeout, now).unwrap();
+        e.transition(StateTransition::DeepSleep, now).unwrap(); // Paused → Hibernating
+        // Hibernating idle 3h (< 7d destroy) → Keep, not Hibernate
+        assert_eq!(evaluate(&e, &p, now), GcAction::Keep);
+        // Even 6 days later still Keep until destroy_after
+        let later = now + Duration::days(6);
+        assert_eq!(evaluate(&e, &p, later), GcAction::Keep);
     }
 
     #[test]
