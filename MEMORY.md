@@ -6,6 +6,40 @@ just "where did we leave off and why."
 
 ## What's solid and live-verified
 
+- **One-command DevOps setup (this round), every path tested against the
+  real published release:** `install.sh` — binaries-only (release download +
+  sha256 verify + PATH install), `--server` (systemd unit + auto-generated
+  0600 secrets that re-runs never rotate + health wait + Traefik bootstrap;
+  `--root` sandbox mode for testing without touching the host) and
+  `--docker` (compose stack from the public ghcr image, `.env` generated,
+  image pinned to the release tag, infra verified). Found and fixed live:
+  checksum asset name (`.sha256` not `.tar.gz.sha256`), env-var clobbering
+  (`BINDIR=""` reset the env), non-root idempotency (grep on a 0600 root
+  file silently failed → would have rotated secrets every re-run), raw
+  CDN staleness (installer now handles both compose shapes + verifies the
+  pin), double-Traefik (compose container now named `oxid-traefik` so
+  bootstrap detects it), and **Traefik ≤v3.5 vs Docker ≥29** — the vendored
+  docker client negotiates API 1.24, the engine's floor is 1.40,
+  `DOCKER_API_VERSION` is ignored, every router silently 404s; compose now
+  pins `traefik:latest` (verified routing end-to-end after the bump).
+  Validated the full production topology from an absolutely fresh
+  `curl | sh`: register via the new `./repos` mount → deploy →
+  `Host: main.e2e-go.local.dev` routed through Traefik → container, 200.
+- **E2E validation scenario (previous round), still running as a
+  playground:** public repo `sazardev/oxid-e2e-go` (5 Go branches, distinct
+  features/deps-in-code), lab daemon v0.1.0 musl on 127.0.0.1:18080
+  (direct-publish) with shared Postgres/Redis, 5 concurrent devs simulated
+  over 4 rounds (CLI + real GitHub webhooks through a cloudflared tunnel),
+  zero-downtime proven with request pollers (732/0 and 482/0 during live
+  cutovers), per-branch DB/index isolation, dashboard driven via CDP
+  (pause/wake from the UI with the port actually dying/coming back),
+  rollback with both versions served mid-cutover. Product findings logged
+  in the report: oxid.toml frozen at registration, read-only CLI commands
+  auto-register cwd, rm-project lacks --project, REDIS_URL index-as-path +
+  no sslmode hint undocumented, global deploy lock, containerized daemons
+  need the ./repos mount to register (no remote-registration API yet), and
+  resource leases are per-daemon-DB (two daemons on one shared
+  Postgres/Redis will collide — one daemon per shared instance).
 - **v0.1.0 shipped (2026-08-24).** Tag `v0.1.0` → `release.yml` all green:
   6 platform binaries attached to the GitHub Release + `ghcr.io/sazardev/oxid`
   images (`0.1.0`, `0.1`, `latest`). Smoke-tested the released musl binary
