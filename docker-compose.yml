@@ -44,8 +44,11 @@ services:
     restart: unless-stopped
 
   oxid-daemon:
-    build: .
-    # Or, once published: image: ghcr.io/sazardev/oxid:latest
+    # Published by every release tag — no clone needed:
+    #   curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+    image: ghcr.io/sazardev/oxid:latest
+    # To build from source instead, clone this repo and uncomment:
+    # build: .
     environment:
       OXID_DATA_DIR: /data
       OXID_ADDR: 0.0.0.0:8080
