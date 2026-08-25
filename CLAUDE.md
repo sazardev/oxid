@@ -4,34 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Oxid is a self-hosted control plane for ephemeral, branch-based preview environments ("the Vercel of local servers"). It detects a git push, builds an image, spins up a container, routes it, and scales it to zero (pause) after inactivity, waking it on the next request. Written entirely in Rust.
+Oxid is a self-hosted control plane for ephemeral, branch-based preview environments ("the Vercel of local servers"). It detects a git push, builds an image, spins up a container, routes it, and scales it to zero (pause) after inactivity, waking it on the next request. Written entirely in Rust, `unsafe` forbidden workspace-wide.
 
-The product vision, architecture spec, and visual design language live in `IDEA.md`, `SPEC.md`, and `DESIGN.md` respectively — read those for background/rationale, not just this file. `ROADMAP.md` tracks a granular gap analysis between what those documents promise and what's actually implemented; check it before assuming a feature described in SPEC/IDEA/DESIGN exists in code.
+The product vision, architecture spec, and visual design language live in `IDEA.md`, `SPEC.md`, and `DESIGN.md` respectively — read those for background/rationale, not just this file. `ROADMAP.md` tracks a granular gap analysis between what those documents promise and what's actually implemented; check it before assuming a feature described in SPEC/IDEA/DESIGN exists in code. `AGENTS.md` is a denser, more exhaustive agent-oriented reference (exact line numbers, hook/CI internals, gotchas) — consult it when this file isn't specific enough.
 
 ## Commands
 
 ```bash
 cargo build                          # build workspace (default member: oxid-cli)
 cargo build --workspace              # build all crates (cli, core, daemon)
+cargo build --workspace --all-targets
 cargo test --workspace               # run all tests
-cargo test -p oxid-daemon <name>     # run a single test by name substring
-cargo clippy --workspace --all-targets   # lint (workspace enforces clippy::all + pedantic as warnings, unsafe_code forbidden)
+cargo test -p oxid-daemon <name>     # single test by substring (also -p oxid-core / oxid-cli)
+cargo test -p oxid-core -- --nocapture
+cargo clippy --workspace --all-targets            # local: all+pedantic = warn
+cargo clippy --workspace --all-targets -- -D warnings   # CI/pre-push gate: deny
 cargo fmt                            # format
-
-# Run the daemon (control plane API + scheduler)
-cargo run -p oxid-daemon
-# Run the CLI (thin HTTP client against the daemon)
-cargo run -p oxid-cli -- <subcommand>
+cargo fmt --all -- --check           # pre-commit gate
 ```
 
+Gate order that matters, mirrored between `.githooks/pre-push` and CI (`ci.yml` `check` job): `fmt --check` → `clippy -D warnings` → `test --workspace`. A `clippy::pedantic` warning that's silent locally (warn) will still fail push/CI (deny with `-D warnings`).
+
+Toolchain is pinned in `rust-toolchain.toml` (`stable` + `clippy` + `rustfmt`); no other setup needed. `build.rs` (`crates/oxid-core/build.rs`) wires `.githooks/` as `core.hooksPath` automatically on the first `cargo build/test/check`, but only if hooksPath isn't already customized.
+
 Daemon configuration is via environment variables (see `crates/oxid-daemon/src/main.rs`):
-- `OXID_DATA_DIR` (default `/data`) — holds `audit.sqlite`, `git-cache/`, `secret.key`
+- `OXID_DATA_DIR` (default `/data`) — holds `audit.sqlite` (WAL), `git-cache/`, `secret.key` (0600, AES-GCM)
 - `OXID_ADDR` (default `0.0.0.0:8080`)
 - `OXID_MASTER_KEY` — 64-hex-char AES-GCM key for secret encryption; auto-generated and persisted to `secret.key` if unset
-- `OXID_WEBHOOK_SECRET` — HMAC-SHA256 secret for verifying GitHub push webhooks; webhooks are rejected while unset
+- `OXID_WEBHOOK_SECRET` — HMAC-SHA256 secret verifying GitHub/Gitea/Gogs push webhooks (+ token echo for GitLab); webhooks are rejected while unset. Routes: `/api/v1/webhooks/{github,gitlab,gitea,gogs}`
+- `OXID_API_TOKEN` — bearer auth; the daemon refuses to start on a non-loopback bind without it (override with `OXID_ALLOW_OPEN_API=1`). Named, project-scopable tokens via `oxid token create [--project id]`; scoped tokens get 404 outside their project and 403 on node-wide routes (`api/middleware.rs::authorize_project`)
 - `OXID_GC_INTERVAL_SECS` (default 30) — scheduler tick for scale-to-zero GC
+- `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required together) — per-client-IP bucket on protected routes
+- `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
+- `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. — see `main.rs`
 
-CLI targets the daemon via `OXID_API` (default `http://127.0.0.1:8080`).
+CLI targets the daemon via `OXID_API` (default `http://127.0.0.1:8080`) and `OXID_API_TOKEN`. Docker is required for the daemon (build/run/pause) but not for `cargo test` — `oxid-core` tests are pure and instant; `oxid-daemon` integration tests use in-memory SQLite unless marked `#[ignore]` (Docker-dependent).
 
 Migrations are plain SQL files under `crates/oxid-daemon/migrations/`, run at startup via `sqlx`.
 
@@ -48,10 +55,19 @@ Hexagonal / ports-and-adapters, split across three crates:
   - `service/control_plane/` — the `ControlPlane` application service, split SRP (one module per concern): `deploy.rs`, `provision.rs`, `lifecycle.rs`, `gc.rs`, `infra.rs`, `admission.rs`, `auth.rs`, `project.rs`.
   - `service/proxy.rs` — built-in per-branch TCP reverse proxy (stable `public_port`, zero-downtime redeploys); `service/scheduler.rs` — periodic tokio task driving scale-to-zero GC + deploy-queue retry.
   - `api/` — `axum` HTTP surface: router in `mod.rs`, one handler file per resource under `handlers/`, `middleware.rs` (auth + rate-limit + request-id), `dashboard.rs` (embedded SPA).
-- **`oxid-cli`** — thin `clap`-based HTTP client (binary `oxid`) that talks to the daemon's REST API; holds no business logic itself.
+- **`oxid-cli`** — thin `clap`-based HTTP client (binary `oxid`) that talks to the daemon's REST API; holds no business logic itself (multi-context config in `cli/config.rs`).
 
 Data flow for a deploy: webhook/CLI request → `api/handlers/*` → `ControlPlane::deploy` → `GitPort` (clone/checkout) → `SecretStore` + `var_resolution` (compute injected env) → `ContainerPort` (build + run + exec `on_start`) → `EnvironmentStore`/`AuditStore` (persist state + audit trail).
 
-When adding a capability, prefer: domain rules and new port methods in `oxid-core`, adapter implementation in `oxid-daemon/src/adapter/*`, orchestration in `oxid-daemon/src/service/control_plane/`, and HTTP/CLI exposure last. Keep `oxid-core` free of any I/O, SQL, Docker, or HTTP dependency.
+Redeploys are zero-downtime: the new container is built and started before traffic cuts over through the reverse proxy, so a broken push never takes the previous build down.
+
+When adding a capability, prefer: domain rules and new port methods in `oxid-core`, adapter implementation in `oxid-daemon/src/adapter/*`, orchestration in `oxid-daemon/src/service/control_plane/`, and HTTP/CLI exposure last. Keep `oxid-core` free of any I/O, SQL, Docker, or HTTP dependency — `crates/oxid-core/Cargo.toml` must never gain `tokio|sqlx|bollard|axum|reqwest|git2|hyper|tower|tar`; this is enforced both by `.githooks/_lib.sh:check_hexagonal_boundary` and in CI (`ci.yml`).
 
 The project (`oxid.toml`) config schema and its `[project]`/`[build]`/`[routing]`/`[dependencies]` sections are specified in `IDEA.md`; `crates/oxid-core/src/domain/project_config.rs` is the domain-side model for it.
+
+## Hooks & CI
+
+- `.githooks/pre-commit` (fast): `fmt --check`, merge-marker check, forbidden paths (`.env`/`secret.key`/`*.pem`), staged secret scan (`gitleaks` if installed, else built-in), `cargo check` if Rust changed, hexagonal-boundary check if `oxid-core/Cargo.toml` is staged.
+- `.githooks/pre-push` (thorough): everything above plus `clippy -D warnings`, `test --workspace`, `cargo audit`, `cargo deny check`, full-history `gitleaks`. Install `cargo-audit`, `cargo-deny`, `gitleaks` locally for full coverage — otherwise those steps warn/skip locally, but CI still enforces them.
+- Hooks are bypassable with `--no-verify`; CI (`ci.yml`) is not, and additionally runs `cargo build --workspace --all-targets`.
+- `deny.toml` allows licenses `0BSD/MIT/Apache-2.0/...` and bans wildcard deps; `.cargo/audit.toml` requires a comment on any ignored advisory.
