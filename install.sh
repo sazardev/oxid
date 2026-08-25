@@ -209,12 +209,18 @@ EOF
     if curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
       log "daemon is healthy"
       # Bootstrap Traefik + the shared docker network (idempotent).
-      if curl -fsS -X POST http://127.0.0.1:8080/api/v1/infra/bootstrap \
-           -H "Authorization: Bearer ${API_TOKEN}" >/dev/null 2>&1; then
-        log "Traefik + docker network bootstrapped (scale-to-zero ready)"
-      else
-        warn "infra bootstrap failed — run later: oxid infra setup"
-      fi
+      BOOTSTRAP_OK=0
+      for _ in 1 2 3; do
+        if curl -fsS -X POST http://127.0.0.1:8080/api/v1/infra/bootstrap \
+             -H "Authorization: Bearer ${API_TOKEN}" >/dev/null 2>&1; then
+          BOOTSTRAP_OK=1
+          break
+        fi
+        sleep 3
+      done
+      [ "${BOOTSTRAP_OK}" = "1" ] \
+        && log "Traefik + docker network bootstrapped (scale-to-zero ready)" \
+        || warn "infra bootstrap failed — run later: oxid infra setup"
     else
       warn "daemon did not answer /health within 30s — check: journalctl -u oxidd -e"
     fi
@@ -254,7 +260,16 @@ if [ "${MODE}" = "docker" ]; then
   # VERSION via the published image tag below.
   fetch "${RAW}/main/docker-compose.yml" "${STACK}/docker-compose.yml"
   # ghcr tags are bare semver (metadata-action `{{version}}`): v0.1.0 → 0.1.0.
-  sed -i "s|image: ghcr.io/${REPO}:latest|image: ghcr.io/${REPO}:${VERSION#v}|" "${STACK}/docker-compose.yml"
+  # raw.githubusercontent.com caches aggressively, so handle BOTH compose
+  # shapes (image-first and older build-from-source) and verify the result.
+  IMG_TAG="${VERSION#v}"
+  if grep -qE "^    image: ghcr\.io/${REPO}:" "${STACK}/docker-compose.yml"; then
+    sed -i "s|^    image: ghcr\.io/${REPO}:.*|    image: ghcr.io/${REPO}:${IMG_TAG}|" "${STACK}/docker-compose.yml"
+  else
+    sed -i "s|^    build: \.$|    image: ghcr.io/${REPO}:${IMG_TAG}|" "${STACK}/docker-compose.yml"
+  fi
+  grep -q "image: ghcr.io/${REPO}:${IMG_TAG}" "${STACK}/docker-compose.yml" \
+    || die "could not pin ghcr.io/${REPO}:${IMG_TAG} in the compose file"
 
   if [ -f "${STACK}/.env" ] && grep -q '^OXID_API_TOKEN=' "${STACK}/.env"; then
     warn "reusing existing ${STACK}/.env (re-run never rotates secrets)"
@@ -277,9 +292,17 @@ EOF
   done
   if curl -fsS http://127.0.0.1:8080/api/v1/health >/dev/null 2>&1; then
     log "daemon is healthy"
-    curl -fsS -X POST http://127.0.0.1:8080/api/v1/infra/bootstrap \
-      -H "Authorization: Bearer ${API_TOKEN}" >/dev/null 2>&1 \
-      && log "Traefik + network bootstrapped" \
+    BOOTSTRAP_OK=0
+    for _ in 1 2 3; do
+      if curl -fsS -X POST http://127.0.0.1:8080/api/v1/infra/bootstrap \
+           -H "Authorization: Bearer ${API_TOKEN}" >/dev/null 2>&1; then
+        BOOTSTRAP_OK=1
+        break
+      fi
+      sleep 3
+    done
+    [ "${BOOTSTRAP_OK}" = "1" ] \
+      && log "Traefik + network verified (scale-to-zero ready)" \
       || warn "infra bootstrap failed — run: cd ${STACK} && docker compose restart oxid-daemon"
   else
     warn "daemon not healthy yet — check: cd ${STACK} && docker compose logs oxid-daemon"

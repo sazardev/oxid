@@ -13,6 +13,10 @@
 services:
   traefik:
     image: traefik:v3.3
+    # `oxid infra setup`/bootstrap detect Traefik by this exact name — with
+    # it set, the installer's bootstrap step is a no-op instead of starting
+    # a second proxy fighting over :80.
+    container_name: oxid-traefik
     environment:
       # Traefik's bundled Docker client negotiates an old default API
       # version that recent Docker Engine releases reject outright
