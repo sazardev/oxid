@@ -143,6 +143,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return BTreeMap::new();
         };
         let heartbeat = format!("{name}-heartbeat");
+        let wake = format!("{name}-wake");
         BTreeMap::from([
             ("traefik.enable".to_owned(), "true".to_owned()),
             ("traefik.docker.network".to_owned(), network.clone()),
@@ -156,7 +157,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             ),
             (
                 format!("traefik.http.routers.{name}.middlewares"),
-                heartbeat.clone(),
+                format!("{heartbeat},{wake}"),
             ),
             (
                 format!("traefik.http.services.{name}.loadbalancer.server.port"),
@@ -165,6 +166,39 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             (
                 format!("traefik.http.middlewares.{heartbeat}.forwardauth.address"),
                 format!("{}/api/v1/heartbeat", self.daemon_url),
+            ),
+            // A `Paused` container's kernel-level TCP stack still completes
+            // a connection (the freeze is at the process/cgroup level), so
+            // a plain proxied request hangs forever waiting for a response
+            // that a frozen process can never send — it never becomes the
+            // 502/503/504 the `errors` middleware below is watching for.
+            // Traefik's Docker *label* provider does not support declaring
+            // a `serversTransport` per-container (confirmed live: the
+            // entity never lands in `/api/rawdata`, so the router 500s
+            // with "servers transport not found"), so the response-header
+            // timeout that turns that hang into a fast, catchable error is
+            // set once, globally, in the Traefik static config instead
+            // (see `--serversTransport.forwardingTimeouts.*` in
+            // `docker-compose.yml`) — every Oxid-managed service picks it
+            // up automatically, no per-router labels needed.
+            //
+            // Redirects a failed/timed-out request at this router to the
+            // daemon's own `oxid-wake` service (labeled on the daemon's own
+            // container — see `docker-compose.yml`), which unpauses/starts
+            // the environment and returns a small auto-reloading page.
+            // `Hibernating` branches (container fully stopped) fail fast
+            // with connection-refused, already well inside these timeouts.
+            (
+                format!("traefik.http.middlewares.{wake}.errors.status"),
+                "500-599".to_owned(),
+            ),
+            (
+                format!("traefik.http.middlewares.{wake}.errors.service"),
+                "oxid-wake".to_owned(),
+            ),
+            (
+                format!("traefik.http.middlewares.{wake}.errors.query"),
+                "/api/v1/wake".to_owned(),
             ),
         ])
     }

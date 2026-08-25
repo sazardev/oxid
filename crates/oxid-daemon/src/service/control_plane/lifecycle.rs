@@ -151,6 +151,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Woken, now)
             .map_err(|e| state_err(&e))?;
+        // Without this, a woken environment's idle clock still reads its
+        // pre-sleep timestamp: the very next GC sweep sees it as still idle
+        // past `pause_after` and pauses it right back — observed live,
+        // ~7s after a manual wake. The request that's about to be served
+        // (or the wake page's auto-reload) is the traffic that justifies
+        // staying awake, so count it now rather than waiting for a
+        // follow-up heartbeat that may not land before the next tick.
+        let _ = env.touch(now);
         EnvironmentStore::update(&self.store, &env).await?;
         tracing::info!(%environment_id, "environment woken");
         Ok(())

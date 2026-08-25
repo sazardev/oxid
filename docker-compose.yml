@@ -37,6 +37,17 @@ services:
       - --entrypoints.traefik.address=:8081
       - --api.dashboard=true
       - --api.insecure=true # dashboard over plain HTTP — fine for localhost, remove otherwise
+      # Wake-on-request (SPEC.md §3.2) needs a request against a `Paused`
+      # container to fail fast: `docker pause` freezes the process but not
+      # the kernel TCP stack, so a plain proxied request would otherwise
+      # hang forever instead of erroring into the `errors` middleware that
+      # redirects to `/api/v1/wake` (ControlPlane::traefik_labels). Per-
+      # router `serversTransport` labels don't work — Traefik's Docker
+      # *label* provider silently drops them (confirmed: never appears in
+      # `/api/rawdata`) — so this is set once, globally, applying to every
+      # Oxid-managed service automatically.
+      - --serversTransport.forwardingTimeouts.dialTimeout=2s
+      - --serversTransport.forwardingTimeouts.responseHeaderTimeout=5s
     ports:
       - "80:80"
       # - "443:443"

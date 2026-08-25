@@ -13,6 +13,7 @@
 use std::any::Any;
 use std::convert::Infallible;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -226,8 +227,17 @@ pub fn router<
         ));
 
     if let Some((per_second, burst)) = rate_limit {
+        // `tower_governor`'s `per_second(n)` is a false friend: despite the
+        // name, it sets the replenish *period* to `n` seconds per token
+        // (i.e. a rate of `1/n` per second), not "n tokens per second" —
+        // confirmed live: `OXID_RATE_LIMIT_PER_SECOND=10` was silently
+        // configuring one token every 10s (a sustained ~0.1 req/s), so any
+        // burst took minutes to recover instead of ~2s, wedging `oxid
+        // doctor` and the dashboard in 429s well after traffic stopped.
+        // `.period()` takes the actual per-token interval, so invert here.
+        let per_second = u32::try_from(per_second.max(1)).unwrap_or(u32::MAX);
         let governor_conf = GovernorConfigBuilder::default()
-            .per_second(per_second.max(1))
+            .period(Duration::from_secs(1) / per_second)
             .burst_size(burst.max(1))
             .key_extractor(ClientIpKeyExtractor)
             .finish()
@@ -246,7 +256,14 @@ pub fn router<
         .route("/style.css", get(dashboard_style))
         .route("/app.js", get(dashboard_app_js))
         .route("/vendor/alpine.min.js", get(dashboard_alpine_js))
-        .route("/api/v1/wake", post(handlers::lifecycle::wake_by_host))
+        // Traefik's `errors` middleware always issues a GET when it
+        // substitutes a custom error page (confirmed live: the original
+        // POST/GET distinction is not preserved), so this must answer GET
+        // too, not just the POST a manual/API caller would use.
+        .route(
+            "/api/v1/wake",
+            get(handlers::lifecycle::wake_by_host).post(handlers::lifecycle::wake_by_host),
+        )
         .route(
             "/api/v1/heartbeat",
             get(handlers::lifecycle::heartbeat_by_host)
