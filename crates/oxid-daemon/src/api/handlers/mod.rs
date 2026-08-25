@@ -6,5 +6,6 @@ pub mod infra;
 pub mod lifecycle;
 pub mod project;
 pub mod secrets;
+pub mod setup;
 pub mod tokens;
 pub mod webhook;

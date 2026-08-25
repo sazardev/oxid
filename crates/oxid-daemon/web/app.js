@@ -19,6 +19,7 @@ const ROUTES = [
   { name: "audit", re: /^\/ui\/audit\/?$/, keys: [] },
   { name: "secrets", re: /^\/ui\/secrets\/?$/, keys: [] },
   { name: "admin", re: /^\/ui\/admin\/?$/, keys: [] },
+  { name: "onboarding", re: /^\/ui\/onboarding\/?$/, keys: [] },
   { name: "environments", re: /^\/(ui\/environments)?\/?$/, keys: [] },
 ];
 
@@ -74,12 +75,41 @@ function dashboard() {
     confirmModal: { open: false, message: "", resolve: null },
     _logAbort: null,
     _timer: null,
+    // Public, pre-auth readiness probe (`GET /api/v1/setup/status`) — the
+    // onboarding wizard and the first-visit auto-redirect both read it.
+    setupStatus: null,
+    wizard: {
+      step: 1,
+      tokenInput: "",
+      checkingToken: false,
+      infra: null,
+      infraLoading: false,
+      fixingInfra: false,
+      infraError: "",
+      projectMode: "url",
+      repoUrl: "",
+      gitToken: "",
+      repoDir: "",
+      registering: false,
+      deployBranch: "main",
+      deploying: false,
+      deployState: "",
+      deployMessage: "",
+      projectId: null,
+      projectName: "",
+      envId: null,
+      provider: "github",
+      webhookSecret: null,
+      webhookSecretMissing: false,
+      copied: "",
+    },
 
     init() {
       this.token = localStorage.getItem("oxid_token") || "";
       window.addEventListener("popstate", () => this.onRouteChange());
       this.onRouteChange();
       this._timer = setInterval(() => this.refreshCurrentPage(), this.refreshIntervalSecs * 1000);
+      this.loadSetupStatus().then(() => this.maybeStartOnboarding());
     },
 
     // ------------------------------------------------------------------
@@ -176,6 +206,9 @@ function dashboard() {
             await this.loadAudit();
             break;
           case "admin":
+            break;
+          case "onboarding":
+            await this.loadSetupStatus();
             break;
         }
 
@@ -490,6 +523,235 @@ function dashboard() {
       }
       const finishedMs = this.toEpochMs(event.occurred_at);
       return finishedMs === null ? null : finishedMs - ref.createdAtMs;
+    },
+
+    // ------------------------------------------------------------------
+    // onboarding wizard (`/ui/onboarding`) — a first-run checklist that
+    // turns "docker compose up" into a working, deployed project: token →
+    // infra → first project + deploy → webhooks → CLI. Everything it calls
+    // already existed (infra/bootstrap, projects, deploy); the only
+    // wizard-specific endpoint is the public `setup/status` probe.
+    // ------------------------------------------------------------------
+
+    async loadSetupStatus() {
+      try {
+        const res = await fetch(`${this.apiBase}/api/v1/setup/status`, { cache: "no-store" });
+        this.setupStatus = await res.json();
+      } catch {
+        this.setupStatus = null;
+      }
+    },
+
+    // Auto-redirects to the wizard on the very first visit to the home
+    // page of a daemon this browser hasn't been set up against yet — but
+    // never hijacks deep links into other views. Dismissed permanently by
+    // finishing or skipping (localStorage `oxid_onboarded`).
+    maybeStartOnboarding() {
+      if (localStorage.getItem("oxid_onboarded") === "1") {
+        return;
+      }
+      const path = location.pathname;
+      if (path !== "/" && path !== "/ui/environments") {
+        return;
+      }
+      const s = this.setupStatus;
+      if (!s) {
+        return; // unreachable daemon — the connError banner already explains
+      }
+      if (!s.auth_required || !this.token) {
+        this.go("/ui/onboarding");
+      }
+    },
+
+    wizardGo(step) {
+      this.wizard.step = step;
+      if (step === 2) {
+        this.loadInfraStatus();
+      }
+      if (step === 4) {
+        this.loadWebhookSecret();
+      }
+    },
+
+    finishOnboarding(message) {
+      localStorage.setItem("oxid_onboarded", "1");
+      if (message) {
+        this.showNotice(message);
+      }
+      this.go("/ui/environments");
+    },
+
+    async verifyToken() {
+      const candidate = this.wizard.tokenInput.trim();
+      if (!candidate) {
+        return;
+      }
+      this.wizard.checkingToken = true;
+      const previous = this.token;
+      this.token = candidate;
+      try {
+        await this.apiGet("/api/v1/stats");
+        this.authError = false;
+        localStorage.setItem("oxid_token", candidate);
+        this.showNotice("Token accepted.");
+        this.wizardGo(2);
+      } catch {
+        this.token = previous;
+        localStorage.setItem("oxid_token", previous);
+        this.showNotice(
+          "That token was rejected. If OXID_AUTO_TOKEN is on, retrieve the generated one with: docker compose logs oxid-daemon | grep -A2 Generated",
+        );
+      } finally {
+        this.wizard.checkingToken = false;
+      }
+    },
+
+    async loadInfraStatus() {
+      this.wizard.infraLoading = true;
+      this.wizard.infraError = "";
+      // 404 means direct-publish mode (no OXID_DOCKER_NETWORK) — a valid,
+      // supported topology where there's simply nothing to bootstrap.
+      this.wizard.infra = await this.apiGetQuiet("/api/v1/infra/status");
+      this.wizard.infraLoading = false;
+    },
+
+    async fixInfra() {
+      this.wizard.fixingInfra = true;
+      this.wizard.infraError = "";
+      try {
+        const res = await this.apiSend("POST", "/api/v1/infra/bootstrap", {});
+        this.wizard.infra = await res.json();
+      } catch (err) {
+        this.wizard.infraError =
+          err.message === "unauthorized"
+            ? "This step needs the master token (scoped tokens can't change infra)."
+            : err.message;
+      } finally {
+        this.wizard.fixingInfra = false;
+      }
+    },
+
+    async registerFirstProject() {
+      this.wizard.registering = true;
+      this.wizard.deployState = "";
+      this.wizard.deployMessage = "";
+      try {
+        const body =
+          this.wizard.projectMode === "url"
+            ? {
+                repo_url: this.wizard.repoUrl.trim(),
+                ...(this.wizard.gitToken.trim()
+                  ? { git_token: this.wizard.gitToken.trim() }
+                  : {}),
+              }
+            : { repo_dir: this.wizard.repoDir.trim() };
+        const res = await this.apiSend("POST", "/api/v1/projects", body);
+        const project = await res.json();
+        this.wizard.projectId = project.id;
+        this.wizard.projectName = project.name;
+        this.showNotice(`Project \`${project.name}\` registered — deploying...`);
+        await this.deployFirstProject();
+      } catch (err) {
+        this.showNotice(`Registration failed: ${err.message}`);
+      } finally {
+        this.wizard.registering = false;
+      }
+    },
+
+    async deployFirstProject() {
+      const branch = this.wizard.deployBranch.trim() || "main";
+      this.wizard.deploying = true;
+      this.wizard.deployState = "building";
+      try {
+        await this.apiSend("POST", `/api/v1/projects/${this.wizard.projectId}/deploy`, {
+          branch,
+        });
+        this.pollFirstDeploy(branch, 0);
+      } catch (err) {
+        this.wizard.deploying = false;
+        this.wizard.deployState = "failed";
+        this.wizard.deployMessage = err.message;
+      }
+    },
+
+    // Polls until the first deploy lands (`running`), fails, or times out
+    // (~3 min). Builds can legitimately take minutes on a cold host.
+    async pollFirstDeploy(branch, attempt) {
+      if (attempt > 90) {
+        this.wizard.deploying = false;
+        this.wizard.deployState = "timeout";
+        this.wizard.deployMessage =
+          "Still building after 3 minutes — check the environment page for live logs.";
+        return;
+      }
+      try {
+        const envs = await this.apiGet(
+          `/api/v1/projects/${this.wizard.projectId}/environments?branch=${encodeURIComponent(branch)}`,
+        );
+        const env = envs[0];
+        if (env && env.state === "running") {
+          this.wizard.envId = env.id;
+          this.wizard.deployState = "running";
+          this.wizard.deploying = false;
+          return;
+        }
+        if (env && env.state !== "building") {
+          this.wizard.deploying = false;
+          this.wizard.deployState = "failed";
+          this.wizard.deployMessage = `Environment state: ${env.state}`;
+          return;
+        }
+      } catch {
+        // transient — keep polling
+      }
+      setTimeout(() => this.pollFirstDeploy(branch, attempt + 1), 2000);
+    },
+
+    webhookUrl() {
+      return `${location.origin}/api/v1/webhooks/${this.wizard.provider}`;
+    },
+
+    async loadWebhookSecret() {
+      this.wizard.webhookSecret = null;
+      this.wizard.webhookSecretMissing = false;
+      try {
+        const res = await fetch(`${this.apiBase}/api/v1/setup/webhook-secret`, {
+          headers: this.authHeaders(),
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const body = await res.json();
+          this.wizard.webhookSecret = body.webhook_secret ?? null;
+          this.wizard.webhookSecretMissing = !body.webhook_secret;
+        } else {
+          this.wizard.webhookSecretMissing = true;
+        }
+      } catch {
+        this.wizard.webhookSecretMissing = true;
+      }
+    },
+
+    cliSnippet() {
+      const tokenPart = this.token || "<your-token>";
+      return `oxid context add prod --api ${location.origin} --token ${tokenPart}`;
+    },
+
+    curlSnippet() {
+      return `curl -X POST ${location.origin}/api/v1/projects -H "Authorization: Bearer $OXID_TOKEN" -H "Content-Type: application/json" -d '{"repo_url":"https://github.com/you/app.git"}'`;
+    },
+
+    async copyText(text, label) {
+      try {
+        await navigator.clipboard.writeText(text);
+        this.wizard.copied = label;
+        setTimeout(() => {
+          if (this.wizard.copied === label) {
+            this.wizard.copied = "";
+          }
+        }, 1500);
+      } catch {
+        this.showNotice("Clipboard unavailable — copy manually.");
+      }
     },
 
     // ------------------------------------------------------------------

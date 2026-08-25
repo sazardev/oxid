@@ -38,17 +38,30 @@ never rotated on re-run), pulls `ghcr.io/sazardev/oxid`, starts daemon +
 Traefik, waits for health, and verifies the network/proxy wiring. Re-running
 is always safe.
 
-Registering projects on the containerized daemon (it has no shell of its
-own): clone the repo into `./oxid-stack/repos/<name>`, then
+Registering projects on the containerized daemon: the easy path is
+registration **by Git URL** — no shared filesystem, the daemon clones into
+its own cache (private repos take an encrypted access token):
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/projects \
   -H "Authorization: Bearer $(grep ^OXID_API_TOKEN oxid-stack/.env | cut -d= -f2)" \
   -H "Content-Type: application/json" \
-  -d '{"repo_dir": "/repos/<name>"}'
+  -d '{"repo_url": "https://github.com/you/app.git"}'
+# scp-style remotes work too: "repo_url": "git@github.com:you/app.git"
 ```
 
-After that, webhook pushes deploy like anywhere else. (Shared
+Or from a checkout under the mounted `./repos` directory:
+
+```bash
+# clone the repo into ./oxid-stack/repos/<name> first, then:
+curl -X POST http://127.0.0.1:8080/api/v1/projects \
+  ... -d '{"repo_dir": "/repos/<name>"}'
+```
+
+The dashboard's setup wizard (`/ui/onboarding`, also linked as *setup* in the
+top bar) walks through all of this — token, infra bootstrap, first project +
+deploy, webhook URL/secret, CLI snippet — and opens automatically on a fresh
+install. After that, webhook pushes deploy like anywhere else. (Shared
 Postgres/Redis pooling: add `OXID_POSTGRES_URL`/`OXID_REDIS_URL` to the
 stack's compose `environment:` — hostnames must resolve from inside the
 `oxid-net` network.)
@@ -68,8 +81,11 @@ waits for `/health`, and bootstraps Traefik + the docker network. Logs:
 
 [`docker-compose.yml`](docker-compose.yml) is the reference stack: daemon +
 Traefik pre-wired for wake-on-request, socket mounted, `/data` volume,
-periodic backups enabled — copy `.env.example` to `.env`, fill both secrets,
-`docker compose up -d`.
+periodic backups enabled — it ships with `OXID_AUTO_TOKEN=1`, so a plain
+`docker compose up -d` works with no `.env` at all (the generated
+`OXID_API_TOKEN`/`OXID_WEBHOOK_SECRET` are printed once to the logs and
+persisted under `/data`). Pin your own secrets instead by setting both env
+vars explicitly (`cp .env.example .env`).
 
 If you start Traefik yourself instead of via compose, `oxid infra setup`
 idempotently creates the network/container. One step always stays manual:

@@ -96,6 +96,35 @@ docker run -d --name oxid-daemon \
   ghcr.io/sazardev/oxid:latest   # or `docker build -t oxid-daemon .` from source
 ```
 
+### First 5 minutes
+
+With the docker stack above (or `install.sh --docker`), everything else
+happens in the browser — the daemon ships an onboarding wizard that opens
+automatically the first time you visit the dashboard:
+
+1. **Token** — paste your `OXID_API_TOKEN`. With `OXID_AUTO_TOKEN=1` (the
+   shipped `docker-compose.yml`) you don't need a `.env` at all: the daemon
+   generates its token + webhook secret on first start, prints them once to
+   `docker compose logs oxid-daemon`, and persists them under `/data`.
+2. **Infrastructure** — one click bootstraps the Docker network and Traefik
+   (`oxid infra setup`, idempotent).
+3. **First project** — register straight from a Git URL (the daemon clones
+   it itself; private repos take an encrypted access token), or from a path
+   under the mounted `./repos` directory. The first deploy is kicked off for
+   you.
+4. **Webhooks** — copy-paste the exact URL and secret into your Git host;
+   pushed branches deploy themselves from then on.
+5. **CLI & team** — ready-made `oxid context add …` snippet, plus guidance
+   for minting project-scoped tokens instead of sharing the master one.
+
+Prefer the terminal? The same flow is:
+
+```bash
+oxid context add prod --api http://DAEMON:8080 --token $TOKEN
+oxid up main --repo https://github.com/you/app.git   # registers + deploys
+oxid infra setup                                      # network + Traefik
+```
+
 See [`docker-compose.yml`](docker-compose.yml) for a fuller setup wired to
 Traefik (routing + scale-to-zero wake-on-request), matching `SPEC.md` §6.
 Prefer not to hand-wire Traefik? With `OXID_DOCKER_NETWORK` set on the daemon,

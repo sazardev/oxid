@@ -31,6 +31,7 @@
         <a href="/ui/audit" :class="route.name==='audit'&&'active'" @click.prevent="go('/ui/audit')">audit</a>
         <a href="/ui/secrets" :class="route.name==='secrets'&&'active'" @click.prevent="go('/ui/secrets')">secrets</a>
         <a href="/ui/admin" :class="route.name==='admin'&&'active'" @click.prevent="go('/ui/admin')">admin</a>
+        <a href="/ui/onboarding" :class="route.name==='onboarding'&&'active'" @click.prevent="go('/ui/onboarding')" title="First-run setup wizard">setup</a>
       </nav>
       <div class="conn">
         <span
@@ -530,10 +531,289 @@
         </table>
       </section>
 
+      <!-- ================= ONBOARDING WIZARD ================= -->
+      <section class="page" x-show="route.name === 'onboarding'" x-cloak>
+        <div class="page-head">
+          <h1>Set up this daemon</h1>
+          <button class="btn btn-sm" @click="finishOnboarding()">skip — I'll configure it myself</button>
+        </div>
+        <p class="muted">
+          Five steps from a fresh install to a deployed project. Everything here can also be
+          done later via the CLI or the pages above.
+        </p>
+
+        <ol class="wizard-steps">
+          <li :class="wizard.step === 1 && 'active'">1 · token</li>
+          <li :class="wizard.step === 2 && 'active'">2 · infrastructure</li>
+          <li :class="wizard.step === 3 && 'active'">3 · first project</li>
+          <li :class="wizard.step === 4 && 'active'">4 · webhooks</li>
+          <li :class="wizard.step === 5 && 'active'">5 · CLI &amp; team</li>
+        </ol>
+
+        <!-- Step 1: connect -->
+        <div class="wizard-panel" x-show="wizard.step === 1">
+          <h2>Connect to the control API</h2>
+          <template x-if="setupStatus && !setupStatus.auth_required">
+            <p>
+              This daemon has no API token configured (loopback/open mode) — you're already
+              authenticated. Continue straight to infrastructure.
+            </p>
+          </template>
+          <template x-if="setupStatus && setupStatus.auth_required">
+            <div>
+              <p>
+                Paste the bearer token below. It's kept in this browser only
+                (<code>localStorage</code>) and sent as
+                <code>Authorization: Bearer …</code> on every request.
+              </p>
+              <template x-if="setupStatus.auto_token">
+                <div class="wizard-hint">
+                  This daemon runs with <code>OXID_AUTO_TOKEN=1</code>: it generated its own token
+                  on first start and printed it once. Retrieve it with:
+                  <pre class="log-output wizard-snippet">docker compose logs oxid-daemon | grep -A2 Generated</pre>
+                </div>
+              </template>
+              <div class="deploy-form">
+                <input
+                  class="token-input mono"
+                  type="password"
+                  placeholder="bearer token"
+                  x-model="wizard.tokenInput"
+                  @keydown.enter="verifyToken()"
+                />
+                <button class="btn" :disabled="wizard.checkingToken" @click="verifyToken()">
+                  <span x-show="!wizard.checkingToken">verify &amp; continue</span>
+                  <span x-show="wizard.checkingToken" class="spinner"></span>
+                </button>
+              </div>
+            </div>
+          </template>
+          <template x-if="!setupStatus">
+            <p class="muted">Cannot read setup status — is the daemon reachable?</p>
+          </template>
+          <div class="wizard-nav">
+            <span></span>
+            <button class="btn" x-show="!setupStatus?.auth_required || token" @click="wizardGo(2)">
+              continue →
+            </button>
+          </div>
+        </div>
+
+        <!-- Step 2: infrastructure -->
+        <div class="wizard-panel" x-show="wizard.step === 2">
+          <h2>Infrastructure</h2>
+          <p class="muted">
+            Traefik mode routes every branch as <code>&lt;branch&gt;.&lt;base-domain&gt;</code> with
+            wake-on-request. Direct-publish mode (no <code>OXID_DOCKER_NETWORK</code>) is also fine:
+            each environment just gets its own host port.
+          </p>
+          <template x-if="wizard.infraLoading">
+            <p><span class="spinner"></span> checking…</p>
+          </template>
+          <template x-if="!wizard.infraLoading && !wizard.infra">
+            <div class="wizard-hint">
+              Direct-publish mode — nothing to bootstrap here. Deployed environments will publish
+              a dynamically-chosen host port each. Continue to the first project.
+            </div>
+          </template>
+          <template x-if="!wizard.infraLoading && wizard.infra">
+            <div>
+              <ul class="wizard-checklist">
+                <li>
+                  <span class="dot" :class="wizard.infra.network_exists ? 'dot-green' : 'dot-red'"></span>
+                  Docker network <code x-text="wizard.infra.network"></code>
+                </li>
+                <li>
+                  <span class="dot" :class="wizard.infra.traefik_status === 'running' ? 'dot-green' : 'dot-red'"></span>
+                  Traefik proxy — <span class="mono" x-text="wizard.infra.traefik_status"></span>
+                </li>
+                <li>
+                  <span class="dot" :class="wizard.infra.self_wiring_ok ? 'dot-green' : 'dot-red'"></span>
+                  Daemon wired into the network
+                </li>
+              </ul>
+              <template x-for="step in wizard.infra.next_steps ?? []" :key="step">
+                <p class="mono muted wizard-next-step" x-text="step"></p>
+              </template>
+              <div class="deploy-form">
+                <button class="btn" :disabled="wizard.fixingInfra" @click="fixInfra()">
+                  <span x-show="!wizard.fixingInfra">fix automatically (idempotent)</span>
+                  <span x-show="wizard.fixingInfra" class="spinner"></span>
+                </button>
+                <span class="muted" x-text="wizard.infraError"></span>
+              </div>
+            </div>
+          </template>
+          <div class="wizard-nav">
+            <button class="btn btn-ghost" @click="wizardGo(1)">← back</button>
+            <button class="btn" @click="wizardGo(3)">continue →</button>
+          </div>
+        </div>
+
+        <!-- Step 3: first project -->
+        <div class="wizard-panel" x-show="wizard.step === 3">
+          <h2>Register your first project</h2>
+          <div class="tabs">
+            <a href="#" :class="wizard.projectMode==='url'&&'active'" @click.prevent="wizard.projectMode='url'">git URL</a>
+            <a href="#" :class="wizard.projectMode==='dir'&&'active'" @click.prevent="wizard.projectMode='dir'">local path</a>
+          </div>
+          <template x-if="wizard.projectMode === 'url'">
+            <div>
+              <p class="muted">
+                The daemon clones the repo itself into its own git cache — no shared filesystem
+                needed. scp-style remotes are normalized automatically; for a private repo add an
+                HTTPS access token below (stored encrypted, never echoed back).
+              </p>
+              <div class="secret-form">
+                <input
+                  class="token-input mono"
+                  type="text"
+                  placeholder="https://github.com/you/app.git"
+                  x-model="wizard.repoUrl"
+                />
+                <input
+                  class="token-input mono"
+                  type="password"
+                  placeholder="access token (private repos only)"
+                  x-model="wizard.gitToken"
+                />
+              </div>
+            </div>
+          </template>
+          <template x-if="wizard.projectMode === 'dir'">
+            <div>
+              <p class="muted">
+                Path to a checkout the daemon container can read — with the shipped compose file
+                that's anything under the mounted <code>./repos</code> directory
+                (<code>/repos/&lt;name&gt;</code> inside the container).
+              </p>
+              <div class="secret-form">
+                <input
+                  class="token-input mono"
+                  type="text"
+                  placeholder="/repos/my-app"
+                  x-model="wizard.repoDir"
+                />
+              </div>
+            </div>
+          </template>
+          <div class="secret-form">
+            <label class="mono muted">branch</label>
+            <input
+              class="token-input mono"
+              type="text"
+              placeholder="main"
+              x-model="wizard.deployBranch"
+            />
+            <button class="btn" :disabled="wizard.registering" @click="registerFirstProject()">
+              <span x-show="!wizard.registering">register &amp; deploy</span>
+              <span x-show="wizard.registering" class="spinner"></span>
+            </button>
+          </div>
+
+          <template x-if="wizard.deployState === 'building'">
+            <p><span class="spinner"></span> building… first builds may take a few minutes on a cold host.</p>
+          </template>
+          <template x-if="wizard.deployState === 'running'">
+            <div class="wizard-hint wizard-success">
+              ✓ <span class="mono" x-text="wizard.projectName"></span>/<span class="mono" x-text="wizard.deployBranch.trim() || 'main'"></span>
+              is live!
+              <a class="link" href="#"
+                 @click.prevent="go('/ui/environments/' + wizard.envId)">open environment</a>
+            </div>
+          </template>
+          <template x-if="wizard.deployState === 'failed' || wizard.deployState === 'timeout'">
+            <div class="wizard-hint wizard-failure">
+              ✗ deploy didn't make it: <span class="mono" x-text="wizard.deployMessage"></span>
+              Check the audit page for the build log, fix, then try again from here.
+            </div>
+          </template>
+
+          <div class="wizard-nav">
+            <button class="btn btn-ghost" @click="wizardGo(2)">← back</button>
+            <button class="btn" @click="wizardGo(4)">continue →</button>
+          </div>
+        </div>
+
+        <!-- Step 4: webhooks -->
+        <div class="wizard-panel" x-show="wizard.step === 4">
+          <h2>Wire up push-to-deploy</h2>
+          <p class="muted">
+            Add a webhook in your Git host pointing at this URL; every pushed branch deploys itself
+            (and deleting a branch destroys its environment). Requires the master credential.
+          </p>
+          <div class="secret-form">
+            <select class="token-input mono" x-model="wizard.provider" style="width:auto">
+              <option value="github">GitHub</option>
+              <option value="gitlab">GitLab</option>
+              <option value="gitea">Gitea</option>
+              <option value="gogs">Gogs</option>
+            </select>
+            <input class="token-input mono" type="text" readonly :value="webhookUrl()" />
+            <button class="btn btn-sm" @click="copyText(webhookUrl(), 'url')">
+              <span x-text="wizard.copied === 'url' ? 'copied!' : 'copy'"></span>
+            </button>
+          </div>
+          <template x-if="wizard.webhookSecret">
+            <div class="wizard-hint">
+              Webhook secret (auto-generated on this daemon) — paste it as your Git host's webhook
+              secret:
+              <div class="secret-form">
+                <input class="token-input mono" type="text" readonly :value="wizard.webhookSecret" />
+                <button class="btn btn-sm" @click="copyText(wizard.webhookSecret, 'secret')">
+                  <span x-text="wizard.copied === 'secret' ? 'copied!' : 'copy'"></span>
+                </button>
+              </div>
+            </div>
+          </template>
+          <template x-if="wizard.webhookSecretMissing">
+            <div class="wizard-hint">
+              No webhook secret configured yet. Set <code>OXID_WEBHOOK_SECRET</code> (or start with
+              <code>OXID_AUTO_TOKEN=1</code>) and restart the daemon — until then pushes are
+              rejected by design.
+            </div>
+          </template>
+          <div class="wizard-nav">
+            <button class="btn btn-ghost" @click="wizardGo(3)">← back</button>
+            <button class="btn" @click="wizardGo(5)">continue →</button>
+          </div>
+        </div>
+
+        <!-- Step 5: CLI + team -->
+        <div class="wizard-panel" x-show="wizard.step === 5">
+          <h2>CLI access &amp; team tokens</h2>
+          <p class="muted">Point the <code>oxid</code> CLI at this daemon:</p>
+          <div class="secret-form">
+            <input class="token-input mono" type="text" readonly :value="cliSnippet()" style="min-width:420px" />
+            <button class="btn btn-sm" @click="copyText(cliSnippet(), 'cli')">
+              <span x-text="wizard.copied === 'cli' ? 'copied!' : 'copy'"></span>
+            </button>
+          </div>
+          <p class="muted">
+            Sharing with teammates? Mint them scoped tokens instead of handing out the master one —
+            <code>oxid token create alice --project &lt;id&gt;</code> (or the admin page). Scoped
+            tokens see nothing outside their projects. Or register projects programmatically:
+          </p>
+          <div class="secret-form">
+            <input class="token-input mono" type="text" readonly :value="curlSnippet()" style="min-width:420px" />
+            <button class="btn btn-sm" @click="copyText(curlSnippet(), 'curl')">
+              <span x-text="wizard.copied === 'curl' ? 'copied!' : 'copy'"></span>
+            </button>
+          </div>
+          <div class="wizard-nav">
+            <button class="btn btn-ghost" @click="wizardGo(4)">← back</button>
+            <button class="btn btn-primary" @click="finishOnboarding('Setup complete.')">
+              finish → go to environments
+            </button>
+          </div>
+        </div>
+      </section>
+
       <!-- ================= ADMIN ================= -->
       <section class="page" x-show="route.name === 'admin'" x-cloak>
         <h1>Admin</h1>
         <div class="project-actions">
+          <button class="btn btn-sm" @click="go('/ui/onboarding')">re-run setup wizard</button>
           <button class="btn btn-sm" @click="downloadBackup()">download backup</button>
           <button class="btn btn-sm btn-danger" @click="rotateKey()">rotate master key</button>
         </div>

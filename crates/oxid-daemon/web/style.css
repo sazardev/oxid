@@ -489,6 +489,106 @@ h2 {
   border-top: 1px solid var(--border);
 }
 
+/* Onboarding wizard — same flat Industrial Elegance: hard borders, no
+   shadows, one accent color doing all the state signaling. */
+.wizard-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  list-style: none;
+  padding: 0;
+  margin: 16px 0;
+}
+
+.wizard-steps li {
+  border: 1px solid var(--border);
+  color: var(--ash-gray);
+  font-family: "Fira Code", monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 6px 12px;
+  border-radius: 2px;
+}
+
+.wizard-steps li.active {
+  color: var(--oxid-orange);
+  border-color: var(--oxid-orange);
+}
+
+.wizard-panel {
+  border: 1px solid var(--border);
+  background: var(--iron-gray);
+  padding: 18px 20px;
+  max-width: 860px;
+}
+
+.wizard-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 20px;
+}
+
+.wizard-hint {
+  border-left: 3px solid var(--ash-gray);
+  background: var(--carbon-black);
+  padding: 10px 14px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.wizard-hint code {
+  color: var(--oxid-orange);
+}
+
+.wizard-success {
+  border-left-color: var(--patina-green);
+  color: var(--patina-green);
+}
+
+.wizard-failure {
+  border-left-color: var(--oxid-orange);
+  color: var(--oxid-orange);
+}
+
+.wizard-snippet {
+  min-height: auto;
+  margin: 10px 0 0;
+  padding: 8px 12px;
+}
+
+.wizard-checklist {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+  display: grid;
+  gap: 8px;
+}
+
+.wizard-checklist li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.wizard-next-step {
+  white-space: pre-wrap;
+  margin: 4px 0;
+}
+
+.btn-primary {
+  background: var(--oxid-orange);
+  border-color: var(--oxid-orange);
+  color: var(--carbon-black);
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: #e86a4f;
+}
+
 @media (max-width: 900px) {
   .stats {
     grid-template-columns: repeat(3, 1fr);

@@ -31,12 +31,12 @@
         <span></span><span></span><span></span>
       </button>
       <nav class="primary-nav" id="primaryNav">
+        <a href="#install">Install</a>
         <a href="#why">Why</a>
         <a href="#features">Features</a>
         <a href="#how">How it works</a>
         <a href="docs/">Docs</a>
         <a href="#status">Status</a>
-        <a href="#join">Join</a>
         <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
       </nav>
     </div>
@@ -46,21 +46,77 @@
     <section class="hero" id="top">
       <div class="wrap hero-inner">
         <span class="badge">
-          <span class="dot dot-building" aria-hidden="true"></span>
-          Coming soon — building in public
+          <span class="dot dot-running" aria-hidden="true"></span>
+          Zero-config · 60 seconds to first preview — building in public
         </span>
         <img class="hero-mark" src="assets/logo/oxid-mark.svg" alt="Oxid logo" width="88" height="88" />
-        <h1>Oxid</h1>
-        <p class="tagline">Ephemeral environments that breathe.</p>
-        <p class="subtagline">Ferrous performance, invisible footprint.</p>
-        <p class="hero-copy">
-          A self-hosted control plane that deploys a preview environment for every branch you push —
-          and actually scales it to zero when nobody's looking.
-        </p>
+        <h1>OXID</h1>
+        <p class="tagline">Every branch comes alive.</p>
+        <p class="subtagline">One push → a live preview. No endless YAML, no forgotten containers quietly burning your server. When nobody's watching, it scales to zero and gives the RAM back.</p>
         <div class="cta-row">
-          <a class="btn btn-primary" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">★ Star on GitHub</a>
-          <a class="btn btn-outline" href="https://github.com/sazardev/oxid/blob/main/ROADMAP.md" target="_blank" rel="noopener">Read the roadmap</a>
+          <a class="btn btn-primary" href="#install">Install in 60s →</a>
+          <a class="btn btn-outline" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">★ Star on GitHub</a>
         </div>
+        <div class="hero-quickstart" role="group" aria-label="Quick install commands">
+          <code class="qs-cmd">$ curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker</code>
+          <span class="qs-or">or</span>
+          <code class="qs-cmd">$ docker compose up -d</code>
+          <span class="qs-arrow" aria-hidden="true">↓</span>
+          <span class="qs-result">→ http://localhost:8080 → wizard</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="install">
+      <div class="wrap">
+        <p class="eyebrow">// install — 60 seconds</p>
+        <h2>From nothing to a live preview.</h2>
+        <p class="install-lead">
+          No YAML novels. No secret juggling. The shipped <code>docker-compose.yml</code> runs with
+          <code>OXID_AUTO_TOKEN=1</code> — secrets generate themselves, persist under <code>/data</code>,
+          and the dashboard's onboarding wizard does the rest.
+        </p>
+        <div class="install-stack">
+          <article class="install-card">
+            <span class="install-step">01 — run</span>
+            <h3><code>docker compose up -d</code></h3>
+            <p>Or one line from nothing — verifies checksums, generates <code>OXID_API_TOKEN</code> + <code>WEBHOOK_SECRET</code> (0600, never rotated on re-run), pulls <code>ghcr.io/sazardev/oxid</code>, starts daemon + Traefik, waits for health.</p>
+            <pre class="cmd-block"><code><span class="tk-gray">$</span> curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+<span class="tk-green">[+]</span> Dashboard: http://localhost:8080  → wizard
+<span class="tk-gray"># or manually:</span>
+<span class="tk-gray">$</span> docker compose up -d
+<span class="tk-gray">$</span> docker compose logs oxid-daemon | grep -A2 Generated  <span class="tk-gray"># your token, printed once</span></code></pre>
+          </article>
+          <article class="install-card install-card-accent">
+            <span class="install-step">02 — wizard</span>
+            <h3>Open the dashboard</h3>
+            <p>First visit auto-opens <code>/ui/onboarding</code> — five steps, everything also available later via CLI:</p>
+            <ol class="install-list">
+              <li><strong>Token</strong> — paste <code>OXID_API_TOKEN</code> (or grab it from <code>docker compose logs</code>)</li>
+              <li><strong>Infrastructure</strong> — one-click bootstrap of Docker network + Traefik</li>
+              <li><strong>First project</strong> — register by <strong>Git URL</strong> (private repos take an encrypted PAT) or <code>/repos</code> path</li>
+              <li><strong>Webhooks</strong> — copy URL + auto-generated secret into your Git host</li>
+              <li><strong>CLI</strong> — copy-paste <code>oxid context add …</code> snippet</li>
+            </ol>
+            <p class="muted">Prefer the terminal? <code>oxid up main --repo https://github.com/you/app.git</code></p>
+          </article>
+          <article class="install-card">
+            <span class="install-step">03 — push</span>
+            <h3>Push a branch</h3>
+            <p>Every push deploys itself. Delete the branch, the environment disappears. Zero-downtime cutover every time.</p>
+            <pre class="cmd-block"><code><span class="tk-gray">$</span> git push origin feature-carrito
+<span class="tk-orange">[&gt;]</span> Building image (cache hit: 85%) ...
+<span class="tk-green">[+]</span> https://feature-carrito.local.dev  <span class="tk-gray">(or :port in direct mode)</span>
+
+<span class="tk-gray">$</span> oxid status        <span class="tk-gray"># live URLs + ports</span>
+<span class="tk-gray">$</span> oxid logs -f feature-carrito</code></pre>
+          </article>
+        </div>
+        <p class="install-footnote">
+          Traefik mode = stable <code>branch.base-domain</code> subdomains + wake-on-request scale-to-zero.
+          Direct-publish mode works too — each env gets its own host port, no DNS needed.
+          Full reference: <a href="docs/install.html">Install guide</a> · <a href="docs/daemon.html">Daemon env vars</a> · <a href="docs/#quickstart">Quickstart</a>.
+        </p>
       </div>
     </section>
 
@@ -148,29 +204,29 @@
           <li>
             <span class="timeline-index">01</span>
             <div>
-              <h3>Install</h3>
-              <p>One binary. Point a wildcard domain at it (<code>*.local.dev</code>), mount the Docker socket.</p>
+              <h3>Install — one command</h3>
+              <p><code>curl .../install.sh | sh -s -- --docker</code> or <code>docker compose up -d</code>. Secrets generate themselves (<code>OXID_AUTO_TOKEN</code>), persist under <code>/data</code>, printed once.</p>
             </div>
           </li>
           <li>
             <span class="timeline-index">02</span>
             <div>
-              <h3>Push a branch</h3>
-              <p><code>git push origin feature-carrito</code> — that's the entire interface.</p>
+              <h3>Wizard — five clicks</h3>
+              <p>Open <code>http://localhost:8080</code> → token → one-click infra bootstrap → register by <strong>Git URL</strong> (or <code>/repos</code> path). First deploy kicks off for you.</p>
             </div>
           </li>
           <li>
             <span class="timeline-index">03</span>
             <div>
-              <h3>The magic</h3>
-              <p>Oxid clones, builds, injects secrets, and deploys. The proxy routes <code>feature-carrito.local.dev</code> automatically.</p>
+              <h3>Push a branch</h3>
+              <p><code>git push origin feature-carrito</code> — that's the entire interface from then on. Webhook → clone → build → deploy. Proxy routes <code>feature-carrito.local.dev</code> automatically.</p>
             </div>
           </li>
           <li>
             <span class="timeline-index">04</span>
             <div>
               <h3>Breathe</h3>
-              <p>No traffic for a while? Oxid pauses it and gives the RAM back. A tester opens the URL — it wakes in milliseconds.</p>
+              <p>No traffic for a while? Oxid pauses it and gives the RAM back. A tester opens the URL — it wakes in milliseconds. Delete the branch, the environment disappears.</p>
             </div>
           </li>
         </ol>
@@ -178,13 +234,15 @@
         <div class="terminal" role="img" aria-label="Example Oxid CLI session">
           <div class="terminal-titlebar">
             <span class="terminal-dot"></span><span class="terminal-dot"></span><span class="terminal-dot"></span>
-            <span class="terminal-title">oxid — the whole lifecycle from one command</span>
+            <span class="terminal-title">oxid — from zero to live in one command</span>
           </div>
-          <pre class="terminal-body"><code><span class="tk-orange">[&gt;]</span> oxid up feature-login
-<span class="tk-green">[+]</span> Parsed oxid.toml successfully
-<span class="tk-green">[+]</span> Shared Postgres instance detected. Created db_feature_login
+          <pre class="terminal-body"><code><span class="tk-gray">$</span> curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+<span class="tk-green">[+]</span> Dashboard: http://localhost:8080  → wizard (token → infra → Git URL → webhooks → CLI)
+
+<span class="tk-orange">[&gt;]</span> oxid up main --repo https://github.com/you/app.git
+<span class="tk-green">[+]</span> Project `my-app` registered (cloned into daemon cache)
 <span class="tk-orange">[&gt;]</span> Building image (cache hit: 85%) ...
-<span class="tk-green">[+]</span> Environment live at: https://feature-login.local.dev
+<span class="tk-green">[+]</span> Environment live at: https://main.my-app.local.dev
 
 <span class="tk-orange">[&gt;]</span> oxid logs -f feature-login
 listening on 0.0.0.0:3000 ...
@@ -250,13 +308,15 @@ listening on 0.0.0.0:3000 ...
     <section class="section section-alt" id="status">
       <div class="wrap">
         <p class="eyebrow">// status</p>
-        <h2>Early, honest, building in public.</h2>
+        <h2>Ready to run. Honest about what's next.</h2>
         <p class="status-copy">
-          Oxid is in active, early development. The Rust control plane already handles webhook
-          ingestion, secret injection, container orchestration, scale-to-zero garbage collection,
-          and zero-downtime redeploys end to end — with an embedded web dashboard and a CLI that
-          covers the full lifecycle: deploy and roll back, live-stream logs, scope secrets per
-          branch, manage multiple daemons as contexts, back up and restore state, rotate the
+          Oxid already runs end to end in production topology: one-command Docker install
+          (<code>OXID_AUTO_TOKEN</code> generates and persists secrets for you), a five-step
+          onboarding wizard that registers your first project straight from a <strong>Git URL</strong>
+          — no shared filesystem — webhook ingestion, secret injection, container orchestration,
+          scale-to-zero garbage collection and zero-downtime redeploys. The embedded web dashboard
+          and the CLI cover the full lifecycle: deploy and roll back, live-stream logs, scope secrets
+          per branch, manage multiple daemons as contexts, back up and restore state, rotate the
           encryption key with zero downtime. The TUI and desktop app described below are
           still part of the plan — the
           <a href="https://github.com/sazardev/oxid/blob/main/ROADMAP.md" target="_blank" rel="noopener">ROADMAP</a>

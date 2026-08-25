@@ -40,6 +40,7 @@
         <p class="side-group">Overview</p>
         <a href="#overview" class="active">What is Oxid</a>
         <a href="#quickstart">Quickstart</a>
+        <a href="install.html">Install — 60s guide</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
@@ -112,31 +113,58 @@
       </section>
 
       <section class="doc-section" id="quickstart">
-        <h2>Quickstart</h2>
+        <h2>Quickstart — 60 seconds to first preview</h2>
         <p>
-          One binary for the daemon, one for the client. Point the CLI at the daemon and deploy
-          from any directory with a <code>Dockerfile</code> (an <code>oxid.toml</code> is optional,
-          for when you want more control).
+          Zero-config Docker, a five-click wizard, then every push deploys itself. The whole
+          install is <strong>one command plus a browser tab</strong> — no <code>.env</code> to hand-wire.
         </p>
+
+        <h3 style="margin-top:2rem">1 — Run the stack</h3>
+        <p>Recommended: one line from nothing — verifies checksums, generates secrets (0600, never rotated on re-run), pulls <code>ghcr.io/sazardev/oxid</code>, starts daemon + Traefik, waits for health and verifies wiring.</p>
+        <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+<span class="tk-gray"># → Dashboard: http://localhost:8080  (wizard auto-opens)</span>
+<span class="tk-gray"># or manually, no .env needed thanks to OXID_AUTO_TOKEN=1:</span>
+docker compose up -d
+docker compose logs oxid-daemon | grep -A2 Generated  <span class="tk-gray"># your token, printed once</span></pre>
+        <p class="note">Docker is required on the daemon host only. The CLI runs anywhere with network access to the daemon — point it via <code>--api</code> or a <a href="cli.html#cli-context">context</a>.</p>
+
+        <h3>2 — Walk the wizard (5 clicks)</h3>
+        <p>Open <code>http://localhost:8080</code> — first visit auto-redirects to <code>/ui/onboarding</code>:</p>
+        <ol style="color:#c7c7ca; display:grid; gap:0.4rem; padding-left:1.25rem; margin:0 0 1rem;">
+          <li><strong>Token</strong> — paste <code>OXID_API_TOKEN</code> (or grab it from <code>docker compose logs</code> when <code>OXID_AUTO_TOKEN=1</code>).</li>
+          <li><strong>Infrastructure</strong> — one-click bootstrap of Docker network + Traefik (idempotent; direct-publish mode shows "nothing to bootstrap" instead).</li>
+          <li><strong>First project</strong> — register by <strong>Git URL</strong> (<code>https://github.com/you/app.git</code>, scp-style <code>git@host:org/repo.git</code> works too; private repos take an encrypted PAT) or a path under the mounted <code>./repos</code>. First deploy of <code>main</code> kicks off for you with live polling.</li>
+          <li><strong>Webhooks</strong> — pick provider, copy URL + auto-generated secret into your Git host.</li>
+          <li><strong>CLI</strong> — copy-paste <code>oxid context add prod --api … --token …</code> snippet. Done → environments page.</li>
+        </ol>
+        <p class="note">Everything here is also available as CLI/API: <code>oxid infra setup</code>, <code>POST /api/v1/projects {"repo_url": …}</code>, <code>POST /api/v1/infra/bootstrap</code>.</p>
+
+        <h3>3 — Push and breathe</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> git push origin feature-carrito
+<span class="tk-orange">[&gt;]</span> Building image (cache hit: 85%) ...
+<span class="tk-green">[+]</span> https://feature-carrito.local.dev  <span class="tk-gray">(or :port in direct-publish mode)</span>
+
+<span class="tk-gray">$</span> oxid up main --repo https://github.com/you/app.git  <span class="tk-gray"># same flow from the CLI</span>
+<span class="tk-gray">$</span> oxid status        <span class="tk-gray"># live URLs + ports</span>
+<span class="tk-gray">$</span> oxid logs -f feature-carrito</pre>
+        <p>Every push deploys its branch; deleting the branch destroys its environment. No traffic for a while? Oxid pauses it and gives the RAM back — next request wakes it in milliseconds.</p>
+
+        <h3>Other ways to run</h3>
         <div class="terminal">
           <div class="terminal-titlebar">
             <span class="terminal-dot"></span><span class="terminal-dot"></span><span class="terminal-dot"></span>
-            <span class="terminal-title">terminal</span>
+            <span class="terminal-title">native / manual</span>
           </div>
-          <pre class="terminal-body"><code><span class="tk-gray">$</span> OXID_DATA_DIR=~/.oxid oxidd
-<span class="tk-green">[+]</span> oxid daemon listening on http addr=0.0.0.0:8080
-
-<span class="tk-gray">$</span> cd my-app &amp;&amp; oxid up feature-login
-<span class="tk-orange">[&gt;]</span> Building image for feature-login...
-<span class="tk-green">[+]</span> Environment live at: http://127.0.0.1:41253/
-
-<span class="tk-gray">$</span> oxid status</code></pre>
+          <pre class="terminal-body"><code><span class="tk-gray">$</span> curl -fsSL .../install.sh | sh -s -- --server   <span class="tk-gray"># systemd + auto secrets + Traefik</span>
+<span class="tk-gray">$</span> curl -fsSL .../install.sh | sh                 <span class="tk-gray"># CLI + daemon binaries only</span>
+<span class="tk-gray">$</span> OXID_DATA_DIR=~/.oxid oxidd                    <span class="tk-gray"># bare binary</span>
+<span class="tk-gray">$</span> docker run -d -v /var/run/docker.sock:/var/run/docker.sock \
+    -v oxid-data:/data -p 8080:8080 \
+    -e OXID_API_TOKEN=$(openssl rand -hex 32) \
+    -e OXID_WEBHOOK_SECRET=$(openssl rand -hex 32) \
+    ghcr.io/sazardev/oxid:latest</code></pre>
         </div>
-        <p class="note">
-          Docker is required on the daemon host. The CLI only needs network access to the daemon
-          — it can run from anywhere, pointed at any daemon via <code>--api</code> or a
-          <a href="cli.html#cli-context">context</a>.
-        </p>
+        <p class="note">See <a href="daemon.html">Daemon → Environment variables</a> for every knob, and <a href="../#install">Home → Install</a> for the marketing one-pager.</p>
       </section>
 
       <p class="docs-footer-note">

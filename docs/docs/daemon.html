@@ -39,6 +39,7 @@
       <nav>
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
+        <a href="install.html">Install</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html" class="current">Daemon</a>
@@ -62,9 +63,11 @@
             <tr><td><code>OXID_ADDR</code></td><td><code>0.0.0.0:8080</code></td><td>Bind address.</td></tr>
             <tr><td><code>OXID_GC_INTERVAL_SECS</code></td><td><code>30</code></td><td>Scheduler tick for GC / deploy-queue retries.</td></tr>
             <tr><td><code>OXID_MASTER_KEY</code></td><td>generated</td><td>64-hex master key for secret encryption; generated + persisted to <code>secret.key</code> (0600) when unset.</td></tr>
-            <tr><td><code>OXID_API_TOKEN</code></td><td>unset</td><td>Bearer token required on <code>/api/v1/*</code>. Unset = open API (fine on localhost).</td></tr>
-            <tr><td><code>OXID_WEBHOOK_SECRET</code></td><td>unset</td><td>HMAC-SHA256 secret for GitHub webhooks; webhooks rejected while unset.</td></tr>
-            <tr><td><code>OXID_DOCKER_NETWORK</code></td><td>unset</td><td>Shared network with Traefik: containers get subdomains instead of host ports, and scale-to-zero wake-on-request activates.</td></tr>
+            <tr><td><code>OXID_API_TOKEN</code></td><td>unset</td><td>Bearer token required on <code>/api/v1/*</code>. Unset = open API (fine on localhost) — or set <code>OXID_AUTO_TOKEN=1</code> to auto-generate and persist it (printed once to logs).</td></tr>
+            <tr><td><code>OXID_ALLOW_OPEN_API</code></td><td><code>0</code></td><td><code>1</code> to let a non-loopback daemon start without <code>OXID_API_TOKEN</code> (explicit opt-in to an unauthenticated API).</td></tr>
+            <tr><td><code>OXID_AUTO_TOKEN</code></td><td><code>0</code></td><td><code>1</code> for zero-config starts: any of <code>OXID_API_TOKEN</code> / <code>OXID_WEBHOOK_SECRET</code> not set is generated (64 hex), persisted under <code>{data}/</code> (0600) and printed <strong>once</strong> — the shipped <code>docker-compose.yml</code> uses this so <code>docker compose up -d</code> works with no <code>.env</code>.</td></tr>
+            <tr><td><code>OXID_WEBHOOK_SECRET</code></td><td>unset</td><td>HMAC-SHA256 secret for GitHub/GitLab/Gitea/Gogs webhooks; webhooks rejected while unset (or auto-generated with <code>OXID_AUTO_TOKEN=1</code>).</td></tr>
+            <tr><td><code>OXID_DOCKER_NETWORK</code></td><td>unset</td><td>Shared network with Traefik: containers get subdomains instead of host ports, and scale-to-zero wake-on-request activates. The wizard's infra step bootstraps this with one click (<code>POST /api/v1/infra/bootstrap</code>).</td></tr>
             <tr><td><code>OXID_DAEMON_URL</code></td><td><code>http://oxid-daemon:8080</code></td><td>The daemon's own address inside <code>OXID_DOCKER_NETWORK</code> (Traefik forwardAuth labels).</td></tr>
             <tr><td><code>OXID_POSTGRES_URL</code></td><td>unset</td><td>Admin connection string for a shared Postgres — per-branch logical databases for projects declaring the dependency.</td></tr>
             <tr><td><code>OXID_REDIS_URL</code></td><td>unset</td><td>Base URL of a shared Redis; per-branch logical databases.</td></tr>
@@ -73,7 +76,9 @@
             <tr><td><code>OXID_DEFAULT_CPU_LIMIT_MILLICORES</code></td><td><code>1000</code></td><td>Fallback container CPU limit; <code>0</code> disables.</td></tr>
             <tr><td><code>OXID_RESERVED_MEMORY_MB</code></td><td><code>1024</code></td><td>Host memory reserved before admission control starts queueing deploys; <code>0</code> disables queueing.</td></tr>
             <tr><td><code>OXID_TLS_CERT</code> / <code>OXID_TLS_KEY</code></td><td>unset</td><td>PEM paths — when both are set the daemon serves HTTPS directly.</td></tr>
-            <tr><td><code>OXID_ALLOW_RESTORE</code></td><td><code>0</code></td><td><code>1</code> to accept <code>POST /api/v1/backup/restore</code> uploads at all.</td></tr>
+            <tr><td><code>OXID_ALLOW_RESTORE</code></td><td><code>0</code></td><td><code>1</code> to accept <code>POST /api/v1/backup/restore</code> uploads at all (staged, applied on next restart).</td></tr>
+            <tr><td><code>OXID_BACKUP_INTERVAL_SECS</code></td><td>unset</td><td>When set (e.g. <code>300</code>), periodic <code>VACUUM INTO</code> snapshots to <code>{data}/backups/</code>.</td></tr>
+            <tr><td><code>OXID_BACKUP_KEEP</code></td><td><code>7</code></td><td>Newest snapshots to keep when backups are enabled.</td></tr>
             <tr><td><code>OXID_RATE_LIMIT_PER_SECOND</code> / <code>_BURST</code></td><td>unset</td><td>When both are set, token-bucket rate limit on protected routes (per client IP).</td></tr>
             <tr><td><code>RUST_LOG</code></td><td><code>info</code></td><td>Tracing filter, e.g. <code>oxid_daemon=debug,info</code>.</td></tr>
             <tr><td><code>OXID_LOG_FORMAT</code></td><td><code>pretty</code></td><td><code>pretty</code> or <code>json</code> (one object per line — use in production).</td></tr>
@@ -92,7 +97,10 @@
         <pre class="cmd-block">/data
 ├── audit.sqlite      <span class="tk-gray"># all state + audit trail (WAL mode)</span>
 ├── secret.key        <span class="tk-gray"># AES-GCM master key, mode 0600</span>
-└── git-cache/        <span class="tk-gray"># cached clones, one dir per project</span></pre>
+├── api-token         <span class="tk-gray"># auto-generated when OXID_AUTO_TOKEN=1 (0600)</span>
+├── webhook-secret    <span class="tk-gray"># auto-generated when OXID_AUTO_TOKEN=1 (0600)</span>
+├── git-cache/        <span class="tk-gray"># cached clones, one dir per project</span>
+└── backups/          <span class="tk-gray"># VACUUM INTO snapshots when OXID_BACKUP_INTERVAL_SECS is set</span></pre>
         <p class="note">
           A restore never touches the live database in place — an upload is staged and applied
           on the next daemon startup.

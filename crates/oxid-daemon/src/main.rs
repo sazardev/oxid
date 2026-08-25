@@ -42,6 +42,15 @@
 //!   without `OXID_API_TOKEN`. The startup warning still prints; this flag
 //!   exists so an operator behind their own network controls can choose the
 //!   old behavior deliberately instead of being locked out by the gate.
+//! - `OXID_AUTO_TOKEN` — set to `1` for zero-config starts (`docker compose
+//!   up -d` with no `.env`): any of `OXID_API_TOKEN`/`OXID_WEBHOOK_SECRET`
+//!   that isn't explicitly set is generated (64 hex chars), persisted under
+//!   `{OXID_DATA_DIR}/` (`api-token`, `webhook-secret`; owner-only on unix)
+//!   so restarts reuse it, and printed **exactly once** to the log — that
+//!   one printout is the retrieval channel from a distroless container,
+//!   which has no shell to cat the file with. Explicit env values always
+//!   win; without the flag behavior is unchanged (including the refusal to
+//!   start unauthenticated on a non-loopback bind).
 //! - `OXID_POSTGRES_URL` — admin connection string for a shared Postgres
 //!   instance (SPEC.md §3.1). When set, projects declaring a `postgres`
 //!   dependency get a per-branch logical database instead of failing to
@@ -228,8 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(oxid_daemon::service::backup::run(cp.clone(), backup_config));
     }
 
-    let webhook_secret = std::env::var("OXID_WEBHOOK_SECRET").ok();
-    let api_token = std::env::var("OXID_API_TOKEN").ok();
+    let (webhook_secret, api_token, auto_token) = resolve_bootstrap_credentials(&data_dir_path)?;
     enforce_startup_security_posture(&addr, api_token.as_ref());
     let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
     let rate_limit = rate_limit_from_env();
@@ -240,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         data_dir: data_dir_path,
         allow_restore,
         rate_limit,
+        auto_token,
     });
     lower_oom_score();
     serve(app, &addr, &data_dir, gc_interval_secs).await
@@ -422,6 +431,96 @@ fn bind_is_loopback(addr: &str) -> bool {
     }
 }
 
+/// Resolves the two control-plane credentials, honoring explicit env values
+/// first: `(webhook_secret, api_token, auto_token)`.
+///
+/// With `OXID_AUTO_TOKEN=1` any credential that wasn't supplied is generated
+/// and persisted (see [`credential`]) — the zero-config path the shipped
+/// `docker-compose.yml` takes. Without the flag both fall back to plain env
+/// reads and behavior is exactly as before.
+fn resolve_bootstrap_credentials(
+    data_dir: &std::path::Path,
+) -> std::io::Result<(Option<String>, Option<String>, bool)> {
+    let auto = std::env::var("OXID_AUTO_TOKEN").as_deref() == Ok("1");
+    let api_token = credential(
+        std::env::var("OXID_API_TOKEN").ok(),
+        auto,
+        &data_dir.join("api-token"),
+        "API token",
+    )?;
+    let webhook_secret = credential(
+        std::env::var("OXID_WEBHOOK_SECRET").ok(),
+        auto,
+        &data_dir.join("webhook-secret"),
+        "webhook secret",
+    )?;
+    Ok((webhook_secret, api_token, auto))
+}
+
+/// Resolves one credential: an explicitly-set value always wins; otherwise
+/// with `auto` it is loaded from `path` or, on a first run, generated
+/// (64 hex chars), persisted there owner-only, and printed to the log.
+///
+/// The one-time printout is a deliberate, documented exception to the
+/// "secrets never in logs" rule: it happens **only at generation** (a reused
+/// file logs nothing but its path), and it exists because the retrieval
+/// channel for a distroless container — no shell, no `cat` — is precisely
+/// `docker compose logs`. Anyone who can read those logs can already
+/// `docker cp` the same 0600 file off the volume, so printing once at
+/// bootstrap grants nothing the socket mount didn't already.
+fn credential(
+    explicit: Option<String>,
+    auto: bool,
+    path: &std::path::Path,
+    label: &str,
+) -> std::io::Result<Option<String>> {
+    if let Some(value) = explicit.filter(|v| !v.trim().is_empty()) {
+        return Ok(Some(value));
+    }
+    if !auto {
+        return Ok(None);
+    }
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            tracing::info!(path = %path.display(), "reusing existing {label}");
+            return Ok(Some(trimmed.to_owned()));
+        }
+    }
+    let value = generate_hex_secret();
+    std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
+    std::fs::write(path, &value)?;
+    restrict_to_owner(path)?;
+    eprintln!(
+        "[oxid] Generated {label} (persisted at {}, owner-only):\n\n    {value}\n\n\
+         Printed once — retrieve later from that file, e.g.:\n  \
+         docker compose cp oxid-daemon:{path_display} -",
+        path.display(),
+        path_display = path.display(),
+    );
+    Ok(Some(value))
+}
+
+/// 64 hex chars of OS entropy — same strength class as the secrets
+/// `install.sh` generates.
+fn generate_hex_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// The startup security posture, enforced before anything binds:
 ///
 /// 1. **Open-API gate** — an open control API is fine on loopback, but a
@@ -512,7 +611,7 @@ fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::e
 
 #[cfg(test)]
 mod tests {
-    use super::bind_is_loopback;
+    use super::{bind_is_loopback, credential, generate_hex_secret};
 
     #[test]
     fn loopback_literals_are_loopback() {
@@ -537,5 +636,73 @@ mod tests {
         // the daemon would otherwise start open on an address nobody can
         // pin down.
         assert!(!bind_is_loopback("no-such-host.invalid:8080"));
+    }
+
+    #[test]
+    fn explicit_value_always_wins_over_auto_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        let resolved = credential(Some("explicit".to_owned()), true, &path, "API token")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, "explicit");
+        assert!(!path.exists(), "nothing should be written when env is set");
+    }
+
+    #[test]
+    fn auto_generates_persists_and_reuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+
+        let first = credential(None, true, &path, "API token").unwrap().unwrap();
+        assert_eq!(first.len(), 64, "64 hex chars");
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "generated credential must be owner-only");
+        }
+
+        // A second run (restart) must reuse the persisted value — never
+        // rotate it behind the operator's back.
+        let second = credential(None, true, &path, "API token").unwrap().unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn without_auto_flag_unset_env_resolves_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        assert!(
+            credential(None, false, &path, "API token")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn generated_secrets_are_unique() {
+        assert_ne!(generate_hex_secret(), generate_hex_secret());
+    }
+
+    #[test]
+    fn blank_explicit_value_falls_through_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        let resolved = credential(Some("   ".to_owned()), true, &path, "API token")
+            .unwrap()
+            .expect("auto mode must still resolve");
+        assert_eq!(resolved.len(), 64);
+    }
+
+    #[test]
+    fn reuse_reads_trimmed_file_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token");
+        std::fs::write(&path, "abc123\n").unwrap();
+        let resolved = credential(None, true, &path, "API token").unwrap().unwrap();
+        assert_eq!(resolved, "abc123");
     }
 }

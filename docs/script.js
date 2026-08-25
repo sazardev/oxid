@@ -16,6 +16,29 @@
     });
   }
 
+  const copyable = document.querySelectorAll(".qs-cmd");
+  copyable.forEach((el) => {
+    el.title = "Click to copy";
+    el.addEventListener("click", async () => {
+      const text = el.textContent.replace(/^\$\s?/, "").trim();
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      el.classList.add("qs-copied");
+      setTimeout(() => el.classList.remove("qs-copied"), 1200);
+    });
+  });
+
   const revealTargets = document.querySelectorAll(
     ".card, .feature, .timeline li, .interface-card, .terminal"
   );

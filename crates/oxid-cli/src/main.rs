@@ -41,6 +41,16 @@ enum Command {
     Up {
         /// Branch to deploy.
         branch: String,
+        /// Register this remote repository URL instead of the current
+        /// directory — how you register against a containerized daemon
+        /// that can't see your checkout. scp-style remotes
+        /// (`git@host:org/repo.git`) are normalized server-side.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Access token for a *private* `--repo` (HTTPS PAT); stored
+        /// encrypted on the daemon, never echoed back. Requires `--repo`.
+        #[arg(long)]
+        git_token: Option<String>,
     },
     /// Redeploy a branch at a prior commit instead of its current head.
     Rollback {
@@ -594,7 +604,20 @@ async fn main() {
     };
 
     let result = match cli.command {
-        Command::Up { branch } => cmd_up(&client, &base, &branch).await,
+        Command::Up {
+            branch,
+            repo,
+            git_token,
+        } => {
+            cmd_up(
+                &client,
+                &base,
+                &branch,
+                repo.as_deref(),
+                git_token.as_deref(),
+            )
+            .await
+        }
         Command::Rollback { branch, to } => {
             cmd_rollback(&client, &base, &branch, to.as_deref()).await
         }
@@ -716,23 +739,52 @@ async fn main() {
 /// project.
 async fn register_project(client: &Client, base: &str) -> Result<Value, CliError> {
     let repo_dir = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
+    register_with_body(
+        client,
+        base,
+        json!({ "repo_dir": repo_dir.display().to_string() }),
+    )
+    .await
+}
+
+/// Registers a project straight from a remote URL — the daemon clones it
+/// into its own git cache (optionally authenticating with `git_token` for
+/// private repos).
+async fn register_project_by_url(
+    client: &Client,
+    base: &str,
+    repo_url: &str,
+    git_token: Option<&str>,
+) -> Result<Value, CliError> {
+    let mut body = json!({ "repo_url": repo_url });
+    if let Some(token) = git_token.filter(|t| !t.is_empty()) {
+        body["git_token"] = json!(token);
+    }
+    register_with_body(client, base, body).await
+}
+
+async fn register_with_body(client: &Client, base: &str, body: Value) -> Result<Value, CliError> {
     let url = format!("{base}/api/v1/projects");
     let response = client
         .post(&url)
-        .json(&json!({ "repo_dir": repo_dir.display().to_string() }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| connect_error(&url, &e))?;
     let status = response.status();
-    let body = response
+    let response_body = response
         .text()
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        return Err(response_error(&body, status, "project registration failed"));
+        return Err(response_error(
+            &response_body,
+            status,
+            "project registration failed",
+        ));
     }
-    let project: Value =
-        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    let project: Value = serde_json::from_str(&response_body)
+        .map_err(|e| format!("invalid daemon response: {e}"))?;
     Ok(project)
 }
 
@@ -787,9 +839,24 @@ async fn resolve_environment(
     Ok((env_id, env.clone()))
 }
 
-async fn cmd_up(client: &Client, base: &str, branch: &str) -> Result<(), CliError> {
+async fn cmd_up(
+    client: &Client,
+    base: &str,
+    branch: &str,
+    repo: Option<&str>,
+    git_token: Option<&str>,
+) -> Result<(), CliError> {
+    if git_token.is_some() && repo.is_none() {
+        return Err(CliError::new(
+            "--git-token requires --repo <url>",
+            EXIT_GENERIC,
+        ));
+    }
     action(format!("oxid up {branch}"));
-    let project = register_project(client, base).await?;
+    let project = match repo {
+        Some(url) => register_project_by_url(client, base, url, git_token).await?,
+        None => register_project(client, base).await?,
+    };
     let project_id = project["id"]
         .as_u64()
         .ok_or_else(|| "daemon response missing project id".to_owned())?;
@@ -2216,8 +2283,42 @@ mod tests {
     fn parses_up_command() {
         let cli = Cli::try_parse_from(["oxid", "up", "feature-login"]).unwrap();
         match cli.command {
-            Command::Up { branch } => assert_eq!(branch, "feature-login"),
+            Command::Up {
+                branch,
+                repo,
+                git_token,
+            } => {
+                assert_eq!(branch, "feature-login");
+                assert_eq!(repo, None);
+                assert_eq!(git_token, None);
+            }
             other => panic!("expected Up, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_up_with_remote_repo_and_token() {
+        let cli = Cli::try_parse_from([
+            "oxid",
+            "up",
+            "main",
+            "--repo",
+            "git@github.com:org/app.git",
+            "--git-token",
+            "ghp-abc",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Up {
+                branch,
+                repo,
+                git_token,
+            } => {
+                assert_eq!(branch, "main");
+                assert_eq!(repo.as_deref(), Some("git@github.com:org/app.git"));
+                assert_eq!(git_token.as_deref(), Some("ghp-abc"));
+            }
+            other => panic!("expected Up --repo, got {other:?}"),
         }
     }
 

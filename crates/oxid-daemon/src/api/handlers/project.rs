@@ -17,10 +17,7 @@ use std::path::PathBuf;
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::middleware::{AuthedAs, authorize_project, operator_scopes, require_unscoped};
-use crate::api::types::{
-    AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
-    SecretDeleteQuery, SecretListQuery,
-};
+use crate::api::types::{RegisterBody, RegistrationSource};
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -49,16 +46,21 @@ pub async fn register_project<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RegisterBody>,
 ) -> ApiResult<(StatusCode, Json<Project>)> {
+    let source = body.into_source()?;
     // `oxid up` registers first on every run (idempotent by repo URL), so a
     // scoped token must still be able to *resolve* its own project here —
     // it just may never CREATE one. In scope: return the project. Out of
     // scope: 404, indistinguishable from "doesn't exist". Brand-new repo:
-    // 403 with the reason.
+    // 403 with the reason. The URL form resolves by exact `repo_url` match
+    // — deliberately before any clone, so a scoped token can't even make
+    // the daemon fetch an arbitrary remote.
     if let Some(scopes) = operator_scopes(authed.as_ref()) {
-        let existing = state
-            .cp
-            .project_for_repo(std::path::Path::new(&body.repo_dir))
-            .await?;
+        let existing = match &source {
+            RegistrationSource::Dir { dir, .. } => {
+                state.cp.project_for_repo(std::path::Path::new(dir)).await?
+            }
+            RegistrationSource::Url { url, .. } => state.cp.project_for_repo_url(url).await?,
+        };
         match existing {
             Some(project) if scopes.contains(&project.id.0) => {
                 return Ok((StatusCode::CREATED, Json(project)));
@@ -73,11 +75,46 @@ pub async fn register_project<
             }
         }
     }
-    let project = state
-        .cp
-        .register_project(std::path::Path::new(&body.repo_dir))
-        .await?;
+    let project = match source {
+        RegistrationSource::Dir { dir, git_token } => {
+            let project = state
+                .cp
+                .register_project(std::path::Path::new(&dir))
+                .await?;
+            apply_git_token(&state, project.id, git_token).await;
+            project
+        }
+        // The URL form persists its token inside `register_project_by_url`
+        // itself — atomically with the create.
+        RegistrationSource::Url { url, git_token } => {
+            state
+                .cp
+                .register_project_by_url(&url, git_token.as_deref())
+                .await?
+        }
+    };
     Ok((StatusCode::CREATED, Json(project)))
+}
+
+/// Applies a post-registration `git_token` for the `repo_dir` form (the URL
+/// form persists it inside `register_project_by_url` itself, atomically with
+/// the create). A no-op unless a non-empty token came along.
+async fn apply_git_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    state: &ApiState<G, O>,
+    project_id: ProjectId,
+    git_token: Option<String>,
+) {
+    if let Some(token) = git_token.as_deref().filter(|t| !t.is_empty()) {
+        // Best-effort: the project row exists either way; surface the
+        // failure in the response rather than silently dropping it.
+        let _ = state
+            .cp
+            .set_project_git_token(project_id, Some(token))
+            .await;
+    }
 }
 
 pub async fn list_projects<

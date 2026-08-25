@@ -107,6 +107,11 @@ pub struct ApiState<
     /// so there it degrades back to one shared bucket; see the extractor's
     /// doc comment for why `X-Forwarded-For` is deliberately not trusted.
     pub rate_limit: Option<(u64, u32)>,
+    /// Whether this daemon was started with `OXID_AUTO_TOKEN=1` — reported
+    /// by the public `GET /api/v1/setup/status` so the onboarding wizard can
+    /// point at the exact retrieval command (`docker compose logs …`)
+    /// instead of generic "ask your operator" advice.
+    pub auto_token: bool,
 }
 
 /// Builds the API router. Every route except `/health`, `/webhooks/github`,
@@ -185,6 +190,13 @@ pub fn router<
         .route("/api/v1/rotate-key", post(handlers::tokens::rotate_key))
         .route("/api/v1/audit", get(handlers::audit::recent_audit))
         .route("/api/v1/queue", get(handlers::audit::list_queue))
+        // Master-only: reveals the (env-provided or auto-generated) webhook
+        // secret so the wizard can hand it over for the Git host config —
+        // same trust level as `GET /api/v1/backup`, which ships `secret.key`.
+        .route(
+            "/api/v1/setup/webhook-secret",
+            get(handlers::setup::webhook_secret),
+        )
         .route("/api/v1/stats", get(handlers::infra::stats))
         .route("/api/v1/infra/status", get(handlers::infra::infra_status))
         // Idempotent and safe to re-run: creates the Docker network/Traefik
@@ -225,6 +237,10 @@ pub fn router<
 
     Router::new()
         .route("/api/v1/health", get(health))
+        // Public, pre-auth onboarding probe: non-sensitive booleans only
+        // (see `handlers::setup::setup_status`). The wizard calls this
+        // before any token exists to decide what to ask for.
+        .route("/api/v1/setup/status", get(handlers::setup::setup_status))
         .route("/", get(dashboard_index))
         .route("/index.html", get(dashboard_index))
         .route("/style.css", get(dashboard_style))

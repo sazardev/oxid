@@ -26,8 +26,8 @@ use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
-    Ttl,
+    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepoUrl, RepositoryError,
+    StateTransition, Ttl,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -44,10 +44,100 @@ use crate::{ControlPlane, CpError, DeployOutcome};
 use super::error::{ApiError, ApiResult};
 
 /// Body for `POST /api/v1/projects`.
+///
+/// Exactly one of:
+/// - `repo_dir` — a checkout the daemon can read (how `oxid up` registers
+///   its cwd against a locally-run daemon), or
+/// - `repo_url` — any remote the daemon clones itself into its git cache
+///   (how the dashboard's onboarding wizard registers against a
+///   containerized daemon; private repos pass `git_token`).
+///
+/// must be present. Sending both or neither is a 400.
 #[derive(Debug, Deserialize)]
 pub struct RegisterBody {
     /// Path to the repository containing `oxid.toml`.
-    pub repo_dir: String,
+    pub repo_dir: Option<String>,
+    /// Remote repository URL (`https://…`, `ssh://…`, or scp-style
+    /// `git@host:org/repo.git`, which is normalized server-side).
+    pub repo_url: Option<String>,
+    /// Write-only access token for a *private* repository — encrypted at
+    /// rest alongside the project row, never echoed back by any response.
+    pub git_token: Option<String>,
+}
+
+/// The validated form of a [`RegisterBody`].
+#[derive(Debug)]
+pub(crate) enum RegistrationSource {
+    Dir {
+        dir: String,
+        git_token: Option<String>,
+    },
+    Url {
+        url: RepoUrl,
+        git_token: Option<String>,
+    },
+}
+
+impl RegisterBody {
+    /// Validates exactly-one-of and normalizes scp-style remotes.
+    ///
+    /// # Errors
+    /// [`ApiError`] 400 when both/neither source is given or the URL fails
+    /// `RepoUrl::parse`.
+    pub(crate) fn into_source(self) -> ApiResult<RegistrationSource> {
+        let dir = self
+            .repo_dir
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        let url = self
+            .repo_url
+            .map(|v| normalize_git_url(&v))
+            .filter(|v| !v.is_empty());
+        match (dir, url) {
+            (Some(dir), None) => Ok(RegistrationSource::Dir {
+                dir,
+                git_token: self.git_token,
+            }),
+            (None, Some(url)) => {
+                let url = RepoUrl::parse(url.clone())
+                    .map_err(|e| ApiError::from_validation(format!("invalid `repo_url`: {e}")))?;
+                Ok(RegistrationSource::Url {
+                    url,
+                    git_token: self.git_token,
+                })
+            }
+            (Some(_), Some(_)) => Err(ApiError::from_validation(
+                "pass either `repo_dir` or `repo_url`, not both",
+            )),
+            (None, None) => Err(ApiError::from_validation(
+                "missing `repo_url` (remote to clone) or `repo_dir` (checkout path)",
+            )),
+        }
+    }
+}
+
+/// Normalizes scp-style git remotes into the explicit scheme form
+/// `RepoUrl::parse` requires: `git@github.com:org/repo.git` becomes
+/// `ssh://git@github.com/org/repo.git`. Everything else passes through
+/// unchanged (absolute paths included — those belong in `repo_dir`
+/// anyway; the conservative `@` requirement keeps odd inputs from being
+/// silently mangled).
+fn normalize_git_url(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.contains("://") || raw.starts_with('/') {
+        return raw.to_owned();
+    }
+    match raw.split_once(':') {
+        Some((user_host, path))
+            if !path.is_empty()
+                && !user_host.is_empty()
+                && !user_host.contains('/')
+                && user_host.contains('@') =>
+        {
+            format!("ssh://{user_host}/{path}")
+        }
+        _ => raw.to_owned(),
+    }
 }
 
 /// Body for `POST /api/v1/projects/{id}/deploy`.
@@ -174,4 +264,73 @@ pub struct SecretDeleteQuery {
 pub struct SecretListQuery {
     /// Branch scope to list.
     pub branch: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegisterBody, RegistrationSource, normalize_git_url};
+
+    fn source_of(json: serde_json::Value) -> Result<RegistrationSource, ()> {
+        let body: RegisterBody = serde_json::from_value(json).unwrap();
+        body.into_source().map_err(|_| ())
+    }
+
+    #[test]
+    fn scp_style_urls_are_normalized_to_ssh() {
+        assert_eq!(
+            normalize_git_url("git@github.com:org/repo.git"),
+            "ssh://git@github.com/org/repo.git"
+        );
+        assert_eq!(
+            normalize_git_url("  git@github.com:org/repo.git  "),
+            "ssh://git@github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn other_url_shapes_pass_through_unchanged() {
+        assert_eq!(
+            normalize_git_url("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            normalize_git_url("ssh://git@host/x/y.git"),
+            "ssh://git@host/x/y.git"
+        );
+    }
+
+    #[test]
+    fn colon_forms_without_a_user_are_not_mangled() {
+        // A bare `host:path` or an absolute path must not be guessed into
+        // an scp remote — the `@` requirement keeps the transform tight.
+        assert_eq!(
+            normalize_git_url("github.com:org/repo.git"),
+            "github.com:org/repo.git"
+        );
+        assert_eq!(normalize_git_url("/srv/git/repo.git"), "/srv/git/repo.git");
+    }
+
+    #[test]
+    fn exactly_one_source_is_accepted() {
+        assert!(matches!(
+            source_of(serde_json::json!({ "repo_dir": "/repos/app" })),
+            Ok(RegistrationSource::Dir { .. })
+        ));
+        assert!(matches!(
+            source_of(serde_json::json!({ "repo_url": "https://x.org/a.git" })),
+            Ok(RegistrationSource::Url { .. })
+        ));
+        assert!(source_of(serde_json::json!({})).is_err());
+        assert!(
+            source_of(serde_json::json!({ "repo_dir": "/a", "repo_url": "https://x.org/a.git" }))
+                .is_err()
+        );
+        // Blank strings count as absent:
+        assert!(source_of(serde_json::json!({ "repo_dir": "   " })).is_err());
+    }
+
+    #[test]
+    fn invalid_repo_url_is_a_validation_error() {
+        assert!(source_of(serde_json::json!({ "repo_url": "not-a-url" })).is_err());
+    }
 }

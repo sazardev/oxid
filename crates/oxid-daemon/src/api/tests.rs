@@ -13,7 +13,30 @@ use oxid_core::ProjectStore;
 const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
 #[derive(Debug, Clone, Default)]
-struct FakeGit;
+struct FakeGit {
+    /// Directory `ensure_repo` reports as the cloned cache entry. `None`
+    /// keeps the legacy `cache_dir/app` behavior for older tests.
+    checkout: Option<std::path::PathBuf>,
+    /// When set, `ensure_repo` fails with this message — simulating an
+    /// unreachable remote / rejected token at registration time.
+    ensure_error: Option<String>,
+}
+
+impl FakeGit {
+    fn at(dir: &std::path::Path) -> Self {
+        Self {
+            checkout: Some(dir.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    fn unreachable(message: &str) -> Self {
+        Self {
+            ensure_error: Some(message.to_owned()),
+            ..Self::default()
+        }
+    }
+}
 
 impl GitPort for FakeGit {
     async fn remote_url(&self, repo_dir: &std::path::Path) -> Result<RepoUrl, GitError> {
@@ -27,7 +50,13 @@ impl GitPort for FakeGit {
         _token: Option<&str>,
         cache_dir: &std::path::Path,
     ) -> Result<std::path::PathBuf, GitError> {
-        Ok(cache_dir.join("app"))
+        if let Some(message) = &self.ensure_error {
+            return Err(GitError::Failure(message.clone()));
+        }
+        Ok(self
+            .checkout
+            .clone()
+            .unwrap_or_else(|| cache_dir.join("app")))
     }
     async fn resolve_branch_head(
         &self,
@@ -182,8 +211,13 @@ async fn test_app() -> (Router, FakeOci) {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
     let oci = FakeOci::default();
-    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        oci.clone(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     (
         router(ApiState {
             cp,
@@ -192,6 +226,7 @@ async fn test_app() -> (Router, FakeOci) {
             data_dir: test_data_dir(),
             allow_restore: true,
             rate_limit: None,
+            auto_token: false,
         }),
         oci,
     )
@@ -201,9 +236,14 @@ async fn test_app_with_traefik() -> (Router, FakeOci) {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
     let oci = FakeOci::default();
-    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
-        .with_readiness_check(false)
-        .with_traefik("oxid-net", "http://oxid-daemon:8080");
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        oci.clone(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false)
+    .with_traefik("oxid-net", "http://oxid-daemon:8080");
     (
         router(ApiState {
             cp,
@@ -212,6 +252,7 @@ async fn test_app_with_traefik() -> (Router, FakeOci) {
             data_dir: test_data_dir(),
             allow_restore: true,
             rate_limit: None,
+            auto_token: false,
         }),
         oci,
     )
@@ -220,8 +261,13 @@ async fn test_app_with_traefik() -> (Router, FakeOci) {
 async fn test_app_with_token(token: &str) -> Router {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -229,6 +275,7 @@ async fn test_app_with_token(token: &str) -> Router {
         data_dir: test_data_dir(),
         allow_restore: true,
         rate_limit: None,
+        auto_token: false,
     })
 }
 
@@ -244,10 +291,15 @@ async fn test_app_with_admission_control(
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
     let oci = FakeOci::default();
-    let cp = ControlPlane::new(store, FakeGit, oci.clone(), cache.path().to_owned())
-        .with_resource_defaults(Some(default_mem_mb), None)
-        .with_admission_control(Some(reserved_mb))
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        oci.clone(),
+        cache.path().to_owned(),
+    )
+    .with_resource_defaults(Some(default_mem_mb), None)
+    .with_admission_control(Some(reserved_mb))
+    .with_readiness_check(false);
     (
         router(ApiState {
             cp,
@@ -256,6 +308,7 @@ async fn test_app_with_admission_control(
             data_dir: test_data_dir(),
             allow_restore: true,
             rate_limit: None,
+            auto_token: false,
         }),
         oci,
     )
@@ -498,6 +551,315 @@ async fn infra_status_and_bootstrap_endpoints_round_trip() {
     assert_eq!(after["network_exists"], true);
 }
 
+/// Same as `test_app_with_token`, started in zero-config (`OXID_AUTO_TOKEN=1`)
+/// mode — what the shipped `docker-compose.yml` runs with.
+async fn test_app_auto_token(token: &str) -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some(token.to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        rate_limit: None,
+        auto_token: true,
+    })
+}
+
+#[tokio::test]
+async fn setup_status_is_public_and_reports_configuration() {
+    let (app, _) = test_app().await;
+    // Deliberately unauthenticated — this is the pre-token onboarding probe.
+    let (status, body) = json_request(&app, "GET", "/api/v1/setup/status", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(!value["version"].as_str().unwrap().is_empty());
+    assert_eq!(value["auth_required"], false);
+    assert_eq!(value["auto_token"], false);
+    assert_eq!(value["webhook_secret_configured"], true);
+}
+
+#[tokio::test]
+async fn setup_status_stays_public_behind_the_token_gate() {
+    let app = test_app_auto_token("s3cr3t").await;
+    let (status, body) = json_request(&app, "GET", "/api/v1/setup/status", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["auth_required"], true);
+    assert_eq!(value["auto_token"], true);
+}
+
+#[tokio::test]
+async fn webhook_secret_requires_master_and_reveals_value_to_it() {
+    let app = test_app_auto_token("master-secret").await;
+
+    let (status, _) = json_request(&app, "GET", "/api/v1/setup/webhook-secret", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/setup/webhook-secret",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["webhook_secret"], "test-secret");
+}
+
+/// A named operator — even an *unscoped* one — must not learn the webhook
+/// secret: knowing it means being able to forge `push` events that deploy
+/// arbitrary branches. Master credential only.
+#[tokio::test]
+async fn webhook_secret_is_hidden_from_named_operators() {
+    let app = test_app_with_token("master-secret").await;
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let alice = created["token"].as_str().unwrap().to_owned();
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/setup/webhook-secret",
+        json!({}),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn webhook_secret_reports_404_when_nothing_is_configured() {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: None,
+        api_token: None,
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        rate_limit: None,
+        auto_token: false,
+    });
+    let (status, body) = json_request(&app, "GET", "/api/v1/setup/webhook-secret", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("OXID_WEBHOOK_SECRET")
+    );
+}
+
+/// A router around a `ControlPlane` with a caller-controlled [`FakeGit`] —
+/// for exercising registration-by-URL without a real remote. When
+/// `api_token` is `Some`, every master-level call must carry it.
+async fn test_app_with_git_and_token(git: FakeGit, api_token: Option<&str>) -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(store, git, FakeOci::default(), cache.path().to_owned())
+        .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: None,
+        api_token: api_token.map(str::to_owned),
+        data_dir: test_data_dir(),
+        allow_restore: true,
+        rate_limit: None,
+        auto_token: false,
+    })
+}
+
+/// Open-API variant (no bearer gate) for tests that don't touch credentials.
+async fn test_app_with_git(git: FakeGit) -> Router {
+    test_app_with_git_and_token(git, None).await
+}
+
+#[tokio::test]
+async fn registering_by_url_clones_parses_and_is_idempotent() {
+    let repo = repo_dir_with_config();
+    // The daemon normalizes scp-style input server-side before anything
+    // touches `RepoUrl::parse`:
+    let app = test_app_with_git(FakeGit::at(repo.path())).await;
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "git@github.com:org/app.git", "git_token": "ghp-secret" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(project["name"], "app");
+    assert_eq!(project["repo_url"], "ssh://git@github.com/org/app.git");
+
+    // Idempotent by exact (normalized) repo URL — re-registering returns
+    // the same project row instead of erroring or duplicating:
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "ssh://git@github.com/org/app.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let again: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(again["id"], project["id"]);
+}
+
+#[tokio::test]
+async fn registering_by_unreachable_url_fails_eagerly_with_a_400() {
+    let app = test_app_with_git(FakeGit::unreachable("authentication failed")).await;
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/org/private.git", "git_token": "bad" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let message = value["error"].as_str().unwrap_or_default();
+    assert!(message.contains("cannot fetch"), "got: {message}");
+    assert!(
+        message.contains("with the provided git token"),
+        "got: {message}"
+    );
+    // And nothing was registered:
+    let (status, body) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), json!([]));
+}
+
+#[tokio::test]
+async fn registering_by_url_rejects_structurally_bad_input_before_any_clone() {
+    let repo = repo_dir_with_config();
+    let app = test_app_with_git(FakeGit::at(repo.path())).await;
+
+    // Both sources:
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": "/repos/app", "repo_url": "https://github.com/org/app.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Neither:
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "git_token": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Not a URL:
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "not-a-url" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A scoped operator must be able to *resolve* its own project by URL
+/// (same right it has with `repo_dir`) but never trigger a clone of a new
+/// remote — resolution happens before any fetch, and new registration
+/// stays 403.
+#[tokio::test]
+async fn scoped_operator_resolves_own_project_by_url_without_cloning_new_ones() {
+    const MASTER: &str = "master-secret";
+    let repo = repo_dir_with_config();
+
+    // Master (a *configured* API token this time — the scoped branch of the
+    // handler only triggers when auth is actually enforced) registers the
+    // project first…
+    let app = test_app_with_git_and_token(FakeGit::at(repo.path()), Some(MASTER)).await;
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/org/app.git" }),
+        Some(MASTER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project: Value = serde_json::from_slice(&body).unwrap();
+    let project_id = project["id"].as_u64().unwrap();
+
+    // …and mints alice scoped to exactly that project.
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "alice", "projects": [project_id] }),
+        Some(MASTER),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let alice = created["token"].as_str().unwrap().to_owned();
+
+    // Alice resolves her own project by URL — this must NOT hit
+    // `ensure_repo` at all (resolution is a pure DB lookup):
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/org/app.git" }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let resolved: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resolved["id"], project_id);
+
+    // A different (unregistered) URL is 403 — brand-new registration — and
+    // provably never reached ensure_repo (this fake fails any real clone).
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/other/repo.git" }),
+        Some(&alice),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn api_is_open_when_no_token_is_configured() {
     let (app, _) = test_app().await;
@@ -713,8 +1075,13 @@ async fn two_project_app() -> Router {
         let project = Project::new(ProjectId(0), parsed.name, url, parsed.config).unwrap();
         ProjectStore::create(&store, &project).await.unwrap();
     }
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -722,6 +1089,7 @@ async fn two_project_app() -> Router {
         data_dir: test_data_dir(),
         allow_restore: true,
         rate_limit: None,
+        auto_token: false,
     })
 }
 
@@ -1029,8 +1397,13 @@ async fn unscoped_tokens_keep_full_access() {
 async fn rotate_key_requires_master_and_keeps_secrets_readable() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let data_dir = test_data_dir();
     let app = router(ApiState {
         cp,
@@ -1039,6 +1412,7 @@ async fn rotate_key_requires_master_and_keeps_secrets_readable() {
         data_dir: data_dir.clone(),
         allow_restore: true,
         rate_limit: None,
+        auto_token: false,
     });
 
     json_request_with_auth(
@@ -1107,8 +1481,13 @@ async fn rotate_key_requires_master_and_keeps_secrets_readable() {
 async fn rate_limit_blocks_a_burst_past_its_configured_size() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let app = router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -1118,6 +1497,7 @@ async fn rate_limit_blocks_a_burst_past_its_configured_size() {
         // 1 request/sec sustained, burst of 2 — the 3rd immediate
         // request must be rejected.
         rate_limit: Some((1, 2)),
+        auto_token: false,
     });
 
     let mut statuses = Vec::new();
@@ -1172,8 +1552,13 @@ async fn json_request_from_ip(
 async fn rate_limit_keys_per_client_ip_when_connect_info_present() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let app = router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -1182,6 +1567,7 @@ async fn rate_limit_keys_per_client_ip_when_connect_info_present() {
         allow_restore: true,
         // 1 request/sec sustained, burst of 2 per IP.
         rate_limit: Some((1, 2)),
+        auto_token: false,
     });
 
     let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
@@ -1259,8 +1645,13 @@ async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key()
         .await
         .unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let app = router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -1268,6 +1659,7 @@ async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key()
         data_dir: data_dir.clone(),
         allow_restore: true,
         rate_limit: None,
+        auto_token: false,
     });
     // Give the backup something real to capture.
     json_request(
@@ -1301,8 +1693,13 @@ async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key()
 async fn restore_is_rejected_when_not_allowed() {
     let store = SqliteStore::open_in_memory().await.unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let app = router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -1310,6 +1707,7 @@ async fn restore_is_rejected_when_not_allowed() {
         data_dir: test_data_dir(),
         allow_restore: false,
         rate_limit: None,
+        auto_token: false,
     });
 
     let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", vec![1, 2, 3]).await;
@@ -1323,8 +1721,13 @@ async fn restore_stages_the_upload_without_touching_the_live_database() {
         .await
         .unwrap();
     let cache = tempfile::tempdir().unwrap();
-    let cp = ControlPlane::new(store, FakeGit, FakeOci::default(), cache.path().to_owned())
-        .with_readiness_check(false);
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
     let app = router(ApiState {
         cp,
         webhook_secret: Some("test-secret".to_owned()),
@@ -1332,6 +1735,7 @@ async fn restore_stages_the_upload_without_touching_the_live_database() {
         data_dir: data_dir.clone(),
         allow_restore: true,
         rate_limit: None,
+        auto_token: false,
     });
 
     let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;

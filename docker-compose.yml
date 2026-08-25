@@ -63,14 +63,14 @@ services:
       # instead/alongside — see the commented service below.
       OXID_BACKUP_INTERVAL_SECS: "300"
       OXID_BACKUP_KEEP: "7"
-      # Required for webhook ingestion to be accepted at all — generate with
-      # `openssl rand -hex 32` and configure the same value as your GitHub
-      # webhook's secret.
-      OXID_WEBHOOK_SECRET: ${OXID_WEBHOOK_SECRET:?set OXID_WEBHOOK_SECRET}
-      # Mandatory now: the daemon refuses to start without a token when
-      # binding a non-loopback address (override with OXID_ALLOW_OPEN_API=1).
-      # Generate with `openssl rand -hex 32`.
-      OXID_API_TOKEN: ${OXID_API_TOKEN:?set OXID_API_TOKEN}
+      # Zero-config mode: any of OXID_API_TOKEN / OXID_WEBHOOK_SECRET not
+      # set below is generated on first start, persisted under /data and
+      # printed ONCE to `docker compose logs oxid-daemon` — that printout is
+      # how you retrieve the dashboard/CLI token (the container has no
+      # shell). Explicit values always win; pin yours by uncommenting:
+      #   OXID_API_TOKEN: <openssl rand -hex 32>
+      #   OXID_WEBHOOK_SECRET: <openssl rand -hex 32>
+      OXID_AUTO_TOKEN: "1"
       # Joining Traefik's network switches deployed containers from
       # publishing a host port to being routed by Traefik labels instead
       # (see ControlPlane::with_traefik / SPEC.md §3.2).

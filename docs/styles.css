@@ -213,32 +213,39 @@ code {
 }
 
 .hero-mark {
-  margin-bottom: 1.5rem;
+  margin-bottom: 1.25rem;
 }
 
 .hero h1 {
-  font-size: 4rem;
+  font-size: clamp(5rem, 16vw, 10.5rem);
   margin: 0;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.06em;
   font-weight: 800;
+  line-height: 0.88;
+  text-transform: uppercase;
 }
 
 .tagline {
-  font-size: 1.4rem;
-  margin: 0.75rem 0 0.25rem;
+  font-size: clamp(1.9rem, 4.8vw, 2.9rem);
+  margin: 2.5rem 0 0.9rem;
   color: var(--steel);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  max-width: 780px;
+  text-wrap: balance;
 }
 
 .subtagline {
   font-family: var(--font-mono);
   color: var(--orange);
-  margin: 0 0 1.5rem;
-}
-
-.hero-copy {
-  max-width: 560px;
-  color: #c7c7ca;
-  font-size: 1.05rem;
+  margin: 0 0 2rem;
+  font-size: clamp(1rem, 2.6vw, 1.4rem);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.45;
+  max-width: 720px;
+  text-wrap: balance;
 }
 
 .cta-row {
@@ -306,8 +313,14 @@ code {
 .section h2 {
   font-size: 2rem;
   max-width: 720px;
-  margin: 0 0 2.5rem;
+  margin: 0 auto 2.5rem;
   letter-spacing: -0.01em;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.section .eyebrow {
+  text-align: center;
 }
 
 .grid-2 {
@@ -526,7 +539,9 @@ code {
 .status-copy {
   max-width: 720px;
   color: #c7c7ca;
-  margin-bottom: 2.5rem;
+  margin: 0 auto 2.5rem;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .status-copy a {
@@ -570,6 +585,218 @@ code {
 .cta-band-inner h2 {
   margin-left: auto;
   margin-right: auto;
+}
+
+.hero-quickstart {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 1.5rem auto 0;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.hero-quickstart .qs-cmd {
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  background: var(--iron-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 0.55rem 1rem;
+  color: var(--steel);
+  max-width: 720px;
+  text-align: center;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.hero-quickstart .qs-cmd:hover {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.hero-quickstart .qs-cmd.qs-copied {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.qs-or {
+  font-family: var(--font-mono);
+  color: var(--ash);
+  font-size: 0.75rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.qs-arrow {
+  font-family: var(--font-mono);
+  color: var(--orange);
+  font-size: 1.15rem;
+  line-height: 1;
+  margin-top: 0.2rem;
+}
+
+.qs-result {
+  font-family: var(--font-mono);
+  color: var(--green);
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-top: 0.35rem;
+}
+
+/* ---------- Install — 60 seconds ---------- */
+
+#install .eyebrow,
+#install h2,
+.install-lead {
+  text-align: center;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+#install h2 {
+  max-width: 720px;
+  text-wrap: balance;
+}
+
+.install-lead {
+  max-width: 640px;
+  color: #c7c7ca;
+  margin: 0 auto 2.25rem;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.install-card {
+  border: 1px solid var(--border);
+  padding: 1.75rem;
+  border-radius: 2px;
+  background: var(--iron-2);
+  display: flex;
+  flex-direction: column;
+}
+
+.install-card p {
+  max-width: none;
+  margin: 0 0 1rem;
+  color: #c7c7ca;
+  font-size: 0.95rem;
+}
+
+.install-card-accent {
+  border-color: var(--orange);
+}
+
+.install-step {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--orange);
+  margin-bottom: 0.75rem;
+  display: block;
+}
+
+.install-card h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+.install-card .cmd-block {
+  margin-top: auto;
+  width: 100%;
+  text-align: left;
+}
+
+.install-list {
+  margin: 0 0 1rem;
+  padding-left: 1.25rem;
+  max-width: none;
+  text-align: left;
+  color: #c7c7ca;
+  font-size: 0.92rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.install-list li::marker {
+  color: var(--orange);
+}
+
+.install-card .muted {
+  margin-bottom: 0;
+  font-size: 0.9rem;
+  color: var(--ash);
+}
+
+.install-footnote {
+  max-width: 720px;
+  margin: 1.75rem auto 0;
+  color: var(--ash);
+  font-size: 0.92rem;
+  text-align: center;
+  text-wrap: balance;
+}
+
+.install-footnote a {
+  color: var(--orange);
+}
+
+/* Prevent grid blowout — long <pre> lines (curl URLs) otherwise force page-level horizontal scroll */
+.grid-3 > *,
+.install-card,
+.install-stack > * {
+  min-width: 0;
+}
+
+.install-card {
+  overflow: hidden;
+}
+
+.install-stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.25rem;
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.cmd-block {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  margin: 0 0 1.25rem;
+  padding: 0.9rem 1.1rem;
+  background: #0d0d0d;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  overflow-y: hidden;
+  color: var(--steel);
+  white-space: pre;
+  word-wrap: normal;
+  -webkit-overflow-scrolling: touch;
+}
+
+.cmd-block code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: inherit;
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+html, body {
+  overflow-x: clip;
 }
 
 .cta-band-inner p {
@@ -657,7 +884,7 @@ code {
   }
 
   .hero h1 {
-    font-size: 2.75rem;
+    font-size: clamp(4rem, 16vw, 6rem);
   }
 
   .grid-2,

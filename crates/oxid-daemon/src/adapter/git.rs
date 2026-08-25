@@ -85,11 +85,20 @@ fn sync_remote_url(repo_dir: &Path) -> Result<RepoUrl, GitError> {
 /// Derives the git-cache subdirectory name for `url`. `pub(crate)` so
 /// project deletion (`control_plane.rs::delete_project`) can locate and
 /// remove the same directory `ensure_repo` created.
+///
+/// The name is `<last-segment>-<8 hex chars of SHA-256(url)>`: the short
+/// content hash disambiguates same-named repos from different orgs
+/// (`orgA/app` and `orgB/app` must not share one cache dir) once arbitrary
+/// remotes can be registered by URL. Changing the derivation orphans old
+/// cache dirs — each project simply re-clones once after upgrading
+/// (self-healing; nothing else keys off these directory names).
 pub(crate) fn cache_dir_name(url: &RepoUrl) -> String {
+    use sha2::Digest;
+
     let raw = url.as_str();
     let trimmed = raw.trim_end_matches('/');
     let segment = trimmed.rsplit('/').next().unwrap_or("repo").to_owned();
-    segment
+    let sanitized: String = segment
         .trim_end_matches(".git")
         .chars()
         .map(|c| {
@@ -99,7 +108,9 @@ pub(crate) fn cache_dir_name(url: &RepoUrl) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect();
+    let digest = sha2::Sha256::digest(raw.as_bytes());
+    format!("{sanitized}-{}", hex::encode(&digest[..4]))
 }
 
 /// Builds the URL actually used for the clone/fetch network operation,
@@ -289,6 +300,30 @@ mod tests {
         let client = GitClient::new();
         let url = client.remote_url(src.path()).await.unwrap();
         assert_eq!(url.as_str(), "https://github.com/org/app.git");
+    }
+
+    #[test]
+    fn cache_names_disambiguate_same_named_repos_from_different_orgs() {
+        // The whole point of the hash suffix: registering by URL must not
+        // let orgA/app and orgB/app share one cache directory.
+        let a = RepoUrl::parse("https://github.com/orgA/app.git").unwrap();
+        let b = RepoUrl::parse("https://github.com/orgB/app.git").unwrap();
+        let name_a = cache_dir_name(&a);
+        let name_b = cache_dir_name(&b);
+        assert_ne!(name_a, name_b);
+        assert!(name_a.starts_with("app-"), "readable prefix kept: {name_a}");
+
+        // Deterministic across calls — project deletion relies on deriving
+        // exactly the same name ensure_repo created.
+        assert_eq!(name_a, cache_dir_name(&a));
+
+        // A trailing-slash variant of the same URL is a *different* string
+        // to git and to idempotency matching; it simply gets its own dir
+        // like any other distinct URL.
+        assert_ne!(
+            name_b,
+            cache_dir_name(&RepoUrl::parse("https://github.com/orgA/app").unwrap())
+        );
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@
       <nav>
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
+        <a href="install.html">Install</a>
         <p class="side-group">CLI</p>
         <a href="cli.html" class="current">CLI reference</a>
         <a href="#cli-global" class="sub">Global options</a>
@@ -96,15 +97,19 @@
         <h2>Lifecycle</h2>
 
         <article class="doc-entry">
-          <h3><code>oxid up &lt;branch&gt;</code></h3>
+          <h3><code>oxid up &lt;branch&gt; [--repo &lt;url&gt; --git-token &lt;pat&gt;]</code></h3>
           <p>
-            Registers the repository in the current directory (idempotent) and deploys
-            <code>branch</code>: clone → build → inject secrets → run → route. If the host is at
-            capacity, the deploy is queued and retried automatically — the command returns the
-            queue position instead of blocking.
+            Registers the repository (idempotent) and deploys <code>branch</code>: clone → build → inject secrets → run → route.
+            Without <code>--repo</code>, registers the current directory (how a locally-run daemon sees your checkout).
+            With <code>--repo https://…</code> the daemon clones the URL itself — how you register against a containerized daemon.
+            Scp-style <code>git@host:org/repo.git</code> is normalized server-side; <code>--git-token</code> is stored encrypted for private repos.
+            If the host is at capacity, the deploy is queued and retried automatically.
           </p>
           <pre class="cmd-block">oxid up feature-login
-<span class="tk-green">[+]</span> Environment live at: http://127.0.0.1:41253/</pre>
+<span class="tk-green">[+]</span> Environment live at: http://127.0.0.1:41253/
+<span class="tk-gray"># against a containerized daemon:</span>
+oxid up main --repo https://github.com/you/app.git
+oxid up main --repo https://github.com/you/private.git --git-token ghp_xxx</pre>
         </article>
 
         <article class="doc-entry">

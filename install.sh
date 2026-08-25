@@ -312,12 +312,16 @@ EOF
 
 [+] Oxid docker stack is up in ${STACK}.
 
+    Dashboard  : http://DAEMON:8080/  — open it and follow the setup wizard
+                 (token → infra → first project → webhooks → CLI)
+    Token      : if the stack generated one (OXID_AUTO_TOKEN), read it with
+                   cd ${STACK} && docker compose logs oxid-daemon | grep -A2 Generated
+                 (or your own OXID_API_TOKEN from ${STACK}/.env)
     CLI access : oxid context add prod --api http://DAEMON:8080 \\
                    --token \$(grep ^OXID_API_TOKEN ${STACK}/.env | cut -d= -f2)
                  oxid doctor
     Webhooks   : http://DAEMON:8080/api/v1/webhooks/github
                  secret: \$(grep ^OXID_WEBHOOK_SECRET ${STACK}/.env | cut -d= -f2)
-    Dashboard  : http://DAEMON:8080/  (paste the same API token)
     Upgrade    : cd ${STACK} && docker compose pull && docker compose up -d
 EOF
   exit 0

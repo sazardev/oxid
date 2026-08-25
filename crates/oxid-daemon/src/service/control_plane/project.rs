@@ -49,6 +49,67 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         }
     }
 
+    /// Registers a project straight from a remote Git URL — no local
+    /// checkout required (how the dashboard's onboarding wizard and
+    /// `oxid up --repo <url>` register against a containerized daemon).
+    ///
+    /// The remote is cloned/fetched **now** rather than at first deploy:
+    /// an eager probe means a wrong URL or token surfaces here, where the
+    /// API maps it to a 400 with the git error in the message, instead of a
+    /// 500 mid-deploy later. It also warms the git cache so the first
+    /// deploy doesn't pay for the clone. Config is parsed from the cloned
+    /// tree exactly as [`Self::register_project`] would from a local one,
+    /// and `git_token` (when given) is persisted encrypted alongside the
+    /// project row so private repos work from the very first deploy.
+    ///
+    /// Idempotent by exact `repo_url`, like [`Self::register_project`].
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on fetch failures (mapped to
+    /// [`CpError::Config`], which the HTTP layer answers 400 — the input is
+    /// what's wrong, not the server), config errors and persistence
+    /// failures.
+    pub async fn register_project_by_url(
+        &self,
+        repo_url: &RepoUrl,
+        git_token: Option<&str>,
+    ) -> Result<Project, CpError> {
+        if let Some(existing) = self.find_project_by_repo(repo_url).await? {
+            return Ok(existing);
+        }
+
+        let cloned_dir = self
+            .git
+            .ensure_repo(repo_url, git_token, &self.cache_dir)
+            .await
+            // Mapped to 400 by the HTTP layer (`CpError::Validation`) — a
+            // failed probe means the *input* (URL or token) is wrong, not
+            // the server. Deploy-time git failures stay `CpError::Git`/500.
+            .map_err(|e| {
+                CpError::Validation(format!(
+                    "cannot fetch `{repo_url}`{}: {e}",
+                    git_token.map_or(String::new(), |_| " with the provided git token".to_owned())
+                ))
+            })?;
+
+        let parsed = config::parse_project(&cloned_dir)?;
+        let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?;
+        match ProjectStore::create(&self.store, &project).await {
+            Ok(id) => {
+                project.id = id;
+                if let Some(token) = git_token.filter(|t| !t.is_empty()) {
+                    self.store.set_git_token(project.id, Some(token)).await?;
+                }
+                Ok(project)
+            }
+            Err(RepositoryError::Conflict(_)) => self
+                .find_project_by_repo(repo_url)
+                .await?
+                .ok_or_else(|| CpError::NotFound(format!("project for `{repo_url}`"))),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Lists all registered projects.
     ///
     /// # Errors
@@ -171,6 +232,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     pub async fn project_for_repo(&self, repo_dir: &Path) -> Result<Option<Project>, CpError> {
         let repo_url = self.git.remote_url(repo_dir).await?;
         Ok(self.find_project_by_repo(&repo_url).await?)
+    }
+
+    /// URL-form twin of [`Self::project_for_repo`]: resolves a project by
+    /// exact `repo_url` with no filesystem access at all — what the scoped-
+    /// token path of registration-by-URL uses (it must answer before any
+    /// clone happens, or a scoped token could make the daemon fetch an
+    /// arbitrary remote).
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence failures.
+    pub async fn project_for_repo_url(
+        &self,
+        repo_url: &RepoUrl,
+    ) -> Result<Option<Project>, CpError> {
+        Ok(self.find_project_by_repo(repo_url).await?)
     }
 
     pub(crate) async fn ensure_project(&self, project_id: ProjectId) -> Result<Project, CpError> {
