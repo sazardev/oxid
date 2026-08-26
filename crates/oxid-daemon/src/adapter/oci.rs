@@ -57,6 +57,16 @@ fn tar_context(dir: &Path) -> Result<Bytes, OciError> {
     let mut buf = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut buf);
+        // `append_dir_all`'s default `follow_symlinks(true)` calls
+        // `fs::metadata` (which *dereferences*) on every entry — a single
+        // dangling symlink anywhere in the tree (a real repo had one under
+        // `.claude/skills/`, unrelated to anything the Dockerfile even
+        // touches) then fails the *entire* build with a bare "No such file
+        // or directory" that doesn't even name the offending path.
+        // `docker build`'s own context upload doesn't require symlink
+        // targets to resolve; match that by storing the symlink entry
+        // itself (target string, no dereference) instead of failing.
+        builder.follow_symlinks(false);
         builder.append_dir_all(".", dir).map_err(|e| {
             OciError::Failure(format!("cannot tar build context `{}`: {e}", dir.display()))
         })?;
@@ -1059,6 +1069,32 @@ mod tests {
         assert!(
             entries >= 2,
             "expected Dockerfile + sub/file.txt, got {entries}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tars_a_directory_containing_a_dangling_symlink() {
+        // Regression: a real repo had a dangling symlink under
+        // `.claude/skills/` (its target predates a cleanup commit) —
+        // `follow_symlinks(true)` (the `tar` crate's default) dereferences
+        // every entry via `fs::metadata`, so that one unrelated broken link
+        // used to fail the *entire* build context tar with a bare ENOENT.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\n").unwrap();
+        std::os::unix::fs::symlink("does/not/exist", dir.path().join("dangling")).unwrap();
+
+        let tar = tar_context(dir.path()).expect("a dangling symlink must not fail the build");
+
+        let mut archive = tar::Archive::new(tar.as_ref());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("dangling")),
+            "expected the symlink itself to be archived, got {names:?}"
         );
     }
 
