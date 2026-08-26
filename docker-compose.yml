@@ -89,10 +89,16 @@ services:
       OXID_DAEMON_URL: http://oxid-daemon:8080
     ports:
       # Direct access for the CLI/dashboard (`OXID_API=http://localhost:8080`).
-      # Traefik only routes *deployed environments*, not this control API —
-      # remove this if you'd rather reach it exclusively through Traefik/a
-      # private network.
-      - "8080:8080"
+      # Bound to loopback deliberately: `GET /api/v1/setup/token` (used by
+      # `oxid token generate` and the onboarding wizard's "generate for me"
+      # button) hands over the auto-generated master token pre-auth — that's
+      # only safe because nothing off this host can reach the port at all.
+      # Widen to `"8080:8080"` (all interfaces) only over a private/trusted
+      # network, and prefer setting an explicit OXID_API_TOKEN first if you
+      # do. Traefik only routes *deployed environments*, not this control
+      # API — remove this line entirely if you'd rather reach it exclusively
+      # through Traefik/a private network.
+      - "127.0.0.1:8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - oxid-data:/data

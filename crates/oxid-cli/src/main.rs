@@ -303,6 +303,17 @@ enum TokenAction {
         /// Token id, from `oxid token list`.
         id: u64,
     },
+    /// Fetches the daemon's auto-generated master token (zero-config
+    /// `OXID_AUTO_TOKEN=1` deployments only — see `oxid-daemon`'s
+    /// `GET /api/v1/setup/token`) and saves it as a context, so a fresh
+    /// install works with no manual `docker compose logs`/volume digging.
+    /// No `--token` needed to run this one.
+    Generate {
+        /// Context name to create/update with the fetched token. Defaults
+        /// to the active context, or `default` if none is configured yet.
+        #[arg(long)]
+        save_as: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -695,6 +706,9 @@ async fn main() {
             }
             TokenAction::List => cmd_token_list(&client, &base).await,
             TokenAction::Revoke { id } => cmd_token_revoke(&client, &base, id).await,
+            TokenAction::Generate { save_as } => {
+                cmd_token_generate(&client, &base, save_as.as_deref()).await
+            }
         },
         Command::Doctor => cmd_doctor(&client, &base).await,
         Command::RotateKey => cmd_rotate_key(&client, &base).await,
@@ -1705,6 +1719,47 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
             scopes,
             format_occurred_at(&token["created_at"]),
         );
+    }
+    Ok(())
+}
+
+/// Fetches the auto-generated master token from `GET /api/v1/setup/token`
+/// (unauthenticated — that's the point, see the daemon handler's doc
+/// comment) and persists it as a context, so a fresh zero-config install
+/// goes from "daemon is up" to "CLI works" in one command instead of a
+/// `docker compose logs`/`docker compose cp` hunt.
+async fn cmd_token_generate(
+    client: &Client,
+    base: &str,
+    save_as: Option<&str>,
+) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/setup/token");
+    let value = get_json(client, url).await?;
+    let token = value["token"]
+        .as_str()
+        .ok_or_else(|| "daemon response missing token".to_owned())?
+        .to_owned();
+
+    let mut cfg = config::load()?;
+    let name = save_as
+        .map(str::to_owned)
+        .or_else(|| cfg.current_context.clone())
+        .unwrap_or_else(|| "default".to_owned());
+    cfg.contexts.insert(
+        name.clone(),
+        config::Context {
+            api: base.to_owned(),
+            token: Some(token.clone()),
+        },
+    );
+    cfg.current_context.get_or_insert_with(|| name.clone());
+    config::save(&cfg)?;
+
+    if !emit_json(&json!({ "context": name, "token": token })) {
+        ok(format!("Fetched token and saved it to context `{name}`"));
+        bg(format!(
+            "oxid context use {name}   # if it isn't already active"
+        ));
     }
     Ok(())
 }

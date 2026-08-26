@@ -10,7 +10,7 @@
     <script src="/vendor/alpine.min.js" defer></script>
   </head>
   <body x-data="dashboard()" x-init="init()">
-    <header class="topbar">
+    <header class="topbar" x-show="route.name !== 'onboarding'" x-cloak>
       <div class="brand">
         <svg class="logo" viewBox="0 0 100 100" aria-hidden="true">
           <path
@@ -50,21 +50,21 @@
       </div>
     </header>
 
-    <div class="banner banner-error" x-show="authError" x-cloak>
+    <div class="banner banner-error" x-show="authError && route.name !== 'onboarding'" x-cloak>
       [!] 401/403 from the daemon — check the bearer token above.
     </div>
-    <div class="banner banner-error" x-show="connError" x-cloak>
+    <div class="banner banner-error" x-show="connError && route.name !== 'onboarding'" x-cloak>
       [!] Cannot reach the daemon at <code x-text="apiBase"></code>.
     </div>
     <div
       class="banner banner-ok"
-      x-show="notice"
+      x-show="notice && route.name !== 'onboarding'"
       x-cloak
       x-text="notice + '  [click to dismiss]'"
       @click="notice = ''"
     ></div>
 
-    <section class="stats">
+    <section class="stats" x-show="route.name !== 'onboarding'" x-cloak>
       <div class="stat-card">
         <div class="stat-value" x-text="stats.projects ?? '—'"></div>
         <div class="stat-label">Projects</div>
@@ -95,7 +95,7 @@
       </div>
     </section>
 
-    <main class="page-container">
+    <main :class="route.name === 'onboarding' ? 'onboarding-container' : 'page-container'">
       <!-- ================= ENVIRONMENTS (home) ================= -->
       <section class="page" x-show="route.name === 'environments'" x-cloak>
         <p class="muted" x-show="!stats.traefik_enabled">
@@ -532,7 +532,20 @@
       </section>
 
       <!-- ================= ONBOARDING WIZARD ================= -->
-      <section class="page" x-show="route.name === 'onboarding'" x-cloak>
+      <section class="page onboarding-card" x-show="route.name === 'onboarding'" x-cloak>
+        <div class="onboarding-brand">
+          <svg class="logo" viewBox="0 0 100 100" aria-hidden="true">
+            <path
+              d="M50 4 L93 27 V73 L50 96 L7 73 V27 Z"
+              fill="none"
+              stroke="#DE5236"
+              stroke-width="6"
+            />
+            <path d="M50 4 L93 27" stroke="#121212" stroke-width="8" />
+          </svg>
+          <span class="wordmark">OXID</span>
+          <span class="tagline">control plane</span>
+        </div>
         <div class="page-head">
           <h1>Set up this daemon</h1>
           <button class="btn btn-sm" @click="finishOnboarding()">skip — I'll configure it myself</button>
@@ -568,11 +581,17 @@
               </p>
               <template x-if="setupStatus.auto_token">
                 <div class="wizard-hint">
-                  This daemon runs with <code>OXID_AUTO_TOKEN=1</code>: it generated its own token
-                  on first start and printed it once. Retrieve it with:
-                  <pre class="log-output wizard-snippet">docker compose logs oxid-daemon | grep -A2 Generated</pre>
+                  This daemon runs with <code>OXID_AUTO_TOKEN=1</code>: it already generated one
+                  for itself on first start. Fetch and use it directly — no logs to dig through:
+                  <div class="deploy-form">
+                    <button class="btn btn-primary" :disabled="wizard.generatingToken" @click="generateToken()">
+                      <span x-show="!wizard.generatingToken">generate automatically</span>
+                      <span x-show="wizard.generatingToken" class="spinner"></span>
+                    </button>
+                  </div>
                 </div>
               </template>
+              <p class="muted" x-show="setupStatus.auto_token">— or paste one yourself:</p>
               <div class="deploy-form">
                 <input
                   class="token-input mono"

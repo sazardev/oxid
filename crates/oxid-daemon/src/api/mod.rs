@@ -251,6 +251,14 @@ pub fn router<
         // (see `handlers::setup::setup_status`). The wizard calls this
         // before any token exists to decide what to ask for.
         .route("/api/v1/setup/status", get(handlers::setup::setup_status))
+        // Public, pre-auth: hands over the auto-generated master token so
+        // the CLI (`oxid token generate`) and the onboarding wizard can
+        // self-serve instead of hunting through `docker compose logs`/the
+        // data volume (see `handlers::setup::bootstrap_token` for the trust
+        // argument — safe specifically because it never reveals an
+        // explicitly-configured token, only the auto-generated one that's
+        // already retrievable via those other channels).
+        .route("/api/v1/setup/token", get(handlers::setup::bootstrap_token))
         .route("/", get(dashboard_index))
         .route("/index.html", get(dashboard_index))
         .route("/style.css", get(dashboard_style))

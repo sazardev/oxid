@@ -64,6 +64,42 @@ pub async fn setup_status<
     })))
 }
 
+/// Reveals the auto-generated master API token, pre-auth. Deliberately
+/// mirrors the trust model already documented on [`crate::credential`]: the
+/// zero-config path (`OXID_AUTO_TOKEN=1`) writes this same value to a
+/// `0600` file in `OXID_DATA_DIR` and prints it once to the container log —
+/// anyone who can reach this HTTP endpoint at all can already retrieve it by
+/// those channels (`docker compose cp`/`docker compose logs`), so serving it
+/// here too adds no new exposure, only removes the friction of finding a
+/// shell/volume-access path to fetch it. This is *why* the shipped
+/// `docker-compose.yml` publishes the control API on `127.0.0.1` only —
+/// widening that to `0.0.0.0` hands this endpoint (and the token file) to
+/// anyone on the network, which is a operator-made decision this endpoint
+/// can't detect or veto.
+///
+/// Only ever serves the *auto-generated* value (`state.auto_token`): an
+/// operator who explicitly set `OXID_API_TOKEN` already knows it, and this
+/// deliberately never echoes an explicitly-configured secret back over
+/// HTTP. 404s when there's nothing to hand over (open API, or an explicit
+/// token) so the CLI/wizard can fall back to "paste your own".
+pub async fn bootstrap_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+) -> ApiResult<Json<Value>> {
+    if state.auto_token
+        && let Some(token) = state.api_token.clone()
+    {
+        return Ok(Json(json!({ "token": token })));
+    }
+    Err(ApiError::not_found(
+        "no auto-generated token to hand over — either the API is open (no token configured) \
+         or OXID_API_TOKEN was set explicitly by the operator; retrieve that value from your \
+         own deployment config",
+    ))
+}
+
 /// Reveals the webhook-signing secret to the **master** credential only —
 /// the same trust level as `GET /api/v1/backup`, which already ships the
 /// AES master key itself. Named operators (scoped or not) get 403: knowing

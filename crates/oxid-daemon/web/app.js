@@ -82,6 +82,7 @@ function dashboard() {
       step: 1,
       tokenInput: "",
       checkingToken: false,
+      generatingToken: false,
       infra: null,
       infraLoading: false,
       fixingInfra: false,
@@ -603,6 +604,33 @@ function dashboard() {
         );
       } finally {
         this.wizard.checkingToken = false;
+      }
+    },
+
+    // Self-serves the auto-generated master token from the public
+    // `GET /api/v1/setup/token` (see that handler's doc comment for why
+    // this is safe: it only ever hands over the *auto-generated* value,
+    // never one the operator set explicitly). Mirrors `oxid token
+    // generate` on the CLI side.
+    async generateToken() {
+      this.wizard.generatingToken = true;
+      try {
+        const res = await fetch(`${this.apiBase}/api/v1/setup/token`, { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error("no auto-generated token available");
+        }
+        const body = await res.json();
+        this.token = body.token;
+        localStorage.setItem("oxid_token", body.token);
+        this.authError = false;
+        this.showNotice("Token generated and saved.");
+        this.wizardGo(2);
+      } catch {
+        this.showNotice(
+          "Couldn't fetch a token automatically — paste one manually below, or check the daemon logs.",
+        );
+      } finally {
+        this.wizard.generatingToken = false;
       }
     },
 

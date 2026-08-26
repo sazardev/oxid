@@ -490,7 +490,48 @@ h2 {
 }
 
 /* Onboarding wizard — same flat Industrial Elegance: hard borders, no
-   shadows, one accent color doing all the state signaling. */
+   shadows, one accent color doing all the state signaling.
+
+   Full-screen on entry (see `main :class` in index.html): the topbar/nav/
+   stats bar are hidden for the whole `/ui/onboarding` route so a fresh
+   install lands on one focused, uncluttered wizard instead of the full
+   dashboard chrome around it. */
+.onboarding-container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+}
+
+.onboarding-card {
+  width: 100%;
+  max-width: 720px;
+}
+
+.onboarding-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 28px;
+}
+
+.onboarding-brand .logo {
+  width: 28px;
+  height: 28px;
+}
+
+.onboarding-brand .wordmark {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  font-size: 18px;
+}
+
+.onboarding-brand .tagline {
+  color: var(--ash-gray);
+  font-size: 12px;
+}
+
 .wizard-steps {
   display: flex;
   flex-wrap: wrap;
