@@ -387,6 +387,13 @@ impl ContainerPort for DockerClient {
         Ok(out)
     }
 
+    // Building the stream is synchronous — `bollard::logs` hands back a
+    // `Stream` without awaiting anything, and the awaiting happens later, in
+    // whoever consumes it. The `async` is still required: this implements
+    // `ContainerPort::stream_logs`, whose signature belongs to the port
+    // trait (declared `#[trait_variant::make(Send)]`), not to this adapter.
+    // Flagged by `clippy::unused_async_trait_impl`, new in Rust 1.98.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn stream_logs(&self, name: &str) -> Result<LogStream, OciError> {
         let options = LogsOptions {
             follow: true,
