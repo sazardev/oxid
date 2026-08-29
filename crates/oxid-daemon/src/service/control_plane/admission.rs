@@ -58,20 +58,38 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             )));
         }
 
+        // Only `Running` environments hold memory.
+        //
+        // `Paused` used to be counted too, and had to be while suspension
+        // meant `docker pause` — a frozen container keeps its whole resident
+        // set. Suspension now stops the container, which frees all of it, so
+        // counting paused environments reserved memory that nothing was
+        // using. That deadlocks a busy node rather than merely wasting it:
+        // once enough branches idle out, their phantom reservations fill the
+        // budget, every new push queues behind memory no process holds, and
+        // the queue can never drain because the environments blocking it are
+        // asleep and will not wake on their own. Reproduced with 15 branches
+        // on one host: 11 stopped containers reserved 1408MB while actually
+        // consuming 0, and four deploys waited indefinitely.
+        //
+        // Over-committing against sleeping branches is the point of
+        // scale-to-zero, not a hazard it introduces: a node hosts far more
+        // environments than could ever run at once precisely because most
+        // are asleep. `Building` is excluded because the deploy asking this
+        // question has already persisted its own row in that state, and
+        // deploys are serialized, so counting it would double-count the
+        // request against itself.
         let mut committed_mb: u64 = 0;
-        for state in [EnvironmentState::Running, EnvironmentState::Paused] {
-            for env in self.store.list_by_state(state).await? {
-                let Some(env_project) = ProjectStore::get(&self.store, env.project_id).await?
-                else {
-                    continue;
-                };
-                committed_mb += env_project
-                    .config
-                    .build
-                    .memory_limit_mb
-                    .or(self.default_memory_limit_mb)
-                    .unwrap_or(0);
-            }
+        for env in self.store.list_by_state(EnvironmentState::Running).await? {
+            let Some(env_project) = ProjectStore::get(&self.store, env.project_id).await? else {
+                continue;
+            };
+            committed_mb += env_project
+                .config
+                .build
+                .memory_limit_mb
+                .or(self.default_memory_limit_mb)
+                .unwrap_or(0);
         }
 
         if committed_mb + request_mb > usable_mb {

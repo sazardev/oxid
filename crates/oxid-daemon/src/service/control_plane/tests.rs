@@ -60,6 +60,9 @@ struct FakeOci {
     network_exists: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Whether `ensure_traefik` believes its container is already up.
     traefik_running: Arc<Mutex<bool>>,
+    /// Labels the most recent `run` was given — the Traefik router,
+    /// middleware and service wiring a deployed environment carries.
+    last_run_labels: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
 }
 
 impl ContainerPort for FakeOci {
@@ -90,6 +93,7 @@ impl ContainerPort for FakeOci {
             "run:{}:env={:?}:mem={:?}:cpu={:?}",
             spec.name, spec.env, spec.memory_limit_mb, spec.cpu_limit_millicores
         ));
+        *self.last_run_labels.lock().unwrap() = spec.labels.clone();
         let mut remaining = self.fail_run_times.lock().unwrap();
         if *remaining > 0 {
             *remaining -= 1;
@@ -2176,4 +2180,126 @@ async fn waking_a_shared_url_resolves_to_the_environment_that_owns_it() {
         .expect("the URL must resolve to an environment");
     assert_eq!(woken.id, live.id);
     assert_eq!(woken.state, EnvironmentState::Running);
+}
+
+/// A sleeping environment must not reserve memory it is not using.
+///
+/// Suspension stops the container, so its resident set is gone; counting it
+/// against host capacity deadlocks a busy node. Once enough branches idle
+/// out their phantom reservations fill the budget, and the queue can never
+/// drain, because the environments blocking it are asleep and nothing will
+/// wake them. Reproduced with 15 branches on one host: 11 stopped containers
+/// reserved 1408MB while consuming none, and four deploys waited forever.
+#[tokio::test]
+async fn a_sleeping_environment_does_not_reserve_host_memory() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    // 1 GiB total, 512 MB reserved for the host -> 512 MB usable, and the
+    // fixture project asks for 256 MB, so exactly two can run at once.
+    *oci.host_capacity.lock().unwrap() = HostCapacity {
+        total_memory_bytes: 1_073_741_824,
+        cpu_count: 2,
+    };
+    let cp = cp(oci.clone())
+        .await
+        .with_resource_defaults(Some(256), None)
+        .with_admission_control(Some(512));
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let first = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    let second = cp
+        .deploy(project.id, BranchName::parse("feature-b").unwrap())
+        .await
+        .unwrap();
+
+    // Full: a third does not fit while both are awake.
+    assert!(matches!(
+        cp.deploy_or_queue(project.id, BranchName::parse("feature-c").unwrap(), None)
+            .await
+            .unwrap(),
+        DeployOutcome::Queued { .. }
+    ));
+
+    // Put both to sleep. Their containers are stopped, so the memory is
+    // genuinely free again and the third deploy must now be admitted.
+    cp.pause(first.id).await.unwrap();
+    cp.pause(second.id).await.unwrap();
+    assert!(
+        matches!(
+            cp.deploy_or_queue(project.id, BranchName::parse("feature-c").unwrap(), None)
+                .await
+                .unwrap(),
+            DeployOutcome::Deployed(_, _)
+        ),
+        "a stopped container holds no memory, so it must not block a deploy"
+    );
+}
+
+/// A dependency the operator never configured is not a transient failure.
+///
+/// Retrying it just multiplies the failure: a branch declaring a `postgres`
+/// dependency on a daemon with no `OXID_POSTGRES_URL` produced five
+/// identical `BuildFailed` rows, burying the one actionable message under
+/// copies of itself. Observed on a fifteen-branch run.
+#[tokio::test]
+async fn a_dependency_the_daemon_lacks_is_not_retried() {
+    let repo = repo_dir_with_redis_dependency();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let err = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CpError::Pool(oxid_core::PoolError::NotConfigured(_))),
+        "{err:?}"
+    );
+    assert!(
+        !crate::service::control_plane::deploy::is_retryable(&err),
+        "an unconfigured dependency can never succeed on a retry"
+    );
+
+    // Exactly one row, not one per attempt.
+    let envs = EnvironmentStore::list_by_project(&cp.store, project.id)
+        .await
+        .unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].state, EnvironmentState::BuildFailed);
+}
+
+/// Waking must trigger on gateway errors, never on the app's own 5xx.
+///
+/// The middleware caught the whole 500-599 range, so a branch whose code
+/// threw showed its developer a "Waking up…" page reloading every two
+/// seconds instead of the stack trace — the preview environment hiding the
+/// one thing it exists to show. Only Traefik's own "cannot reach the
+/// backend" codes mean the container might be asleep.
+#[tokio::test]
+async fn waking_triggers_on_gateway_errors_not_on_the_apps_own_500() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone())
+        .await
+        .with_traefik("oxid-net", "http://oxid-daemon:8080");
+    let project = cp.register_project(repo.path()).await.unwrap();
+    cp.deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    let labels = oci.last_run_labels.lock().unwrap().clone();
+    let status = labels
+        .iter()
+        .find(|(k, _)| k.ends_with(".errors.status"))
+        .map(|(_, v)| v.clone())
+        .expect("the wake middleware must be labelled");
+    assert_eq!(status, "502-504");
+    assert!(
+        !status.contains("500-"),
+        "an application 500 must reach the developer, not the wake page"
+    );
 }

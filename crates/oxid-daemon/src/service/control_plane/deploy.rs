@@ -46,11 +46,19 @@ const MAX_DEPLOY_ATTEMPTS: u32 = 5;
 /// pool that wasn't reachable yet. A build failure is deliberately excluded —
 /// a broken Dockerfile fails identically on every retry, and it now leaves a
 /// `BuildFailed` environment behind that says so.
-fn is_retryable(err: &CpError) -> bool {
-    matches!(
-        err,
-        CpError::Git(_) | CpError::Store(_) | CpError::Pool(_) | CpError::DeployNotReady(_)
-    )
+pub(crate) fn is_retryable(err: &CpError) -> bool {
+    match err {
+        CpError::Git(_) | CpError::Store(_) | CpError::DeployNotReady(_) => true,
+        // A pool that couldn't be reached may well be reachable next tick;
+        // one that isn't configured on this daemon at all never will be.
+        // Retrying the latter just multiplies the failure: a branch
+        // declaring a dependency the operator hasn't set up produced five
+        // identical `BuildFailed` rows instead of one, burying the single
+        // actionable message under copies of itself.
+        CpError::Pool(PoolError::Failure(_)) => true,
+        CpError::Pool(PoolError::NotConfigured(_)) => false,
+        _ => false,
+    }
 }
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {

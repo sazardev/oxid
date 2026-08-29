@@ -200,9 +200,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             // the environment and returns a small auto-reloading page.
             // `Hibernating` branches (container fully stopped) fail fast
             // with connection-refused, already well inside these timeouts.
+            // Gateway errors only — deliberately *not* the whole 5xx range.
+            //
+            // These are the codes Traefik itself produces when it cannot
+            // reach a backend: 502 on connection refused, 504 on a dial or
+            // response timeout, 503 when a router has no healthy server. An
+            // absent container can only ever surface as one of those.
+            //
+            // A plain 500 is the opposite: it can only come from an app that
+            // is running and answering. Catching it too meant a branch whose
+            // code threw showed its developer a "Waking up…" page that
+            // reloaded every two seconds forever, instead of the stack trace
+            // the environment exists to show — the product hiding exactly
+            // the information it was built to surface.
             (
                 format!("traefik.http.middlewares.{wake}.errors.status"),
-                "500-599".to_owned(),
+                "502-504".to_owned(),
             ),
             (
                 format!("traefik.http.middlewares.{wake}.errors.service"),
