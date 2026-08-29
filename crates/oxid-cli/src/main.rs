@@ -14,6 +14,8 @@ use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 
 mod config;
+mod i18n;
+use crate::i18n::{t, tf};
 
 /// Ephemeral environments that breathe. Ferrous performance, invisible footprint.
 #[derive(Debug, Parser)]
@@ -31,6 +33,11 @@ struct Cli {
     /// failure kinds in scripts.
     #[arg(long, global = true)]
     json: bool,
+    /// Language for messages: `en` or `es`. Defaults to `OXID_LANG`, then
+    /// the shell's own `LC_ALL`/`LC_MESSAGES`/`LANG`, then English.
+    /// `--json` output is never translated — scripts parse it.
+    #[arg(long, global = true, value_name = "LANG")]
+    lang: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -608,6 +615,16 @@ fn connect_error(url: &str, e: &reqwest::Error) -> CliError {
 async fn main() {
     let cli = Cli::parse();
     JSON_MODE.store(cli.json, Ordering::Relaxed);
+    // Resolved before anything can print. An unrecognised `--lang` falls
+    // back to the environment rather than failing: the flag is a
+    // convenience, and refusing to run because a message could not be
+    // translated would be worse than answering in English.
+    i18n::init(
+        cli.lang
+            .as_deref()
+            .and_then(i18n::Locale::from_tag)
+            .unwrap_or_else(i18n::Locale::from_env),
+    );
     let base = api_base(cli.api.as_deref());
     let token = api_token(cli.token.as_deref());
     let client = match build_client(token.as_deref()) {
@@ -870,7 +887,7 @@ async fn cmd_up(
             EXIT_GENERIC,
         ));
     }
-    action(format!("oxid up {branch}"));
+    action(tf("deploy.start", &[("branch", branch)]));
     let project = match repo {
         Some(url) => register_project_by_url(client, base, url, git_token).await?,
         None => register_project(client, base).await?,
@@ -878,13 +895,16 @@ async fn cmd_up(
     let project_id = project["id"]
         .as_u64()
         .ok_or_else(|| "daemon response missing project id".to_owned())?;
-    ok("Parsed oxid.toml successfully");
-    ok(format!(
-        "Project `{}` registered (id {project_id})",
-        project["name"].as_str().unwrap_or("?")
+    ok(t("deploy.configParsed"));
+    ok(tf(
+        "deploy.registered",
+        &[
+            ("name", project["name"].as_str().unwrap_or("?")),
+            ("id", &project_id.to_string()),
+        ],
     ));
 
-    action(format!("Building image for {branch}..."));
+    action(tf("deploy.building", &[("branch", branch)]));
     let url = format!("{base}/api/v1/projects/{project_id}/deploy");
     let request = async {
         let response = client
@@ -909,24 +929,22 @@ async fn cmd_up(
     let env: Value = tokio::select! {
         result = request => result?,
         _ = tokio::signal::ctrl_c() => {
-            error("Interrupted — the deploy keeps running server-side; check it with `oxid status` or `oxid queue`");
+            error(t("deploy.interrupted"));
             std::process::exit(EXIT_INTERRUPTED);
         }
     };
     if env["status"].as_str() == Some("queued") {
         if !emit_json(&env) {
             let position = env["position"].as_u64().unwrap_or(0);
-            ok(format!(
-                "Queued, waiting for host capacity (position {position}) — run `oxid queue` to check, or `oxid status` once it deploys"
-            ));
+            ok(tf("deploy.queued", &[("position", &position.to_string())]));
         }
         return Ok(());
     }
     if !emit_json(&env) {
         print_deploy_report(&env);
-        ok(format!(
-            "Environment live at: {}",
-            env_display_address(base, &env)
+        ok(tf(
+            "deploy.live",
+            &[("url", &env_display_address(base, &env))],
         ));
     }
     Ok(())
@@ -942,8 +960,11 @@ fn print_deploy_report(env: &Value) {
     if let Some(build) = env.get("build") {
         let took = format_duration_ms(build["duration_ms"].as_u64().unwrap_or(0));
         match build["cache_hit_percent"].as_u64().map(u8::try_from) {
-            Some(Ok(pct)) => ok(format!("Image built (cache hit: {pct}%, {took})")),
-            _ => ok(format!("Image built ({took})")),
+            Some(Ok(pct)) => ok(tf(
+                "deploy.builtCached",
+                &[("cache", &pct.to_string()), ("took", &took)],
+            )),
+            _ => ok(tf("deploy.built", &[("took", &took)])),
         }
     }
     for dep in env["dependencies"].as_array().into_iter().flatten() {
@@ -970,7 +991,7 @@ async fn cmd_rollback(
     branch: &str,
     to_sha: Option<&str>,
 ) -> Result<(), CliError> {
-    action(format!("oxid rollback {branch}"));
+    action(tf("rollback.start", &[("branch", branch)]));
     let project = register_project(client, base).await?;
     let project_id = project["id"]
         .as_u64()
@@ -996,9 +1017,9 @@ async fn cmd_rollback(
     if !emit_json(&env) {
         print_deploy_report(&env);
         let sha = env["branch"]["commit_sha"].as_str().unwrap_or("?");
-        ok(format!(
-            "Rolled back to {sha} — environment live at: {}",
-            env_display_address(base, &env)
+        ok(tf(
+            "rollback.done",
+            &[("sha", sha), ("url", &env_display_address(base, &env))],
         ));
     }
     Ok(())
@@ -1088,13 +1109,18 @@ async fn cmd_status(
         return Ok(());
     }
     if latest.is_empty() {
-        bg(format!(
-            "No environments for `{}` yet. Deploy one with `oxid up <branch>`.",
-            project["name"].as_str().unwrap_or("?")
+        bg(tf(
+            "empty.environments",
+            &[("name", project["name"].as_str().unwrap_or("?"))],
         ));
         return Ok(());
     }
-    println!("{:<24} {:<24} URL", "BRANCH", "STATE");
+    println!(
+        "{:<24} {:<24} {}",
+        t("table.branch"),
+        t("table.state"),
+        t("table.url")
+    );
     for (branch, state, address, _) in latest {
         println!("{:<24} {:<33} {}", branch, colored_state(state), address);
     }
@@ -1114,7 +1140,7 @@ async fn cmd_down(
             "This will permanently destroy `{branch}` and its container. Continue? [y/N] "
         ))
     {
-        bg("Aborted (re-run with --force to skip this prompt).");
+        bg(t("confirm.aborted"));
         return Ok(());
     }
     let url = if purge_secrets {
@@ -1140,9 +1166,9 @@ async fn cmd_down(
         ));
     }
     if !emit_json(&json!({ "status": "destroyed", "branch": branch })) {
-        ok(format!("Environment `{branch}` destroyed"));
+        ok(tf("env.destroyed", &[("branch", branch)]));
         if purge_secrets {
-            bg(format!("Branch `{branch}` secrets purged"));
+            bg(tf("env.secretsPurged", &[("branch", branch)]));
         }
     }
     Ok(())
@@ -1170,7 +1196,7 @@ async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), 
             "This will permanently delete project `{name}` — every environment, secret and its git cache. Continue? [y/N] "
         ))
     {
-        bg("Aborted (re-run with --force to skip this prompt).");
+        bg(t("confirm.aborted"));
         return Ok(());
     }
     let url = format!("{base}/api/v1/projects/{project_id}");
@@ -1188,7 +1214,7 @@ async fn cmd_rm_project(client: &Client, base: &str, force: bool) -> Result<(), 
         return Err(response_error(&body, status, "deleting project failed"));
     }
     if !emit_json(&json!({ "status": "deleted", "project": name })) {
-        ok(format!("Project `{name}` deleted"));
+        ok(tf("project.deleted", &[("name", name)]));
     }
     Ok(())
 }
@@ -1197,7 +1223,7 @@ async fn cmd_pause(client: &Client, base: &str, branch: &str) -> Result<(), CliE
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     post_empty(client, format!("{base}/api/v1/environments/{env_id}/pause")).await?;
     if !emit_json(&json!({ "status": "paused", "branch": branch })) {
-        bg(format!("Environment `{branch}` paused"));
+        bg(tf("env.paused", &[("branch", branch)]));
     }
     Ok(())
 }
@@ -1206,7 +1232,7 @@ async fn cmd_wake(client: &Client, base: &str, branch: &str) -> Result<(), CliEr
     let (env_id, _) = resolve_environment(client, base, branch).await?;
     post_empty(client, format!("{base}/api/v1/environments/{env_id}/wake")).await?;
     if !emit_json(&json!({ "status": "woken", "branch": branch })) {
-        ok(format!("Environment `{branch}` woken"));
+        ok(tf("env.woken", &[("branch", branch)]));
     }
     Ok(())
 }
@@ -1388,10 +1414,15 @@ async fn cmd_audit(
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
     if events.is_empty() {
-        bg("No audit events yet.");
+        bg(t("empty.audit"));
         return Ok(());
     }
-    println!("{:<24} {:<14} DETAIL", "WHEN", "EVENT");
+    println!(
+        "{:<24} {:<14} {}",
+        t("table.when"),
+        t("table.event"),
+        t("table.detail")
+    );
     for event in events {
         let when = format_occurred_at(&event["occurred_at"]);
         let kind = event["kind"].as_str().unwrap_or("?");
@@ -1482,7 +1513,7 @@ fn cmd_context_add(name: &str, api: String, token: Option<String>) -> Result<(),
         .insert(name.to_owned(), config::Context { api, token });
     config::save(&cfg)?;
     if !emit_json(&json!({ "context": name, "action": "added" })) {
-        ok(format!("Added context `{name}`"));
+        ok(tf("context.added", &[("name", name)]));
     }
     Ok(())
 }
@@ -1500,7 +1531,7 @@ fn cmd_context_use(name: &str) -> Result<(), CliError> {
     cfg.current_context = Some(name.to_owned());
     config::save(&cfg)?;
     if !emit_json(&json!({ "context": name, "action": "activated" })) {
-        ok(format!("Switched to context `{name}`"));
+        ok(tf("context.switched", &[("name", name)]));
     }
     Ok(())
 }
@@ -1521,10 +1552,16 @@ fn cmd_context_list() -> Result<(), CliError> {
         return Ok(());
     }
     if cfg.contexts.is_empty() {
-        bg("No contexts configured yet. Add one with `oxid context add <name> --api <url>`.");
+        bg(t("empty.contexts"));
         return Ok(());
     }
-    println!("{:<4} {:<16} {:<32} TOKEN", "", "NAME", "API");
+    println!(
+        "{:<4} {:<16} {:<32} {}",
+        "",
+        t("table.name"),
+        t("table.api"),
+        t("table.token")
+    );
     for (name, ctx) in &cfg.contexts {
         let marker = if cfg.current_context.as_deref() == Some(name.as_str()) {
             "*"
@@ -1551,7 +1588,7 @@ fn cmd_context_current() -> Result<(), CliError> {
         }
         _ => {
             if !emit_json(&json!({ "context": Value::Null })) {
-                bg("No active context (using --api/OXID_API/default).");
+                bg(t("empty.activeContext"));
             }
             Ok(())
         }
@@ -1579,7 +1616,7 @@ fn cmd_context_remove(name: &str, force: bool) -> Result<(), CliError> {
     }
     config::save(&cfg)?;
     if !emit_json(&json!({ "context": name, "action": "removed" })) {
-        ok(format!("Removed context `{name}`"));
+        ok(tf("context.removed", &[("name", name)]));
     }
     Ok(())
 }
@@ -1593,10 +1630,16 @@ async fn cmd_queue(client: &Client, base: &str) -> Result<(), CliError> {
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
     if entries.is_empty() {
-        bg("Queue is empty — every deploy has capacity.");
+        bg(t("empty.queue"));
         return Ok(());
     }
-    println!("{:<5} {:<24} {:<20} OPERATOR", "POS", "REQUESTED", "BRANCH");
+    println!(
+        "{:<5} {:<24} {:<20} {}",
+        t("table.pos"),
+        t("table.requested"),
+        t("table.branch"),
+        t("table.operator")
+    );
     for (i, entry) in entries.iter().enumerate() {
         let when = format_occurred_at(&entry["requested_at"]);
         let branch = entry["branch"].as_str().unwrap_or("?");
@@ -1624,9 +1667,9 @@ async fn cmd_backup(client: &Client, base: &str, file: &str) -> Result<(), CliEr
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     std::fs::write(file, &bytes).map_err(|e| format!("cannot write `{file}`: {e}"))?;
     if !emit_json(&json!({ "status": "backed-up", "file": file, "bytes": bytes.len() })) {
-        ok(format!(
-            "Backup written to `{file}` ({} bytes)",
-            bytes.len()
+        ok(tf(
+            "backup.written",
+            &[("file", file), ("bytes", &bytes.len().to_string())],
         ));
     }
     Ok(())
@@ -1688,16 +1731,19 @@ async fn cmd_token_create(
     if !emit_json(&value) {
         let token = value["token"].as_str().unwrap_or("?");
         let id = value["id"].as_u64().unwrap_or(0);
-        ok(format!("Token `{name}` created (id {id}): {token}"));
+        ok(tf(
+            "token.created",
+            &[("name", name), ("id", &id.to_string()), ("token", token)],
+        ));
         if projects.is_empty() {
-            bg("Unscoped: this token has full access. Re-create it with --project to limit it.");
+            bg(t("token.unscoped"));
         } else {
-            bg(format!(
-                "Scoped to project ids {projects:?} — every other project answers 404 to this \
-                 token."
+            bg(tf(
+                "token.scoped",
+                &[("projects", &format!("{projects:?}"))],
             ));
         }
-        bg("This is the only time the raw token is shown — store it now.");
+        bg(t("token.onlyOnce"));
     }
     Ok(())
 }
@@ -1711,7 +1757,7 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
         .as_array()
         .ok_or_else(|| "invalid daemon response: expected an array".to_owned())?;
     if tokens.is_empty() {
-        bg("No tokens issued yet.");
+        bg(t("empty.tokens"));
         return Ok(());
     }
     println!(
@@ -1778,10 +1824,8 @@ async fn cmd_token_generate(
     config::save(&cfg)?;
 
     if !emit_json(&json!({ "context": name, "token": token })) {
-        ok(format!("Fetched token and saved it to context `{name}`"));
-        bg(format!(
-            "oxid context use {name}   # if it isn't already active"
-        ));
+        ok(tf("token.fetched", &[("name", &name)]));
+        bg(tf("token.useContext", &[("name", &name)]));
     }
     Ok(())
 }
@@ -1802,7 +1846,7 @@ async fn cmd_token_revoke(client: &Client, base: &str, id: u64) -> Result<(), Cl
         return Err(response_error(&body, status, "revoking token failed"));
     }
     if !emit_json(&json!({ "status": "revoked", "id": id })) {
-        ok(format!("Token {id} revoked"));
+        ok(tf("token.revoked", &[("id", &id.to_string())]));
     }
     Ok(())
 }
@@ -1899,11 +1943,7 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
                  DISABLED (no idle auto-pause; environments run until manually paused/destroyed). \
                  Run `oxid infra setup` on the host to enable the supported Traefik topology",
             ),
-            Some(Err(err)) => bg(format!(
-                "Could not fetch infra status ({}) — the daemon may predate \
-                 `/api/v1/infra/status`; upgrade it to enable this check",
-                err.message
-            )),
+            Some(Err(err)) => bg(tf("doctor.noInfra", &[("error", &err.message)])),
             None => {}
         }
     }
@@ -1925,33 +1965,35 @@ fn print_doctor_report(
     auth_ok: bool,
     node_stats: Option<&Result<Value, String>>,
 ) {
-    ok(format!(
-        "Daemon reachable at {base} (v{daemon_version}, {}ms)",
-        latency.as_millis()
+    ok(tf(
+        "doctor.reachable",
+        &[
+            ("api", base),
+            ("version", daemon_version),
+            ("ms", &latency.as_millis().to_string()),
+        ],
     ));
     if auth_ok {
-        ok("Control API authenticates correctly");
+        ok(t("doctor.authOk"));
     } else {
         bg(
             "Control API requires a token that wasn't provided/didn't work — pass --token or set OXID_TOKEN",
         );
     }
     if version_mismatch {
-        bg(format!(
-            "CLI is v{cli_version} but daemon is v{daemon_version} (major version mismatch) \
-             — upgrade whichever is older; a mismatch across major versions may break API compatibility"
+        bg(tf(
+            "doctor.versionSkew",
+            &[("cli", cli_version), ("daemon", daemon_version)],
         ));
     } else if daemon_version != "unknown" {
-        ok(format!(
-            "CLI (v{cli_version}) and daemon (v{daemon_version}) versions match"
+        ok(tf(
+            "doctor.versionMatch",
+            &[("cli", cli_version), ("daemon", daemon_version)],
         ));
     }
     match node_stats {
         Some(Ok(node_stats)) => print_node_stats(node_stats),
-        Some(Err(message)) => bg(format!(
-            "Could not fetch capacity stats ({message}) — the daemon may predate \
-             `/api/v1/stats`; upgrade it to enable this check"
-        )),
+        Some(Err(message)) => bg(tf("doctor.noStats", &[("error", message)])),
         None => {}
     }
 }
@@ -1970,9 +2012,19 @@ fn print_node_stats(node_stats: &Value) {
     } else {
         #[allow(clippy::cast_precision_loss)]
         let mem_gib = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        ok(format!(
-            "Docker capacity: {cpus} CPU(s), {mem_gib:.1} GiB memory, {} env(s) running",
-            node_stats["environments_running"].as_u64().unwrap_or(0),
+        ok(tf(
+            "doctor.capacity",
+            &[
+                ("cpus", &cpus.to_string()),
+                ("memory", &format!("{mem_gib:.1}")),
+                (
+                    "running",
+                    &node_stats["environments_running"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .to_string(),
+                ),
+            ],
         ));
     }
 }
@@ -2006,7 +2058,7 @@ async fn cmd_rotate_key(client: &Client, base: &str) -> Result<(), CliError> {
     let value: Value =
         serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
     if !emit_json(&value) {
-        ok("Master key rotated — every secret re-encrypted, zero downtime");
+        ok(t("key.rotated"));
         if let Some(note) = value["note"].as_str() {
             bg(note);
         }
@@ -2056,29 +2108,30 @@ async fn cmd_infra_setup(client: &Client, base: &str) -> Result<(), CliError> {
 fn print_infra_report(value: &Value) {
     let network = value["network"].as_str().unwrap_or("?");
     if value["network_exists"].as_bool().unwrap_or(false) {
-        ok(format!("Docker network `{network}` exists"));
+        ok(tf("infra.networkExists", &[("network", network)]));
     } else {
-        bg(format!("Docker network `{network}` does not exist"));
+        bg(tf("infra.networkMissing", &[("network", network)]));
     }
 
     match value["traefik_status"].as_str().unwrap_or("missing") {
         "running" => {
             let port = value["traefik_http_port"].as_u64().unwrap_or(80);
             if port == 80 {
-                ok("Traefik is running");
+                ok(t("infra.traefikRunning"));
             } else {
-                ok(format!(
-                    "Traefik is running (published on host port {port} — branch URLs need it)"
+                ok(tf(
+                    "infra.traefikRunningPort",
+                    &[("port", &port.to_string())],
                 ));
             }
         }
-        "paused" => bg("Traefik container exists but is paused"),
-        "stopped" => bg("Traefik container exists but is stopped"),
-        _ => bg("Traefik is not running"),
+        "paused" => bg(t("infra.traefikPaused")),
+        "stopped" => bg(t("infra.traefikStopped")),
+        _ => bg(t("infra.traefikMissing")),
     }
 
     match value["self_wiring"]["state"].as_str().unwrap_or("unknown") {
-        "not_containerized" => bg("Daemon isn't running inside Docker — self-wiring check skipped"),
+        "not_containerized" => bg(t("infra.notContainerized")),
         "detected" => {
             let wiring = &value["self_wiring"];
             let joined = wiring["joined_network"].as_bool().unwrap_or(false);
@@ -2088,16 +2141,14 @@ fn print_infra_report(value: &Value) {
             let wake = wiring["references_oxid_wake"].as_bool().unwrap_or(false);
             let catchall = wiring["has_wake_catchall"].as_bool().unwrap_or(false);
             if joined && labeled && wake && catchall {
-                ok("This daemon's own container is fully wired for wake-on-request");
+                ok(t("infra.selfWiredFully"));
             } else if joined && labeled && wake {
-                bg(
-                    "Wake-on-request can't reach scaled-to-zero branches: the catch-all router is missing",
-                );
+                bg(t("infra.selfWiredNoCatchall"));
             } else {
-                bg("This daemon's own container is NOT fully wired for wake-on-request");
+                bg(t("infra.selfWiredNot"));
             }
         }
-        _ => bg("Could not determine this daemon's own container wiring"),
+        _ => bg(t("infra.selfWiringUnknown")),
     }
 
     if let Some(steps) = value["next_steps"].as_array() {
@@ -2151,10 +2202,15 @@ async fn cmd_ps(
         return Ok(());
     }
     if projects.is_empty() {
-        bg("No projects registered yet.");
+        bg(t("empty.projects"));
         return Ok(());
     }
-    println!("{:<5} {:<24} BASE DOMAIN", "ID", "NAME");
+    println!(
+        "{:<5} {:<24} {}",
+        t("table.id"),
+        t("table.name"),
+        t("table.baseDomain")
+    );
     for project in &projects {
         println!(
             "{:<5} {:<24} {}",
@@ -2266,8 +2322,8 @@ async fn cmd_env_set(
     }
     if !emit_json(&json!({ "status": "set", "name": name, "scope": scope })) {
         match branch {
-            Some(b) => ok(format!("Secret `{name}` set for branch `{b}`")),
-            None => ok(format!("Secret `{name}` set ({scope})")),
+            Some(b) => ok(tf("secret.setBranch", &[("name", name), ("branch", &b)])),
+            None => ok(tf("secret.set", &[("name", name), ("scope", scope)])),
         }
     }
     Ok(())
@@ -2312,10 +2368,10 @@ async fn cmd_env_list(
         return Ok(());
     }
     if secrets.is_empty() {
-        bg("No secrets in this scope.");
+        bg(t("empty.secrets"));
         return Ok(());
     }
-    println!("{:<28} SCOPE", "NAME");
+    println!("{:<28} {}", t("table.name"), t("table.scope"));
     for secret in &secrets {
         println!(
             "{:<28} {}",
@@ -2361,7 +2417,7 @@ async fn cmd_env_delete(
         return Err(response_error(&body, status, "deleting secret failed"));
     }
     if !emit_json(&json!({ "status": "deleted", "name": name })) {
-        ok(format!("Secret `{name}` deleted"));
+        ok(tf("secret.deleted", &[("name", name)]));
     }
     Ok(())
 }
