@@ -1,0 +1,15 @@
+-- Index the column the busiest query in the system filters on.
+--
+-- `find_by_url` resolves a `Host` header to its environment, and Traefik's
+-- `forwardAuth` heartbeat calls it on *every* HTTP request to *every*
+-- environment — so does every wake. Without an index that was a full scan of
+-- a table which only grows: one row per deploy is kept as history, so a node
+-- a team has used for a few months holds tens of thousands of them and every
+-- page view of every preview environment scanned all of them.
+--
+-- Not UNIQUE: two branches whose names normalise to the same DNS label do
+-- collide on one URL, and the deploy path refuses the second one with an
+-- explanation. A constraint here would instead surface that as an opaque
+-- database error, and would fail outright on the historical rows a node
+-- created before that check existed.
+CREATE INDEX IF NOT EXISTS idx_environments_url ON environments(url);

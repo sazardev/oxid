@@ -36,6 +36,7 @@ Daemon configuration is via environment variables (see `crates/oxid-daemon/src/m
 - `OXID_GC_INTERVAL_SECS` (default 30) — scheduler tick for scale-to-zero GC
 - `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required together) — per-client-IP bucket on protected routes
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
+- `OXID_DB_MAX_CONNECTIONS` (default 8) — SQLite pool size. WAL lets readers and the writer proceed in parallel, so the read-heavy hot paths (the `forwardAuth` heartbeat on every request, dashboard polling, `oxid status`) overlap instead of queueing. Writes still serialize — that is SQLite — so `busy_timeout`/`acquire_timeout` are set explicitly
 - `OXID_TRAEFIK_HTTP_PORT` (default 80) — host port `oxid infra setup` publishes the built-in Traefik on. Traefik always listens on 80 *inside* its container; only the host side is configurable, so a machine whose 80 is already taken can still bootstrap
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. — see `main.rs`
 
@@ -75,6 +76,16 @@ Redeploys are zero-downtime: the new container is built and started before traff
 When adding a capability, prefer: domain rules and new port methods in `oxid-core`, adapter implementation in `oxid-daemon/src/adapter/*`, orchestration in `oxid-daemon/src/service/control_plane/`, and HTTP/CLI exposure last. Keep `oxid-core` free of any I/O, SQL, Docker, or HTTP dependency — `crates/oxid-core/Cargo.toml` must never gain `tokio|sqlx|bollard|axum|reqwest|git2|hyper|tower|tar`; this is enforced both by `.githooks/_lib.sh:check_hexagonal_boundary` and in CI (`ci.yml`).
 
 The project (`oxid.toml`) config schema and its `[project]`/`[build]`/`[routing]`/`[dependencies]` sections are specified in `IDEA.md`; `crates/oxid-core/src/domain/project_config.rs` is the domain-side model for it.
+
+## Database
+
+One SQLite file, WAL, opened as a pool (`OXID_DB_MAX_CONNECTIONS`, default 8). Three things are load-bearing and easy to undo:
+
+- **`open_in_memory` keeps exactly one connection.** Every connection to `:memory:` gets its own empty database, so a pool there hands each caller a different, migration-less copy — tests fail in ways that look like data loss.
+- **`rotate_master_key` uses `BEGIN IMMEDIATE`.** Exclusion from concurrent secret writes used to come free from a single-connection pool; a deferred transaction takes the write lock only at its first write, leaving a window where a secret written under the *old* key would survive the swap and become undecryptable.
+- **`touch_by_url` coalesces.** Traefik calls the heartbeat on every request to every environment and it is deliberately unauthenticated, so a write per call is both waste and an amplifier. The timestamp only feeds idle detection, whose threshold is minutes.
+
+Measured on 12k environments / 60k audit events: heartbeat throughput went from flat at ~180 req/s (1→64 concurrent, p50 6ms→321ms) to 948–5108 req/s with p50 under 12ms. `environments(url)` is indexed — it is the column the busiest query in the system filters on.
 
 ## Internationalisation
 

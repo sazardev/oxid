@@ -79,18 +79,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // question has already persisted its own row in that state, and
         // deploys are serialized, so counting it would double-count the
         // request against itself.
-        let mut committed_mb: u64 = 0;
-        for env in self.store.list_by_state(EnvironmentState::Running).await? {
-            let Some(env_project) = ProjectStore::get(&self.store, env.project_id).await? else {
-                continue;
-            };
-            committed_mb += env_project
-                .config
-                .build
-                .memory_limit_mb
-                .or(self.default_memory_limit_mb)
-                .unwrap_or(0);
-        }
+        let committed_mb = self
+            .store
+            .committed_memory_mb(self.default_memory_limit_mb.unwrap_or(0))
+            .await?;
 
         if committed_mb + request_mb > usable_mb {
             Ok(Admission::Queue)

@@ -2303,3 +2303,48 @@ async fn waking_triggers_on_gateway_errors_not_on_the_apps_own_500() {
         "an application 500 must reach the developer, not the wake page"
     );
 }
+
+/// A heartbeat writes at most once per coalescing window.
+///
+/// Traefik calls it on every request to every environment and it is
+/// deliberately unauthenticated, so persisting a row per call is both waste
+/// and an amplifier anyone who can reach the proxy could drive. The
+/// timestamp only feeds idle detection, whose threshold is minutes.
+#[tokio::test]
+async fn repeated_heartbeats_do_not_write_on_every_request() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    // Age the row past the window so the first heartbeat definitely writes.
+    let stale = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    touch_env(&cp, env.clone(), stale).await;
+
+    cp.touch_by_url(&env.url).await.unwrap();
+    let first = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_accessed_at;
+    assert!(first > stale, "a stale row must be refreshed");
+
+    // Everything that follows inside the window is a read: the recorded
+    // time must not move.
+    for _ in 0..20 {
+        cp.touch_by_url(&env.url).await.unwrap();
+    }
+    let after = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_accessed_at;
+    assert_eq!(
+        after, first,
+        "heartbeats inside the window must not each persist a row"
+    );
+}

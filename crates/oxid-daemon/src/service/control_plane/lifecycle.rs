@@ -32,6 +32,12 @@ use oxid_core::{
     SecretValue, SelfWiringStatus, StateTransition, TraefikSpec, Ttl,
 };
 
+/// How stale `last_accessed_at` may get before a heartbeat actually writes
+/// it. Far below the shortest `pause_after` anyone configures, so idle
+/// detection is unaffected, and far above a request rate, so a busy
+/// environment writes once per window instead of once per request.
+const TOUCH_COALESCE_WINDOW: time::Duration = time::Duration::seconds(15);
+
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Suspends an environment (scale-to-zero), unattributed.
     ///
@@ -176,6 +182,26 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Ok(());
         };
         let now = OffsetDateTime::now_utc();
+
+        // Coalesce: only write when the recorded time is actually stale.
+        //
+        // Traefik calls this through `forwardAuth` on *every* HTTP request to
+        // *every* environment — every page, every asset, every XHR — and it
+        // used to persist a row on each one. That is a write amplifier on an
+        // endpoint that is deliberately unauthenticated (Traefik has no
+        // token), so anyone who can reach the proxy could drive unbounded
+        // writes and WAL growth.
+        //
+        // Nothing is lost by skipping them: this timestamp exists only to
+        // decide when `gc::evaluate` should pause an idle environment, and
+        // that threshold is `pause_after` — minutes at the shortest. Being a
+        // few seconds behind cannot change a decision measured in minutes,
+        // while a busy environment goes from one write per request to one
+        // per interval.
+        if now - env.last_accessed_at < TOUCH_COALESCE_WINDOW {
+            return Ok(());
+        }
+
         // Touching is best-effort bookkeeping; a Destroyed/terminal state
         // simply can't be touched and that's fine to ignore.
         let _ = env.touch(now);

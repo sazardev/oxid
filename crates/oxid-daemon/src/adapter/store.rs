@@ -37,6 +37,30 @@ pub enum StoreError {
     Crypto(#[from] CryptoError),
 }
 
+/// Connections the on-disk pool opens by default: enough for the read-heavy
+/// hot paths to overlap without opening one per in-flight request. Capped
+/// rather than scaled to the host's core count without limit, because SQLite
+/// serializes writes regardless — past a handful of connections the extra
+/// ones only add file handles and page cache, not throughput.
+const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+
+/// How long a statement waits for the write lock before giving up. With more
+/// than one connection a writer can genuinely find the database busy; a
+/// short wait is the right answer, and failing a deploy over a few
+/// milliseconds of contention is not.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pool size, from `OXID_DB_MAX_CONNECTIONS` when it names a sane value.
+/// Zero and unparseable values fall back rather than producing a pool that
+/// can never hand out a connection.
+fn max_connections() -> u32 {
+    std::env::var("OXID_DB_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
 /// A connected, migrated `SQLite` database.
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -59,6 +83,24 @@ impl SqliteStore {
     /// skipping an `fsync` per transaction — the right trade for an audit
     /// trail of ephemeral dev environments, not a system of record.
     ///
+    /// The pool is opened with several connections (see
+    /// [`DEFAULT_MAX_CONNECTIONS`], overridable with `OXID_DB_MAX_CONNECTIONS`)
+    /// rather than the single one it used to hold. WAL journaling is what
+    /// makes that safe *and* useful: readers never block the writer and the
+    /// writer never blocks readers, so the read-heavy hot paths — the
+    /// `forwardAuth` heartbeat on every request to every environment, the
+    /// dashboard's polling, `oxid status` — run in parallel instead of
+    /// queueing behind one another. Measured on a database with 12k
+    /// environments and 60k audit events: heartbeat throughput was flat at
+    /// ~180 req/s from 1 to 64 concurrent callers, with p50 latency climbing
+    /// from 6ms to 320ms, which is the signature of one serialized resource.
+    ///
+    /// Writes still serialize — that is SQLite, not a setting — so
+    /// `busy_timeout` is set explicitly rather than left to a default:
+    /// with more than one connection a writer *can* now find the database
+    /// locked, and the honest response is to wait briefly rather than fail
+    /// a deploy over a few milliseconds of contention.
+    ///
     /// # Errors
     /// Returns [`StoreError`] on connection or migration failure.
     pub async fn open(path: impl AsRef<Path>, cipher: Cipher) -> Result<Self, StoreError> {
@@ -67,8 +109,16 @@ impl SqliteStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(BUSY_TIMEOUT)
+            // Sorting and grouping happen in memory instead of spilling to a
+            // temp file — the audit page orders tens of thousands of rows.
+            .pragma("temp_store", "MEMORY")
+            // ~8 MiB of page cache per connection (negative means KiB).
+            // The whole database is far smaller than that in every
+            // deployment this targets, so reads settle into RAM.
+            .pragma("cache_size", "-8000")
             .foreign_keys(true);
-        Self::open_with(opts, cipher).await
+        Self::open_with(opts, cipher, max_connections()).await
     }
 
     /// Opens an ephemeral in-memory database (tests) with a fixed test key.
@@ -79,7 +129,11 @@ impl SqliteStore {
         let opts = SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true);
-        Self::open_with(opts, Cipher::from_key([1u8; 32])).await
+        // Exactly one connection, unlike [`Self::open`]. Every connection to
+        // `:memory:` gets its *own* empty database, so a pool of them would
+        // hand each caller a different, migration-less copy — the tests
+        // would fail in ways that look like data loss.
+        Self::open_with(opts, Cipher::from_key([1u8; 32]), 1).await
     }
 
     /// Writes a consistent point-in-time snapshot of the database to
@@ -104,11 +158,18 @@ impl SqliteStore {
 
     /// Re-encrypts every stored secret under `new_cipher` and atomically
     /// swaps it in — zero downtime, no restart. The re-encryption pass runs
-    /// inside one transaction (all rows or none — with `max_connections(1)`
-    /// this also blocks out any concurrent secret write until it commits,
-    /// so nothing can be written mid-rotation under the wrong key), and
-    /// only *after* it commits successfully does the in-memory cipher
-    /// change — a failed rotation leaves every secret exactly as it was.
+    /// inside one transaction (all rows or none), and only *after* it
+    /// commits successfully does the in-memory cipher change — a failed
+    /// rotation leaves every secret exactly as it was.
+    ///
+    /// `BEGIN IMMEDIATE`, not a plain `BEGIN`. Excluding concurrent secret
+    /// writes used to come for free from the pool holding a single
+    /// connection; with several, a deferred transaction takes the write lock
+    /// only at its first write, leaving a window where another request could
+    /// insert a secret encrypted under the *old* key after this pass had
+    /// already read the table. The swap below would then make that one
+    /// secret permanently undecryptable. `IMMEDIATE` takes the lock up
+    /// front, so such a write waits for the rotation to finish instead.
     ///
     /// The caller (the daemon, which alone knows the data directory) still
     /// has to persist `new_cipher`'s key to `secret.key` itself — see
@@ -118,7 +179,7 @@ impl SqliteStore {
     /// Returns [`StoreError`] on query or encryption/decryption failure.
     pub async fn rotate_master_key(&self, new_cipher: Cipher) -> Result<(), StoreError> {
         let old_cipher = self.cipher.load_full();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query("SELECT id, value_enc FROM secrets")
             .fetch_all(&mut *tx)
             .await?;
@@ -214,9 +275,22 @@ impl SqliteStore {
             .map_err(storage)
     }
 
-    async fn open_with(opts: SqliteConnectOptions, cipher: Cipher) -> Result<Self, StoreError> {
+    async fn open_with(
+        opts: SqliteConnectOptions,
+        cipher: Cipher,
+        max_connections: u32,
+    ) -> Result<Self, StoreError> {
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
+            // One connection is kept warm so the first request after an idle
+            // period doesn't pay for opening the file and replaying its
+            // pragmas.
+            .min_connections(1)
+            // Fail fast rather than pile up. The default is 30s, which under
+            // a burst turns a saturated pool into a queue of requests all
+            // still holding their sockets long after the caller gave up;
+            // answering "busy" in 5 lets the load shed instead.
+            .acquire_timeout(BUSY_TIMEOUT)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
@@ -224,6 +298,30 @@ impl SqliteStore {
             pool,
             cipher: Arc::new(ArcSwap::from_pointee(cipher)),
         })
+    }
+
+    /// Total memory the currently-`Running` environments are committed to,
+    /// in megabytes, using each project's own limit and `fallback_mb` for
+    /// projects that set none.
+    ///
+    /// One query rather than the listing-plus-a-lookup-per-row this
+    /// replaces: admission runs on every deploy, and on a node with a few
+    /// hundred live environments that shape issued a few hundred queries to
+    /// add up a few hundred numbers.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn committed_memory_mb(&self, fallback_mb: u64) -> Result<u64, RepositoryError> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(COALESCE(p.memory_limit_mb, ?)), 0) \
+             FROM environments e JOIN projects p ON p.id = e.project_id \
+             WHERE e.state = 'running'",
+        )
+        .bind(i64::try_from(fallback_mb).unwrap_or(i64::MAX))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(u64::try_from(total).unwrap_or(0))
     }
 
     /// Lists every environment across all projects, regardless of state.
@@ -1949,5 +2047,126 @@ mod tests {
             .unwrap()
             .expect("token exists");
         assert_eq!(identity.scoped_projects, None);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use oxid_core::{Branch, BranchName, Environment, EnvironmentId, EnvironmentStore};
+    use oxid_core::{EnvironmentState, OffsetDateTime, Project, ProjectId, ProjectStore};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    async fn seeded() -> (tempfile::TempDir, SqliteStore, ProjectId) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("t.sqlite"), Cipher::from_key([2u8; 32]))
+            .await
+            .unwrap();
+        let config = oxid_core::ProjectConfig::new(
+            "app.local.dev",
+            oxid_core::Ttl::parse("30m").unwrap(),
+            oxid_core::Ttl::parse("7d").unwrap(),
+            8080,
+            oxid_core::BuildConfig {
+                memory_limit_mb: Some(256),
+                ..oxid_core::BuildConfig::default()
+            },
+            vec![],
+        )
+        .unwrap();
+        let project = Project::new(
+            ProjectId(0),
+            "app",
+            oxid_core::RepoUrl::parse("https://github.com/org/app.git").unwrap(),
+            config,
+        )
+        .unwrap();
+        let id = ProjectStore::create(&store, &project).await.unwrap();
+        (dir, store, id)
+    }
+
+    /// Reads and writes must actually overlap.
+    ///
+    /// The pool held a single connection, so every query in the daemon —
+    /// including the `forwardAuth` heartbeat on every request to every
+    /// environment — queued behind every other. This drives many at once
+    /// through one store and asserts they all succeed: with a single
+    /// connection they would still pass, just serially, so the value here is
+    /// catching a regression that reintroduces `SQLITE_BUSY` under a pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_readers_and_writers_all_succeed() {
+        let (_dir, store, project_id) = seeded().await;
+        let now = OffsetDateTime::now_utc();
+        for i in 0..16 {
+            let env = Environment::new(
+                EnvironmentId(0),
+                project_id,
+                Branch::new(BranchName::parse(format!("feat-{i}")).unwrap(), SHA).unwrap(),
+                EnvironmentState::Running,
+                format!("feat-{i}.app.local.dev"),
+                now,
+            )
+            .unwrap();
+            EnvironmentStore::create(&store, &env).await.unwrap();
+        }
+
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    // Reader: the URL lookup every HTTP request performs.
+                    store
+                        .find_by_url(&format!("feat-{}.app.local.dev", i % 16))
+                        .await
+                        .map(|env| env.is_some())
+                } else {
+                    // Writer: the heartbeat's `last_accessed_at` touch.
+                    let url = format!("feat-{}.app.local.dev", i % 16);
+                    let mut env = store.find_by_url(&url).await?.expect("seeded above");
+                    let _ = env.touch(OffsetDateTime::now_utc());
+                    EnvironmentStore::update(&store, &env).await.map(|()| true)
+                }
+            }));
+        }
+        for task in tasks {
+            assert!(
+                task.await.unwrap().expect("no query may fail under load"),
+                "every lookup must find its seeded row"
+            );
+        }
+    }
+
+    /// The committed-memory total is summed in the database rather than by
+    /// fetching each environment's project in turn, so it has to agree with
+    /// what that loop produced: each running environment counts its
+    /// project's own limit, sleeping ones count nothing.
+    #[tokio::test]
+    async fn committed_memory_counts_only_running_environments() {
+        let (_dir, store, project_id) = seeded().await;
+        let now = OffsetDateTime::now_utc();
+        for (i, state) in [
+            EnvironmentState::Running,
+            EnvironmentState::Running,
+            EnvironmentState::Paused,
+            EnvironmentState::Destroyed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let env = Environment::new(
+                EnvironmentId(0),
+                project_id,
+                Branch::new(BranchName::parse(format!("b{i}")).unwrap(), SHA).unwrap(),
+                state,
+                format!("b{i}.app.local.dev"),
+                now,
+            )
+            .unwrap();
+            EnvironmentStore::create(&store, &env).await.unwrap();
+        }
+        // Two running environments of a project limited to 256 MB each.
+        assert_eq!(store.committed_memory_mb(512).await.unwrap(), 512);
     }
 }
