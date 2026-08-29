@@ -215,6 +215,15 @@ h2 {
   margin-top: 4px;
 }
 
+/* Language switcher: sized to its two-letter labels so it sits in the
+   connection strip without pushing the token field around. */
+.lang-select {
+  width: auto;
+  min-width: 4.5ch;
+  padding-right: 4px;
+  text-transform: uppercase;
+}
+
 .state-running {
   color: var(--patina-green);
 }

@@ -71,6 +71,16 @@ pub async fn dashboard_app_js() -> impl IntoResponse {
     )
 }
 
+/// The translation catalog. Its own asset rather than part of `app.js`
+/// because it is the file a translator edits, and separating it means adding
+/// a language never means reading application code.
+pub async fn dashboard_i18n_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../../web/i18n.js"),
+    )
+}
+
 pub async fn dashboard_alpine_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],

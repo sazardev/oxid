@@ -494,6 +494,7 @@ async fn dashboard_static_assets_are_served_without_a_token() {
         ("/index.html", "OXID"),
         ("/style.css", "--oxid-orange"),
         ("/app.js", "function dashboard()"),
+        ("/i18n.js", "OxidI18n"),
         ("/vendor/alpine.min.js", "Alpine"),
     ] {
         let (status, body) = json_request(&app, "GET", path, json!({})).await;
@@ -3260,4 +3261,74 @@ async fn the_wake_page_marks_itself_so_the_poll_can_tell_when_it_is_gone() {
             .and_then(|v| v.to_str().ok()),
         Some("1")
     );
+}
+
+/// Every string the dashboard asks for must exist in every language.
+///
+/// The catalog and the markup are separate files, so a renamed key or a
+/// language missing an entry is invisible until someone loads that page in
+/// that language and finds the raw key — or an empty element — where the
+/// text should be. Checked here rather than by eye because the catalog has
+/// hundreds of entries and grows with every feature.
+#[test]
+fn every_dashboard_string_exists_in_every_language() {
+    let catalog = include_str!("../../web/i18n.js");
+    let markup = include_str!("../../web/index.html");
+    let script = include_str!("../../web/app.js");
+
+    let locales = ["en", "es"];
+    let keys_in = |locale: &str| -> Vec<String> {
+        // Each locale is a `<code>: { ... }` block of `"key": "value"`
+        // pairs; the keys are what matters here, not the prose.
+        let start = catalog
+            .find(&format!("\n    {locale}: {{"))
+            .unwrap_or_else(|| panic!("catalog has no `{locale}` block"));
+        let rest = &catalog[start + 1..];
+        let end = rest.find("\n    },").expect("unterminated locale block");
+        rest[..end]
+            .lines()
+            .filter_map(|line| {
+                // Only `"key":` starts an entry. A value long enough to wrap
+                // continues on its own line starting with a quote too, so
+                // requiring the colon is what keeps prose out of the keys.
+                let line = line.trim();
+                let (key, rest) = line.strip_prefix('"')?.split_once('"')?;
+                rest.starts_with(':').then(|| key.to_owned())
+            })
+            .collect()
+    };
+
+    let english = keys_in("en");
+    assert!(
+        english.len() > 100,
+        "catalog looks truncated: {}",
+        english.len()
+    );
+    for locale in locales {
+        let keys = keys_in(locale);
+        for key in &english {
+            assert!(keys.contains(key), "`{locale}` is missing `{key}`");
+        }
+        assert_eq!(keys.len(), english.len(), "`{locale}` has extra keys");
+    }
+
+    // And every key the UI actually asks for must be one of them.
+    for source in [markup, script] {
+        for fragment in source.split("t('").skip(1) {
+            let Some((key, _)) = fragment.split_once('\'') else {
+                continue;
+            };
+            if key.is_empty()
+                || !key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            {
+                continue;
+            }
+            assert!(
+                english.contains(&key.to_owned()),
+                "UI uses undefined key `{key}`"
+            );
+        }
+    }
 }

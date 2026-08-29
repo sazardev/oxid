@@ -58,7 +58,8 @@ pub mod types;
 pub(crate) const DEFAULT_AUDIT_LIMIT: u64 = 50;
 
 pub use dashboard::{
-    dashboard_alpine_js, dashboard_app_js, dashboard_index, dashboard_style, health,
+    dashboard_alpine_js, dashboard_app_js, dashboard_i18n_js, dashboard_index, dashboard_style,
+    health,
 };
 pub use error::{ApiError, ApiResult};
 use middleware::AuthedAs;
@@ -263,6 +264,7 @@ pub fn router<
         .route("/index.html", get(dashboard_index))
         .route("/style.css", get(dashboard_style))
         .route("/app.js", get(dashboard_app_js))
+        .route("/i18n.js", get(dashboard_i18n_js))
         .route("/vendor/alpine.min.js", get(dashboard_alpine_js))
         // Traefik's `errors` middleware always issues a GET when it
         // substitutes a custom error page (confirmed live: the original

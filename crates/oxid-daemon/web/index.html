@@ -6,6 +6,7 @@
     <title>Oxid — Control Plane</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/style.css" />
+    <script src="/i18n.js" defer></script>
     <script src="/app.js" defer></script>
     <script src="/vendor/alpine.min.js" defer></script>
   </head>
@@ -22,131 +23,138 @@
           <path d="M50 4 L93 27" stroke="#121212" stroke-width="8" />
         </svg>
         <span class="wordmark">OXID</span>
-        <span class="tagline">control plane</span>
+        <span class="tagline" x-text="t('app.tagline')"></span>
       </div>
       <nav class="nav">
-        <a href="/ui/environments" :class="route.name==='environments'&&'active'" @click.prevent="go('/ui/environments')">environments</a>
-        <a href="/ui/projects" :class="(route.name==='projects'||route.name==='project'||route.name==='projectSecrets')&&'active'" @click.prevent="go('/ui/projects')">projects</a>
-        <a href="/ui/queue" :class="route.name==='queue'&&'active'" @click.prevent="go('/ui/queue')">queue</a>
-        <a href="/ui/audit" :class="route.name==='audit'&&'active'" @click.prevent="go('/ui/audit')">audit</a>
-        <a href="/ui/secrets" :class="route.name==='secrets'&&'active'" @click.prevent="go('/ui/secrets')">secrets</a>
-        <a href="/ui/admin" :class="route.name==='admin'&&'active'" @click.prevent="go('/ui/admin')">admin</a>
-        <a href="/ui/onboarding" :class="route.name==='onboarding'&&'active'" @click.prevent="go('/ui/onboarding')" title="First-run setup wizard">setup</a>
+        <a href="/ui/environments" :class="route.name==='environments'&&'active'" @click.prevent="go('/ui/environments')" x-text="t('nav.environments')"></a>
+        <a href="/ui/projects" :class="(route.name==='projects'||route.name==='project'||route.name==='projectSecrets')&&'active'" @click.prevent="go('/ui/projects')" x-text="t('nav.projects')"></a>
+        <a href="/ui/queue" :class="route.name==='queue'&&'active'" @click.prevent="go('/ui/queue')" x-text="t('nav.queue')"></a>
+        <a href="/ui/audit" :class="route.name==='audit'&&'active'" @click.prevent="go('/ui/audit')" x-text="t('nav.audit')"></a>
+        <a href="/ui/secrets" :class="route.name==='secrets'&&'active'" @click.prevent="go('/ui/secrets')" x-text="t('nav.secrets')"></a>
+        <a href="/ui/admin" :class="route.name==='admin'&&'active'" @click.prevent="go('/ui/admin')" x-text="t('nav.admin')"></a>
+        <a href="/ui/onboarding" :class="route.name==='onboarding'&&'active'" @click.prevent="go('/ui/onboarding')" :title="t('nav.setupTitle')" x-text="t('nav.setup')"></a>
       </nav>
       <div class="conn">
         <span
           class="dot"
           :class="online ? 'dot-green' : 'dot-red'"
-          :title="online ? 'Connected' : 'Unreachable'"
+          :title="online ? t('conn.connected') : t('conn.unreachable')"
         ></span>
         <input
           class="token-input"
           type="password"
-          placeholder="Bearer token (if configured)"
+          :placeholder="t('conn.tokenPlaceholder')"
           x-model="token"
           @change="saveToken()"
         />
-        <button class="btn btn-ghost" @click="loadForRoute()" title="Refresh now">⟳</button>
+        <select
+          class="token-input lang-select"
+          :title="t('conn.language')"
+          :aria-label="t('conn.language')"
+          x-model="locale"
+          @change="setLocale(locale)"
+        >
+          <template x-for="l in locales" :key="l.code">
+            <option :value="l.code" x-text="l.label" :title="l.name"></option>
+          </template>
+        </select>
+        <button class="btn btn-ghost" @click="loadForRoute()" :title="t('conn.refresh')">⟳</button>
       </div>
     </header>
 
     <div class="banner banner-error" x-show="authError && route.name !== 'onboarding'" x-cloak>
-      [!] 401/403 from the daemon — check the bearer token above.
+      <span x-text="t('banner.authError')"></span>
     </div>
     <div class="banner banner-error" x-show="connError && route.name !== 'onboarding'" x-cloak>
-      [!] Cannot reach the daemon at <code x-text="apiBase"></code>.
+      <span x-text="t('banner.connError')"></span> <code x-text="apiBase"></code>.
     </div>
     <div
       class="banner banner-ok"
       x-show="notice && route.name !== 'onboarding'"
       x-cloak
-      x-text="notice + '  [click to dismiss]'"
+      x-text="notice + '  ' + t('banner.dismiss')"
       @click="notice = ''"
     ></div>
 
     <section class="stats" x-show="route.name !== 'onboarding'" x-cloak>
       <div class="stat-card">
         <div class="stat-value" x-text="stats.projects ?? '—'"></div>
-        <div class="stat-label">Projects</div>
+        <div class="stat-label" x-text="t('stats.projects')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value state-running" x-text="stats.environments_running ?? '—'"></div>
-        <div class="stat-label">Running</div>
+        <div class="stat-label" x-text="t('stats.running')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value state-paused" x-text="stats.environments_paused ?? '—'"></div>
-        <div class="stat-label">Paused</div>
+        <div class="stat-label" x-text="t('stats.paused')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value state-building" x-text="stats.environments_building ?? '—'"></div>
-        <div class="stat-label">Building</div>
+        <div class="stat-label" x-text="t('stats.building')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value" x-text="stats.environments_hibernating ?? '—'"></div>
-        <div class="stat-label">Hibernating</div>
+        <div class="stat-label" x-text="t('stats.hibernating')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value state-build_failed" x-text="stats.environments_build_failed ?? '—'"></div>
-        <div class="stat-label">Failed</div>
+        <div class="stat-label" x-text="t('stats.failed')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value" x-text="stats.queue_length ?? '—'"></div>
-        <div class="stat-label">Queued</div>
+        <div class="stat-label" x-text="t('stats.queued')"></div>
       </div>
       <div class="stat-card">
         <div class="stat-value" x-text="hostMemoryLabel()"></div>
-        <div class="stat-label">Host memory</div>
+        <div class="stat-label" x-text="t('stats.hostMemory')"></div>
       </div>
     </section>
 
     <main :class="route.name === 'onboarding' ? 'onboarding-container' : 'page-container'">
       <!-- ================= ENVIRONMENTS (home) ================= -->
       <section class="page" x-show="route.name === 'environments'" x-cloak>
-        <p class="muted" x-show="!stats.traefik_enabled">
-          [~] No Traefik configured (<code>OXID_DOCKER_NETWORK</code> unset) — URLs below link to
-          each environment's own dynamically-assigned host port instead of a subdomain. Docker
-          picks a free port per deploy, so multiple branches of the same project can run
-          simultaneously even without Traefik — the port just isn't stable across redeploys.
-        </p>
+        <p class="muted" x-show="!stats.traefik_enabled"
+           x-text="t('env.noTraefik', { var: 'OXID_DOCKER_NETWORK' })"></p>
         <div class="page-head">
-          <h1>Environments</h1>
+          <h1 x-text="t('env.title')"></h1>
           <div class="filters">
             <select class="token-input mono" x-model="filterProject" @change="setQuery({project: filterProject})">
-              <option value="">all projects</option>
+              <option value="" x-text="t('env.allProjects')"></option>
               <template x-for="p in projects" :key="p.id">
                 <option :value="p.id" x-text="p.name"></option>
               </template>
             </select>
             <select class="token-input mono" x-model="filterState" @change="setQuery({state: filterState})">
-              <option value="">all states</option>
-              <option value="running">running</option>
-              <option value="paused">paused</option>
-              <option value="building">building</option>
-              <option value="hibernating">hibernating</option>
-              <option value="build_failed">build failed</option>
+              <option value="" x-text="t('env.allStates')"></option>
+              <option value="running" x-text="t('state.running')"></option>
+              <option value="paused" x-text="t('state.paused')"></option>
+              <option value="building" x-text="t('state.building')"></option>
+              <option value="hibernating" x-text="t('state.hibernating')"></option>
+              <option value="build_failed" x-text="t('state.build_failed')"></option>
             </select>
             <input
               class="token-input mono"
               type="text"
-              placeholder="search branch..."
+              :placeholder="t('env.searchBranch')"
               x-model="filterQuery"
               @input.debounce.300ms="setQuery({q: filterQuery})"
             />
           </div>
         </div>
         <template x-if="filteredEnvironments().length === 0">
-          <p class="muted">No environments match. Run <code>oxid up &lt;branch&gt;</code>, or clear the filters.</p>
+          <p class="muted" x-text="t('env.empty', { cmd: 'oxid up <branch>' })"></p>
         </template>
         <table class="env-table" x-show="filteredEnvironments().length > 0">
           <thead>
             <tr>
-              <th>Project</th>
-              <th>Branch</th>
-              <th>State</th>
-              <th>URL</th>
-              <th>Created</th>
-              <th>Last seen</th>
-              <th>Updated</th>
+              <th x-text="t('env.col.project')"></th>
+              <th x-text="t('env.col.branch')"></th>
+              <th x-text="t('env.col.state')"></th>
+              <th x-text="t('env.col.url')"></th>
+              <th x-text="t('env.col.created')"></th>
+              <th x-text="t('env.col.lastSeen')"></th>
+              <th x-text="t('env.col.updated')"></th>
               <th></th>
             </tr>
           </thead>
@@ -162,7 +170,7 @@
                 <td>
                   <span class="badge" :class="'badge-' + env.state">
                     <span x-show="env.state === 'building'" class="spinner"></span>
-                    <span x-text="env.state"></span>
+                    <span x-text="stateLabel(env.state)"></span>
                   </span>
                 </td>
                 <td>
@@ -172,17 +180,15 @@
                 <td class="mono muted" x-text="formatTime(env.last_accessed_at)"></td>
                 <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
                 <td class="actions">
-                  <button class="btn btn-sm" x-show="env.state === 'running'" @click="pause(env)">pause</button>
+                  <button class="btn btn-sm" x-show="env.state === 'running'" @click="pause(env)" x-text="t('action.pause')"></button>
                   <button
                     class="btn btn-sm"
                     x-show="env.state === 'paused' || env.state === 'hibernating'"
                     @click="wake(env)"
-                  >
-                    wake
-                  </button>
-                  <button class="btn btn-sm btn-danger" x-show="env.state !== 'destroyed'" @click="destroy(env)">
-                    destroy
-                  </button>
+                    x-text="t('action.wake')"
+                  ></button>
+                  <button class="btn btn-sm btn-danger" x-show="env.state !== 'destroyed'" @click="destroy(env)"
+                          x-text="t('action.destroy')"></button>
                 </td>
               </tr>
             </template>
@@ -198,46 +204,42 @@
               <h1>
                 <a class="link" href="#" @click.prevent="go('/ui/projects/' + currentEnvironment().projectId)" x-text="currentEnvironment().projectName"></a>
                 / <span class="mono" x-text="currentEnvironment().branch.name"></span>
-                <span class="badge" :class="'badge-' + currentEnvironment().state" x-text="currentEnvironment().state"></span>
+                <span class="badge" :class="'badge-' + currentEnvironment().state" x-text="stateLabel(currentEnvironment().state)"></span>
               </h1>
               <div class="project-actions">
-                <button class="btn btn-sm" x-show="currentEnvironment().state === 'running'" @click="pause(currentEnvironment())">pause</button>
+                <button class="btn btn-sm" x-show="currentEnvironment().state === 'running'" @click="pause(currentEnvironment())" x-text="t('action.pause')"></button>
                 <button
                   class="btn btn-sm"
                   x-show="currentEnvironment().state === 'paused' || currentEnvironment().state === 'hibernating'"
                   @click="wake(currentEnvironment())"
-                >
-                  wake
-                </button>
+                  x-text="t('action.wake')"
+                ></button>
                 <button
                   class="btn btn-sm"
                   @click="rollback({id: currentEnvironment().projectId}, currentEnvironment())"
-                >
-                  rollback
-                </button>
-                <button class="btn btn-sm btn-danger" x-show="currentEnvironment().state !== 'destroyed'" @click="destroy(currentEnvironment())">
-                  destroy
-                </button>
+                  x-text="t('action.rollback')"
+                ></button>
+                <button class="btn btn-sm btn-danger" x-show="currentEnvironment().state !== 'destroyed'" @click="destroy(currentEnvironment())"
+                        x-text="t('action.destroy')"></button>
               </div>
             </div>
 
             <dl class="data-grid mono">
-              <dt>id</dt><dd x-text="currentEnvironment().id"></dd>
-              <dt>url</dt><dd><a class="link" :href="envLink(currentEnvironment())" target="_blank" rel="noopener" x-text="envLinkLabel(currentEnvironment())"></a></dd>
-              <dt x-show="!stats.traefik_enabled" class="muted">note</dt>
-              <dd x-show="!stats.traefik_enabled" class="muted">
-                no Traefik configured — this is Oxid's own stable proxy port for this branch, not <span x-text="currentEnvironment().url"></span>. It stays the same across redeploys: a push swaps traffic to the new container with zero downtime instead of changing the address.
-              </dd>
-              <dt>commit sha</dt><dd x-text="currentEnvironment().branch.commit_sha"></dd>
-              <dt>created</dt><dd x-text="formatTime(currentEnvironment().created_at)"></dd>
-              <dt>last seen</dt><dd x-text="formatTime(currentEnvironment().last_accessed_at)"></dd>
-              <dt>updated</dt><dd x-text="formatTime(currentEnvironment().updated_at)"></dd>
+              <dt x-text="t('env.field.id')"></dt><dd x-text="currentEnvironment().id"></dd>
+              <dt x-text="t('env.field.url')"></dt><dd><a class="link" :href="envLink(currentEnvironment())" target="_blank" rel="noopener" x-text="envLinkLabel(currentEnvironment())"></a></dd>
+              <dt x-show="!stats.traefik_enabled" class="muted" x-text="t('env.field.note')"></dt>
+              <dd x-show="!stats.traefik_enabled" class="muted"
+                  x-text="t('env.directNote', { url: currentEnvironment().url })"></dd>
+              <dt x-text="t('env.field.commit')"></dt><dd x-text="currentEnvironment().branch.commit_sha"></dd>
+              <dt x-text="t('env.field.created')"></dt><dd x-text="formatTime(currentEnvironment().created_at)"></dd>
+              <dt x-text="t('env.field.lastSeen')"></dt><dd x-text="formatTime(currentEnvironment().last_accessed_at)"></dd>
+              <dt x-text="t('env.field.updated')"></dt><dd x-text="formatTime(currentEnvironment().updated_at)"></dd>
             </dl>
 
             <div class="tabs">
-              <a href="#" :class="(!query.tab||query.tab==='overview')&&'active'" @click.prevent="setQuery({tab:null})">overview</a>
-              <a href="#" :class="query.tab==='logs'&&'active'" @click.prevent="setQuery({tab:'logs'})">logs</a>
-              <a href="#" :class="query.tab==='history'&&'active'" @click.prevent="setQuery({tab:'history'})">history</a>
+              <a href="#" :class="(!query.tab||query.tab==='overview')&&'active'" @click.prevent="setQuery({tab:null})" x-text="t('env.tab.overview')"></a>
+              <a href="#" :class="query.tab==='logs'&&'active'" @click.prevent="setQuery({tab:'logs'})" x-text="t('env.tab.logs')"></a>
+              <a href="#" :class="query.tab==='history'&&'active'" @click.prevent="setQuery({tab:'history'})" x-text="t('env.tab.history')"></a>
             </div>
 
             <div x-show="query.tab === 'logs'">
@@ -255,30 +257,30 @@
                       x-show="auditDuration(event) !== null"
                       x-text="formatDuration(auditDuration(event))"
                     ></span>
-                    <span class="muted" x-text="event.operator ?? 'anonymous'"></span>
+                    <span class="muted" x-text="event.operator ?? t('audit.anonymous')"></span>
                     <span class="muted" x-text="event.detail ?? ''"></span>
                   </li>
                 </template>
-                <li x-show="historyEvents.length === 0" class="muted">No audit events.</li>
+                <li x-show="historyEvents.length === 0" class="muted" x-text="t('env.noAudit')"></li>
               </ol>
             </div>
           </div>
         </template>
         <template x-if="!currentEnvironment()">
-          <p class="muted">Environment not found (destroyed, or the id is wrong).</p>
+          <p class="muted" x-text="t('env.notFound')"></p>
         </template>
       </section>
 
       <!-- ================= PROJECTS ================= -->
       <section class="page" x-show="route.name === 'projects'" x-cloak>
-        <h1>Projects</h1>
+        <h1 x-text="t('project.title')"></h1>
         <table class="env-table">
           <thead>
             <tr>
-              <th>Name</th>
-              <th>Repo</th>
-              <th>Port</th>
-              <th>Environments</th>
+              <th x-text="t('project.col.name')"></th>
+              <th x-text="t('project.col.repo')"></th>
+              <th x-text="t('project.col.port')"></th>
+              <th x-text="t('project.col.environments')"></th>
               <th></th>
             </tr>
           </thead>
@@ -290,7 +292,7 @@
                 <td class="mono" x-text="p.config.port"></td>
                 <td class="mono" x-text="p.environments.length"></td>
                 <td class="actions">
-                  <button class="btn btn-sm" @click="go('/ui/projects/' + p.id)">open</button>
+                  <button class="btn btn-sm" @click="go('/ui/projects/' + p.id)" x-text="t('action.open')"></button>
                 </td>
               </tr>
             </template>
@@ -305,20 +307,20 @@
             <div class="page-head">
               <h1 x-text="currentProject().name"></h1>
               <div class="project-actions">
-                <button class="btn btn-sm" @click="go('/ui/projects/' + currentProject().id + '/secrets')">secrets</button>
-                <button class="btn btn-sm btn-danger" @click="removeProject(currentProject())">delete project</button>
+                <button class="btn btn-sm" @click="go('/ui/projects/' + currentProject().id + '/secrets')" x-text="t('action.secrets')"></button>
+                <button class="btn btn-sm btn-danger" @click="removeProject(currentProject())" x-text="t('project.deleteProject')"></button>
               </div>
             </div>
             <p class="mono muted" x-text="currentProject().repo_url"></p>
             <dl class="data-grid mono">
-              <dt title="What the app listens on inside the container — the host-side published port is chosen dynamically per environment, see each branch's URL below">container port</dt><dd x-text="currentProject().config.port"></dd>
-              <dt>dockerfile</dt><dd x-text="currentProject().config.build.dockerfile ?? 'Dockerfile'"></dd>
-              <dt>context</dt><dd x-text="currentProject().config.build.context"></dd>
-              <dt x-show="currentProject().config.build.memory_limit_mb">memory limit</dt>
+              <dt :title="t('project.field.containerPortTitle')" x-text="t('project.field.containerPort')"></dt><dd x-text="currentProject().config.port"></dd>
+              <dt x-text="t('project.field.dockerfile')"></dt><dd x-text="currentProject().config.build.dockerfile ?? 'Dockerfile'"></dd>
+              <dt x-text="t('project.field.context')"></dt><dd x-text="currentProject().config.build.context"></dd>
+              <dt x-show="currentProject().config.build.memory_limit_mb" x-text="t('project.field.memoryLimit')"></dt>
               <dd x-show="currentProject().config.build.memory_limit_mb" x-text="currentProject().config.build.memory_limit_mb + 'MB'"></dd>
-              <dt x-show="currentProject().config.build.cpu_limit_millicores">cpu limit</dt>
+              <dt x-show="currentProject().config.build.cpu_limit_millicores" x-text="t('project.field.cpuLimit')"></dt>
               <dd x-show="currentProject().config.build.cpu_limit_millicores" x-text="currentProject().config.build.cpu_limit_millicores + 'm'"></dd>
-              <dt x-show="currentProject().config.dependencies.length">dependencies</dt>
+              <dt x-show="currentProject().config.dependencies.length" x-text="t('project.field.dependencies')"></dt>
               <dd x-show="currentProject().config.dependencies.length">
                 <template x-for="dep in currentProject().config.dependencies" :key="dep.shared_instance">
                   <span class="badge badge-audit" x-text="dep.kind + ':' + dep.shared_instance"></span>
@@ -326,69 +328,62 @@
               </dd>
             </dl>
 
-            <h2>Lifetime policy</h2>
-            <p class="muted">
-              Idle/scale-to-zero timers — <code>oxid.toml</code> only ever seeds these once, at
-              first registration. Changes here take effect on the next GC sweep, no redeploy.
-            </p>
+            <h2 x-text="t('project.lifetime.title')"></h2>
+            <p class="muted" x-text="t('project.lifetime.help', { file: 'oxid.toml' })"></p>
             <div class="secret-form">
               <label class="mono muted">pause_after</label>
               <input
                 class="token-input mono"
                 type="text"
-                placeholder="e.g. 30m"
+                :placeholder="t('project.lifetime.pausePlaceholder')"
                 x-model="projectSettingsForm.pause_after"
               />
               <label class="mono muted">destroy_after</label>
               <input
                 class="token-input mono"
                 type="text"
-                placeholder="e.g. 7d"
+                :placeholder="t('project.lifetime.destroyPlaceholder')"
                 x-model="projectSettingsForm.destroy_after"
               />
-              <button class="btn btn-sm" @click="saveProjectSettings(currentProject())">save</button>
+              <button class="btn btn-sm" @click="saveProjectSettings(currentProject())" x-text="t('action.save')"></button>
             </div>
 
-            <h2>Private repo access</h2>
-            <p class="muted">
-              Only needed for a private repository — a GitHub personal access token (or
-              equivalent) letting this daemon clone/fetch it on its own. Write-only: never
-              shown back once saved.
-            </p>
+            <h2 x-text="t('project.git.title')"></h2>
+            <p class="muted" x-text="t('project.git.help')"></p>
             <div class="secret-form">
               <label class="mono muted">git_token</label>
               <input
                 class="token-input mono"
                 type="password"
-                placeholder="e.g. ghp_..., leave blank to keep unchanged"
+                :placeholder="t('project.git.placeholder')"
                 x-model="projectSettingsForm.git_token"
               />
-              <button class="btn btn-sm" @click="saveGitToken(currentProject())">save</button>
-              <button class="btn btn-sm btn-danger" @click="clearGitToken(currentProject())">clear</button>
+              <button class="btn btn-sm" @click="saveGitToken(currentProject())" x-text="t('action.save')"></button>
+              <button class="btn btn-sm btn-danger" @click="clearGitToken(currentProject())" x-text="t('action.clear')"></button>
             </div>
 
             <div class="deploy-form">
               <input
                 class="token-input mono"
                 type="text"
-                placeholder="branch to deploy"
+                :placeholder="t('project.deployPlaceholder')"
                 x-model="deployBranch"
                 @keydown.enter="deployNew(currentProject())"
               />
-              <button class="btn btn-sm" @click="deployNew(currentProject())">deploy</button>
+              <button class="btn btn-sm" @click="deployNew(currentProject())" x-text="t('action.deploy')"></button>
             </div>
 
-            <h2>Environments</h2>
+            <h2 x-text="t('project.environments')"></h2>
             <template x-if="currentProject().environments.length === 0">
-              <p class="muted">No live branches.</p>
+              <p class="muted" x-text="t('project.noBranches')"></p>
             </template>
             <table class="env-table" x-show="currentProject().environments.length > 0">
               <thead>
                 <tr>
-                  <th>Branch</th>
-                  <th>State</th>
-                  <th>URL</th>
-                  <th>Updated</th>
+                  <th x-text="t('env.col.branch')"></th>
+                  <th x-text="t('env.col.state')"></th>
+                  <th x-text="t('env.col.url')"></th>
+                  <th x-text="t('env.col.updated')"></th>
                   <th></th>
                 </tr>
               </thead>
@@ -399,12 +394,12 @@
                       <a class="link" href="#" @click.prevent="go('/ui/environments/' + env.id)" x-text="env.branch.name"></a>
                     </td>
                     <td>
-                      <span class="badge" :class="'badge-' + env.state" x-text="env.state"></span>
+                      <span class="badge" :class="'badge-' + env.state" x-text="stateLabel(env.state)"></span>
                     </td>
                     <td><a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a></td>
                     <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
                     <td class="actions">
-                      <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)">open</button>
+                      <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)" x-text="t('action.open')"></button>
                     </td>
                   </tr>
                 </template>
@@ -413,57 +408,57 @@
           </div>
         </template>
         <template x-if="!currentProject()">
-          <p class="muted">Project not found.</p>
+          <p class="muted" x-text="t('project.notFound')"></p>
         </template>
       </section>
 
       <!-- ================= SECRETS (global + project-scoped) ================= -->
       <section class="page" x-show="route.name === 'secrets' || route.name === 'projectSecrets'" x-cloak>
-        <h1 x-text="route.name === 'projectSecrets' ? 'Secrets — ' + (currentProject()?.name ?? '') : 'Global secrets'"></h1>
-        <p class="muted">Values are write-only — the daemon never returns a stored value, only names and scope.</p>
+        <h1 x-text="route.name === 'projectSecrets' ? t('secrets.projectTitle', { name: currentProject()?.name ?? '' }) : t('secrets.globalTitle')"></h1>
+        <p class="muted" x-text="t('secrets.help')"></p>
         <ol class="audit-list">
           <template x-for="s in secretsList" :key="s.name + s.scope">
             <li>
               <span class="mono" x-text="s.name"></span>
               <span class="badge badge-audit" x-text="s.scope"></span>
-              <button class="btn btn-sm btn-danger" @click="deleteSecret(s)">delete</button>
+              <button class="btn btn-sm btn-danger" @click="deleteSecret(s)" x-text="t('action.delete')"></button>
             </li>
           </template>
-          <li x-show="secretsList.length === 0" class="muted">No secrets in this scope.</li>
+          <li x-show="secretsList.length === 0" class="muted" x-text="t('secrets.empty')"></li>
         </ol>
-        <h2>Set a secret</h2>
+        <h2 x-text="t('secrets.setTitle')"></h2>
         <div class="secret-form">
-          <input class="token-input mono" type="text" placeholder="NAME" x-model="secretForm.name" />
+          <input class="token-input mono" type="text" :placeholder="t('secrets.namePlaceholder')" x-model="secretForm.name" />
           <select class="token-input mono" x-model="secretForm.scope" x-show="route.name === 'projectSecrets'">
-            <option value="project">project</option>
-            <option value="branch">branch</option>
+            <option value="project" x-text="t('secrets.scope.project')"></option>
+            <option value="branch" x-text="t('secrets.scope.branch')"></option>
           </select>
           <input
             class="token-input mono"
             type="text"
-            placeholder="branch (if scope=branch)"
+            :placeholder="t('secrets.branchPlaceholder')"
             x-model="secretForm.branch"
             x-show="secretForm.scope === 'branch'"
           />
-          <input class="token-input mono" type="password" placeholder="value" x-model="secretForm.value" />
-          <button class="btn btn-sm" @click="submitSecret()">set</button>
+          <input class="token-input mono" type="password" :placeholder="t('secrets.valuePlaceholder')" x-model="secretForm.value" />
+          <button class="btn btn-sm" @click="submitSecret()" x-text="t('action.set')"></button>
         </div>
       </section>
 
       <!-- ================= QUEUE ================= -->
       <section class="page" x-show="route.name === 'queue'" x-cloak>
-        <h1>Deploy queue</h1>
+        <h1 x-text="t('queue.title')"></h1>
         <template x-if="queue.length === 0">
-          <p class="muted">Empty — every deploy has capacity.</p>
+          <p class="muted" x-text="t('queue.empty')"></p>
         </template>
         <table class="env-table" x-show="queue.length > 0">
           <thead>
             <tr>
-              <th>#</th>
-              <th>Project</th>
-              <th>Branch</th>
-              <th>Operator</th>
-              <th>Requested</th>
+              <th x-text="t('queue.col.position')"></th>
+              <th x-text="t('queue.col.project')"></th>
+              <th x-text="t('queue.col.branch')"></th>
+              <th x-text="t('queue.col.operator')"></th>
+              <th x-text="t('queue.col.requested')"></th>
             </tr>
           </thead>
           <tbody>
@@ -472,7 +467,7 @@
                 <td class="mono" x-text="i + 1"></td>
                 <td><a class="link" href="#" @click.prevent="go('/ui/projects/' + item.project_id)" x-text="projectName(item.project_id)"></a></td>
                 <td class="mono" x-text="item.branch"></td>
-                <td class="muted" x-text="item.operator ?? 'anonymous'"></td>
+                <td class="muted" x-text="item.operator ?? t('audit.anonymous')"></td>
                 <td class="mono muted" x-text="formatTime(item.requested_at)"></td>
               </tr>
             </template>
@@ -483,20 +478,20 @@
       <!-- ================= AUDIT ================= -->
       <section class="page" x-show="route.name === 'audit'" x-cloak>
         <div class="page-head">
-          <h1>Audit trail</h1>
+          <h1 x-text="t('audit.title')"></h1>
           <div class="filters">
             <input
               class="token-input mono"
               type="number"
               min="1"
-              placeholder="limit"
+              :placeholder="t('audit.limitPlaceholder')"
               x-model="auditLimit"
               @change="setQuery({limit: auditLimit})"
             />
             <input
               class="token-input mono"
               type="text"
-              placeholder="search kind/detail/operator..."
+              :placeholder="t('audit.searchPlaceholder')"
               x-model="auditQuery"
               @input.debounce.300ms="setQuery({q: auditQuery})"
             />
@@ -505,12 +500,12 @@
         <table class="env-table">
           <thead>
             <tr>
-              <th>When</th>
-              <th>Kind</th>
-              <th>Branch</th>
-              <th title="Wall-clock time from the environment's push/creation to this outcome">Deploy time</th>
-              <th>Operator</th>
-              <th>Detail</th>
+              <th x-text="t('audit.col.when')"></th>
+              <th x-text="t('audit.col.kind')"></th>
+              <th x-text="t('audit.col.branch')"></th>
+              <th :title="t('audit.col.deployTimeTitle')" x-text="t('audit.col.deployTime')"></th>
+              <th x-text="t('audit.col.operator')"></th>
+              <th x-text="t('audit.col.detail')"></th>
             </tr>
           </thead>
           <tbody>
@@ -523,12 +518,12 @@
                     class="mono link"
                     href="#"
                     @click.prevent="go('/ui/environments/' + event.environment_id)"
-                    :title="'environment #' + event.environment_id"
+                    :title="t('audit.envTitle', { id: event.environment_id })"
                     x-text="envRef(event.environment_id)"
                   ></a>
                 </td>
                 <td class="mono" x-text="formatDuration(auditDuration(event))"></td>
-                <td class="muted" x-text="event.operator ?? 'anonymous'"></td>
+                <td class="muted" x-text="event.operator ?? t('audit.anonymous')"></td>
                 <td class="mono detail-cell" x-text="event.detail ?? ''"></td>
               </tr>
             </template>
@@ -549,111 +544,92 @@
             <path d="M50 4 L93 27" stroke="#121212" stroke-width="8" />
           </svg>
           <span class="wordmark">OXID</span>
-          <span class="tagline">control plane</span>
+          <span class="tagline" x-text="t('app.tagline')"></span>
         </div>
         <div class="page-head">
-          <h1>Set up this daemon</h1>
-          <button class="btn btn-sm" @click="finishOnboarding()">skip — I'll configure it myself</button>
+          <h1 x-text="t('wizard.title')"></h1>
+          <button class="btn btn-sm" @click="finishOnboarding()" x-text="t('wizard.skip')"></button>
         </div>
-        <p class="muted">
-          Five steps from a fresh install to a deployed project. Everything here can also be
-          done later via the CLI or the pages above.
-        </p>
+        <p class="muted" x-text="t('wizard.intro')"></p>
 
         <ol class="wizard-steps">
-          <li :class="wizard.step === 1 && 'active'">1 · token</li>
-          <li :class="wizard.step === 2 && 'active'">2 · infrastructure</li>
-          <li :class="wizard.step === 3 && 'active'">3 · first project</li>
-          <li :class="wizard.step === 4 && 'active'">4 · webhooks</li>
-          <li :class="wizard.step === 5 && 'active'">5 · CLI &amp; team</li>
+          <li :class="wizard.step === 1 && 'active'" x-text="t('wizard.step1')"></li>
+          <li :class="wizard.step === 2 && 'active'" x-text="t('wizard.step2')"></li>
+          <li :class="wizard.step === 3 && 'active'" x-text="t('wizard.step3')"></li>
+          <li :class="wizard.step === 4 && 'active'" x-text="t('wizard.step4')"></li>
+          <li :class="wizard.step === 5 && 'active'" x-text="t('wizard.step5')"></li>
         </ol>
 
         <!-- Step 1: connect -->
         <div class="wizard-panel" x-show="wizard.step === 1">
-          <h2>Connect to the control API</h2>
+          <h2 x-text="t('wizard.s1.title')"></h2>
           <template x-if="setupStatus && !setupStatus.auth_required">
-            <p>
-              This daemon has no API token configured (loopback/open mode) — you're already
-              authenticated. Continue straight to infrastructure.
-            </p>
+            <p x-text="t('wizard.s1.open')"></p>
           </template>
           <template x-if="setupStatus && setupStatus.auth_required">
             <div>
-              <p>
-                Paste the bearer token below. It's kept in this browser only
-                (<code>localStorage</code>) and sent as
-                <code>Authorization: Bearer …</code> on every request.
-              </p>
+              <p x-text="t('wizard.s1.paste', { storage: 'localStorage', header: 'Authorization: Bearer …' })"></p>
               <template x-if="setupStatus.auto_token">
                 <div class="wizard-hint">
-                  This daemon runs with <code>OXID_AUTO_TOKEN=1</code>: it already generated one
-                  for itself on first start. Fetch and use it directly — no logs to dig through:
+                  <span x-text="t('wizard.s1.autoToken', { flag: 'OXID_AUTO_TOKEN=1' })"></span>
                   <div class="deploy-form">
                     <button class="btn btn-primary" :disabled="wizard.generatingToken" @click="generateToken()">
-                      <span x-show="!wizard.generatingToken">generate automatically</span>
+                      <span x-show="!wizard.generatingToken" x-text="t('wizard.s1.generate')"></span>
                       <span x-show="wizard.generatingToken" class="spinner"></span>
                     </button>
                   </div>
                 </div>
               </template>
-              <p class="muted" x-show="setupStatus.auto_token">— or paste one yourself:</p>
+              <p class="muted" x-show="setupStatus.auto_token" x-text="t('wizard.s1.orPaste')"></p>
               <div class="deploy-form">
                 <input
                   class="token-input mono"
                   type="password"
-                  placeholder="bearer token"
+                  :placeholder="t('wizard.s1.tokenPlaceholder')"
                   x-model="wizard.tokenInput"
                   @keydown.enter="verifyToken()"
                 />
                 <button class="btn" :disabled="wizard.checkingToken" @click="verifyToken()">
-                  <span x-show="!wizard.checkingToken">verify &amp; continue</span>
+                  <span x-show="!wizard.checkingToken" x-text="t('wizard.s1.verify')"></span>
                   <span x-show="wizard.checkingToken" class="spinner"></span>
                 </button>
               </div>
             </div>
           </template>
           <template x-if="!setupStatus">
-            <p class="muted">Cannot read setup status — is the daemon reachable?</p>
+            <p class="muted" x-text="t('wizard.s1.noStatus')"></p>
           </template>
           <div class="wizard-nav">
             <span></span>
-            <button class="btn" x-show="!setupStatus?.auth_required || token" @click="wizardGo(2)">
-              continue →
-            </button>
+            <button class="btn" x-show="!setupStatus?.auth_required || token" @click="wizardGo(2)"
+                    x-text="t('wizard.continue')"></button>
           </div>
         </div>
 
         <!-- Step 2: infrastructure -->
         <div class="wizard-panel" x-show="wizard.step === 2">
-          <h2>Infrastructure</h2>
-          <p class="muted">
-            Traefik mode routes every branch as <code>&lt;branch&gt;.&lt;base-domain&gt;</code> with
-            wake-on-request. Direct-publish mode (no <code>OXID_DOCKER_NETWORK</code>) is also fine:
-            each environment just gets its own host port.
-          </p>
+          <h2 x-text="t('wizard.s2.title')"></h2>
+          <p class="muted" x-text="t('wizard.s2.help', { pattern: '<branch>.<base-domain>', var: 'OXID_DOCKER_NETWORK' })"></p>
           <template x-if="wizard.infraLoading">
-            <p><span class="spinner"></span> checking…</p>
+            <p><span class="spinner"></span> <span x-text="t('wizard.s2.checking')"></span></p>
           </template>
           <template x-if="!wizard.infraLoading && !wizard.infra">
-            <div class="wizard-hint">
-              Direct-publish mode — nothing to bootstrap here. Deployed environments will publish
-              a dynamically-chosen host port each. Continue to the first project.
-            </div>
+            <div class="wizard-hint" x-text="t('wizard.s2.directMode')"></div>
           </template>
           <template x-if="!wizard.infraLoading && wizard.infra">
             <div>
               <ul class="wizard-checklist">
                 <li>
                   <span class="dot" :class="wizard.infra.network_exists ? 'dot-green' : 'dot-red'"></span>
-                  Docker network <code x-text="wizard.infra.network"></code>
+                  <span x-text="t('wizard.s2.network')"></span> <code x-text="wizard.infra.network"></code>
                 </li>
                 <li>
                   <span class="dot" :class="wizard.infra.traefik_status === 'running' ? 'dot-green' : 'dot-red'"></span>
-                  Traefik proxy — <span class="mono" x-text="wizard.infra.traefik_status"></span>
+                  <span x-text="t('wizard.s2.traefik')"></span> <span class="mono" x-text="wizard.infra.traefik_status"></span>
                 </li>
                 <li>
                   <span class="dot" :class="wizard.infra.self_wiring_ok ? 'dot-green' : 'dot-red'"></span>
-                  Daemon wired into the network
+                  <span x-text="t('wizard.s2.wired')"></span>
                 </li>
               </ul>
               <template x-for="step in wizard.infra.next_steps ?? []" :key="step">
@@ -661,7 +637,7 @@
               </template>
               <div class="deploy-form">
                 <button class="btn" :disabled="wizard.fixingInfra" @click="fixInfra()">
-                  <span x-show="!wizard.fixingInfra">fix automatically (idempotent)</span>
+                  <span x-show="!wizard.fixingInfra" x-text="t('wizard.s2.fix')"></span>
                   <span x-show="wizard.fixingInfra" class="spinner"></span>
                 </button>
                 <span class="muted" x-text="wizard.infraError"></span>
@@ -669,25 +645,21 @@
             </div>
           </template>
           <div class="wizard-nav">
-            <button class="btn btn-ghost" @click="wizardGo(1)">← back</button>
-            <button class="btn" @click="wizardGo(3)">continue →</button>
+            <button class="btn btn-ghost" @click="wizardGo(1)" x-text="t('wizard.back')"></button>
+            <button class="btn" @click="wizardGo(3)" x-text="t('wizard.continue')"></button>
           </div>
         </div>
 
         <!-- Step 3: first project -->
         <div class="wizard-panel" x-show="wizard.step === 3">
-          <h2>Register your first project</h2>
+          <h2 x-text="t('wizard.s3.title')"></h2>
           <div class="tabs">
-            <a href="#" :class="wizard.projectMode==='url'&&'active'" @click.prevent="wizard.projectMode='url'">git URL</a>
-            <a href="#" :class="wizard.projectMode==='dir'&&'active'" @click.prevent="wizard.projectMode='dir'">local path</a>
+            <a href="#" :class="wizard.projectMode==='url'&&'active'" @click.prevent="wizard.projectMode='url'" x-text="t('wizard.s3.tabUrl')"></a>
+            <a href="#" :class="wizard.projectMode==='dir'&&'active'" @click.prevent="wizard.projectMode='dir'" x-text="t('wizard.s3.tabDir')"></a>
           </div>
           <template x-if="wizard.projectMode === 'url'">
             <div>
-              <p class="muted">
-                The daemon clones the repo itself into its own git cache — no shared filesystem
-                needed. scp-style remotes are normalized automatically; for a private repo add an
-                HTTPS access token below (stored encrypted, never echoed back).
-              </p>
+              <p class="muted" x-text="t('wizard.s3.urlHelp')"></p>
               <div class="secret-form">
                 <input
                   class="token-input mono"
@@ -698,7 +670,7 @@
                 <input
                   class="token-input mono"
                   type="password"
-                  placeholder="access token (private repos only)"
+                  :placeholder="t('wizard.s3.tokenPlaceholder')"
                   x-model="wizard.gitToken"
                 />
               </div>
@@ -706,11 +678,7 @@
           </template>
           <template x-if="wizard.projectMode === 'dir'">
             <div>
-              <p class="muted">
-                Path to a checkout the daemon container can read — with the shipped compose file
-                that's anything under the mounted <code>./repos</code> directory
-                (<code>/repos/&lt;name&gt;</code> inside the container).
-              </p>
+              <p class="muted" x-text="t('wizard.s3.dirHelp', { dir: './repos', inner: '/repos/<name>' })"></p>
               <div class="secret-form">
                 <input
                   class="token-input mono"
@@ -722,7 +690,7 @@
             </div>
           </template>
           <div class="secret-form">
-            <label class="mono muted">branch</label>
+            <label class="mono muted" x-text="t('wizard.s3.branch')"></label>
             <input
               class="token-input mono"
               type="text"
@@ -730,42 +698,39 @@
               x-model="wizard.deployBranch"
             />
             <button class="btn" :disabled="wizard.registering" @click="registerFirstProject()">
-              <span x-show="!wizard.registering">register &amp; deploy</span>
+              <span x-show="!wizard.registering" x-text="t('wizard.s3.register')"></span>
               <span x-show="wizard.registering" class="spinner"></span>
             </button>
           </div>
 
           <template x-if="wizard.deployState === 'building'">
-            <p><span class="spinner"></span> building… first builds may take a few minutes on a cold host.</p>
+            <p><span class="spinner"></span> <span x-text="t('wizard.s3.building')"></span></p>
           </template>
           <template x-if="wizard.deployState === 'running'">
             <div class="wizard-hint wizard-success">
               ✓ <span class="mono" x-text="wizard.projectName"></span>/<span class="mono" x-text="wizard.deployBranch.trim() || 'main'"></span>
-              is live!
+              <span x-text="t('wizard.s3.live')"></span>
               <a class="link" href="#"
-                 @click.prevent="go('/ui/environments/' + wizard.envId)">open environment</a>
+                 @click.prevent="go('/ui/environments/' + wizard.envId)" x-text="t('wizard.s3.openEnv')"></a>
             </div>
           </template>
           <template x-if="wizard.deployState === 'failed' || wizard.deployState === 'timeout'">
             <div class="wizard-hint wizard-failure">
-              ✗ deploy didn't make it: <span class="mono" x-text="wizard.deployMessage"></span>
-              Check the audit page for the build log, fix, then try again from here.
+              <span x-text="t('wizard.s3.failed')"></span> <span class="mono" x-text="wizard.deployMessage"></span>
+              <span x-text="t('wizard.s3.failedHelp')"></span>
             </div>
           </template>
 
           <div class="wizard-nav">
-            <button class="btn btn-ghost" @click="wizardGo(2)">← back</button>
-            <button class="btn" @click="wizardGo(4)">continue →</button>
+            <button class="btn btn-ghost" @click="wizardGo(2)" x-text="t('wizard.back')"></button>
+            <button class="btn" @click="wizardGo(4)" x-text="t('wizard.continue')"></button>
           </div>
         </div>
 
         <!-- Step 4: webhooks -->
         <div class="wizard-panel" x-show="wizard.step === 4">
-          <h2>Wire up push-to-deploy</h2>
-          <p class="muted">
-            Add a webhook in your Git host pointing at this URL; every pushed branch deploys itself
-            (and deleting a branch destroys its environment). Requires the master credential.
-          </p>
+          <h2 x-text="t('wizard.s4.title')"></h2>
+          <p class="muted" x-text="t('wizard.s4.help')"></p>
           <div class="secret-form">
             <select class="token-input mono" x-model="wizard.provider" style="width:auto">
               <option value="github">GitHub</option>
@@ -775,94 +740,83 @@
             </select>
             <input class="token-input mono" type="text" readonly :value="webhookUrl()" />
             <button class="btn btn-sm" @click="copyText(webhookUrl(), 'url')">
-              <span x-text="wizard.copied === 'url' ? 'copied!' : 'copy'"></span>
+              <span x-text="wizard.copied === 'url' ? t('action.copied') : t('action.copy')"></span>
             </button>
           </div>
           <template x-if="wizard.webhookSecret">
             <div class="wizard-hint">
-              Webhook secret (auto-generated on this daemon) — paste it as your Git host's webhook
-              secret:
+              <span x-text="t('wizard.s4.secretHint')"></span>
               <div class="secret-form">
                 <input class="token-input mono" type="text" readonly :value="wizard.webhookSecret" />
                 <button class="btn btn-sm" @click="copyText(wizard.webhookSecret, 'secret')">
-                  <span x-text="wizard.copied === 'secret' ? 'copied!' : 'copy'"></span>
+                  <span x-text="wizard.copied === 'secret' ? t('action.copied') : t('action.copy')"></span>
                 </button>
               </div>
             </div>
           </template>
           <template x-if="wizard.webhookSecretMissing">
-            <div class="wizard-hint">
-              No webhook secret configured yet. Set <code>OXID_WEBHOOK_SECRET</code> (or start with
-              <code>OXID_AUTO_TOKEN=1</code>) and restart the daemon — until then pushes are
-              rejected by design.
-            </div>
+            <div class="wizard-hint"
+                 x-text="t('wizard.s4.secretMissing', { var: 'OXID_WEBHOOK_SECRET', flag: 'OXID_AUTO_TOKEN=1' })"></div>
           </template>
           <div class="wizard-nav">
-            <button class="btn btn-ghost" @click="wizardGo(3)">← back</button>
-            <button class="btn" @click="wizardGo(5)">continue →</button>
+            <button class="btn btn-ghost" @click="wizardGo(3)" x-text="t('wizard.back')"></button>
+            <button class="btn" @click="wizardGo(5)" x-text="t('wizard.continue')"></button>
           </div>
         </div>
 
         <!-- Step 5: CLI + team -->
         <div class="wizard-panel" x-show="wizard.step === 5">
-          <h2>CLI access &amp; team tokens</h2>
-          <p class="muted">Point the <code>oxid</code> CLI at this daemon:</p>
+          <h2 x-text="t('wizard.s5.title')"></h2>
+          <p class="muted" x-text="t('wizard.s5.point', { cli: 'oxid' })"></p>
           <div class="secret-form">
             <input class="token-input mono" type="text" readonly :value="cliSnippet()" style="min-width:420px" />
             <button class="btn btn-sm" @click="copyText(cliSnippet(), 'cli')">
-              <span x-text="wizard.copied === 'cli' ? 'copied!' : 'copy'"></span>
+              <span x-text="wizard.copied === 'cli' ? t('action.copied') : t('action.copy')"></span>
             </button>
           </div>
-          <p class="muted">
-            Sharing with teammates? Mint them scoped tokens instead of handing out the master one —
-            <code>oxid token create alice --project &lt;id&gt;</code> (or the admin page). Scoped
-            tokens see nothing outside their projects. Or register projects programmatically:
-          </p>
+          <p class="muted" x-text="t('wizard.s5.share', { cmd: 'oxid token create alice --project <id>' })"></p>
           <div class="secret-form">
             <input class="token-input mono" type="text" readonly :value="curlSnippet()" style="min-width:420px" />
             <button class="btn btn-sm" @click="copyText(curlSnippet(), 'curl')">
-              <span x-text="wizard.copied === 'curl' ? 'copied!' : 'copy'"></span>
+              <span x-text="wizard.copied === 'curl' ? t('action.copied') : t('action.copy')"></span>
             </button>
           </div>
           <div class="wizard-nav">
-            <button class="btn btn-ghost" @click="wizardGo(4)">← back</button>
-            <button class="btn btn-primary" @click="finishOnboarding('Setup complete.')">
-              finish → go to environments
-            </button>
+            <button class="btn btn-ghost" @click="wizardGo(4)" x-text="t('wizard.back')"></button>
+            <button class="btn btn-primary" @click="finishOnboarding(t('notice.setupComplete'))"
+                    x-text="t('wizard.finish')"></button>
           </div>
         </div>
       </section>
 
       <!-- ================= ADMIN ================= -->
       <section class="page" x-show="route.name === 'admin'" x-cloak>
-        <h1>Admin</h1>
+        <h1 x-text="t('admin.title')"></h1>
         <div class="project-actions">
-          <button class="btn btn-sm" @click="go('/ui/onboarding')">re-run setup wizard</button>
-          <button class="btn btn-sm" @click="downloadBackup()">download backup</button>
-          <button class="btn btn-sm btn-danger" @click="rotateKey()">rotate master key</button>
+          <button class="btn btn-sm" @click="go('/ui/onboarding')" x-text="t('admin.rerunWizard')"></button>
+          <button class="btn btn-sm" @click="downloadBackup()" x-text="t('admin.downloadBackup')"></button>
+          <button class="btn btn-sm btn-danger" @click="rotateKey()" x-text="t('admin.rotateKey')"></button>
         </div>
 
-        <h2>API tokens</h2>
+        <h2 x-text="t('admin.tokensTitle')"></h2>
         <div class="deploy-form">
           <input
             class="token-input mono"
             type="text"
-            placeholder="token name"
+            :placeholder="t('admin.tokenNamePlaceholder')"
             x-model="newTokenName"
             @keydown.enter="createToken()"
           />
-          <button class="btn btn-sm" @click="createToken()">create</button>
+          <button class="btn btn-sm" @click="createToken()" x-text="t('action.create')"></button>
         </div>
-        <p class="muted" x-show="tokens.length === 0">
-          No tokens yet, or this token isn't the master credential.
-        </p>
+        <p class="muted" x-show="tokens.length === 0" x-text="t('admin.noTokens')"></p>
         <ol class="audit-list">
           <template x-for="tok in tokens" :key="tok.id">
             <li>
               <span class="mono" x-text="tok.name"></span>
               <span class="mono muted" x-text="formatTime(tok.created_at)"></span>
-              <span class="muted" x-text="tok.revoked ? '(revoked)' : ''"></span>
-              <button class="btn btn-sm btn-danger" x-show="!tok.revoked" @click="revokeToken(tok)">revoke</button>
+              <span class="muted" x-text="tok.revoked ? t('admin.revoked') : ''"></span>
+              <button class="btn btn-sm btn-danger" x-show="!tok.revoked" @click="revokeToken(tok)" x-text="t('admin.revoke')"></button>
             </li>
           </template>
         </ol>
@@ -874,16 +828,16 @@
         <div class="modal-body">
           <p x-text="confirmModal.message"></p>
           <div class="confirm-actions">
-            <button class="btn btn-sm" @click="resolveConfirm(false)">cancel</button>
-            <button class="btn btn-sm btn-danger" @click="resolveConfirm(true)">confirm</button>
+            <button class="btn btn-sm" @click="resolveConfirm(false)" x-text="t('action.cancel')"></button>
+            <button class="btn btn-sm btn-danger" @click="resolveConfirm(true)" x-text="t('action.confirm')"></button>
           </div>
         </div>
       </div>
     </div>
 
     <footer class="footer">
-      <span>Ephemeral environments that breathe.</span>
-      <span x-text="'auto-refresh ' + refreshIntervalSecs + 's'"></span>
+      <span x-text="t('footer.tagline')"></span>
+      <span x-text="t('footer.autoRefresh', { secs: refreshIntervalSecs })"></span>
     </footer>
   </body>
 </html>

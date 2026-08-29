@@ -72,6 +72,11 @@ function dashboard() {
     auditLimit: 50,
     auditQuery: "",
     refreshIntervalSecs: 5,
+    // Active locale. Every `t()` call reads it, which is what makes Alpine
+    // re-render the whole UI when the switcher changes it — the catalog
+    // itself is static, the reactivity lives here.
+    locale: window.OxidI18n.detect(),
+    locales: window.OxidI18n.available(),
     confirmModal: { open: false, message: "", resolve: null },
     _logAbort: null,
     _timer: null,
@@ -106,11 +111,53 @@ function dashboard() {
     },
 
     init() {
+      this.applyLocale();
       this.token = localStorage.getItem("oxid_token") || "";
       window.addEventListener("popstate", () => this.onRouteChange());
       this.onRouteChange();
       this._timer = setInterval(() => this.refreshCurrentPage(), this.refreshIntervalSecs * 1000);
       this.loadSetupStatus().then(() => this.maybeStartOnboarding());
+    },
+
+    // ------------------------------------------------------------------
+    // i18n
+    // ------------------------------------------------------------------
+
+    /**
+     * Translates `key`, substituting `{placeholder}` values from `params`.
+     *
+     * Reads `this.locale` on every call rather than closing over it, so
+     * Alpine records the dependency and re-evaluates each binding when the
+     * switcher changes language — no reload, no manual re-render.
+     */
+    t(key, params) {
+      return window.OxidI18n.translate(this.locale, key, params);
+    },
+
+    /** Switches language and remembers the choice. */
+    setLocale(locale) {
+      this.locale = locale;
+      window.OxidI18n.persist(locale);
+      this.applyLocale();
+    },
+
+    /**
+     * Propagates the locale to the parts of the page Alpine does not own:
+     * `<html lang>` (screen readers, hyphenation, spellcheck) and the
+     * document title, neither of which lives under `x-data`.
+     */
+    applyLocale() {
+      document.documentElement.lang = this.locale;
+      document.title = this.t("app.title");
+    },
+
+    /**
+     * A state's display label. States travel over the API as stable
+     * identifiers (`build_failed`); only their rendering is translated, so
+     * filters and CSS classes keep matching the identifier.
+     */
+    stateLabel(state) {
+      return this.t(`state.${state}`);
     },
 
     // ------------------------------------------------------------------
@@ -222,7 +269,7 @@ function dashboard() {
         }
       } catch (err) {
         if (err.message !== "unauthorized") {
-          this.showNotice(`Failed to load page data: ${err.message}`);
+          this.showNotice(this.t("notice.loadFailed", { error: err.message }));
         }
       }
     },
@@ -241,6 +288,11 @@ function dashboard() {
       if (this.token) {
         headers.Authorization = `Bearer ${this.token}`;
       }
+      // Tells the daemon which language to answer in. Harmless against a
+      // daemon that ignores it, and it means a message the API produces
+      // arrives already translated rather than needing a second catalog
+      // here that would have to be kept in step with the server's wording.
+      headers["Accept-Language"] = this.locale;
       return headers;
     },
 
@@ -471,27 +523,42 @@ function dashboard() {
       return `${gb.toFixed(1)}G / ${this.stats.host_cpu_count ?? "?"} cpu`;
     },
 
+    // Renders an API timestamp in the viewer's own locale and timezone.
+    //
+    // The daemon sends RFC 3339, so this is a parse and a format rather than
+    // the hand-rolled calendar arithmetic it replaces: timestamps used to
+    // arrive as `time`'s positional array and were rendered `2026-day241
+    // 15:20:45`, the second number being the ordinal day of the year. The
+    // array branch is kept for one release so a newer dashboard still shows
+    // something sane against an older daemon.
     formatTime(value) {
-      if (!Array.isArray(value)) {
+      const ms = this.toEpochMs(value);
+      if (ms === null) {
         return String(value ?? "");
       }
-      const [year, day, hour, min, sec] = value;
-      const pad = (n, w) => String(n ?? 0).padStart(w, "0");
-      return `${pad(year, 4)}-day${pad(day, 3)} ${pad(hour, 2)}:${pad(min, 2)}:${pad(sec, 2)}`;
+      return new Intl.DateTimeFormat(this.locale, {
+        dateStyle: "short",
+        timeStyle: "medium",
+      }).format(new Date(ms));
     },
 
-    // Converts the `[year, ordinal_day, hour, min, sec, ...]` array the
-    // daemon serializes every timestamp as into a real epoch millisecond
-    // value, so push→deploy speed can actually be measured (Date.UTC with
-    // day 1 of the year, then adding `ordinal - 1` days, correctly handles
-    // month boundaries and leap years without reimplementing a calendar).
+    // Epoch milliseconds for an API timestamp, so push→deploy speed can be
+    // measured. `null` for anything unparseable, which the callers render as
+    // an em dash rather than `NaN`.
     toEpochMs(value) {
-      if (!Array.isArray(value)) {
-        return null;
+      if (typeof value === "string") {
+        const ms = Date.parse(value);
+        return Number.isNaN(ms) ? null : ms;
       }
-      const [year, day, hour, min, sec] = value;
-      return Date.UTC(year, 0, 1) + (day - 1) * 86_400_000 + hour * 3_600_000 + min * 60_000
-        + sec * 1000;
+      // Legacy `[year, ordinal_day, hour, min, sec, ...]`: `Date.UTC` with
+      // day 1 of the year plus `ordinal - 1` days handles month boundaries
+      // and leap years without reimplementing a calendar.
+      if (Array.isArray(value)) {
+        const [year, day, hour, min, sec] = value;
+        return Date.UTC(year, 0, 1) + (day - 1) * 86_400_000 + hour * 3_600_000 + min * 60_000
+          + sec * 1000;
+      }
+      return null;
     },
 
     // Human-readable elapsed time for a push→deploy duration, e.g. "1.4s"
@@ -594,13 +661,13 @@ function dashboard() {
         await this.apiGet("/api/v1/stats");
         this.authError = false;
         localStorage.setItem("oxid_token", candidate);
-        this.showNotice("Token accepted.");
+        this.showNotice(this.t("notice.tokenAccepted"));
         this.wizardGo(2);
       } catch {
         this.token = previous;
         localStorage.setItem("oxid_token", previous);
         this.showNotice(
-          "That token was rejected. If OXID_AUTO_TOKEN is on, retrieve the generated one with: docker compose logs oxid-daemon | grep -A2 Generated",
+          this.t("notice.tokenRejected"),
         );
       } finally {
         this.wizard.checkingToken = false;
@@ -623,11 +690,11 @@ function dashboard() {
         this.token = body.token;
         localStorage.setItem("oxid_token", body.token);
         this.authError = false;
-        this.showNotice("Token generated and saved.");
+        this.showNotice(this.t("notice.tokenGenerated"));
         this.wizardGo(2);
       } catch {
         this.showNotice(
-          "Couldn't fetch a token automatically — paste one manually below, or check the daemon logs.",
+          this.t("notice.tokenGenerateFailed"),
         );
       } finally {
         this.wizard.generatingToken = false;
@@ -652,7 +719,7 @@ function dashboard() {
       } catch (err) {
         this.wizard.infraError =
           err.message === "unauthorized"
-            ? "This step needs the master token (scoped tokens can't change infra)."
+            ? this.t("notice.masterOnly")
             : err.message;
       } finally {
         this.wizard.fixingInfra = false;
@@ -677,10 +744,10 @@ function dashboard() {
         const project = await res.json();
         this.wizard.projectId = project.id;
         this.wizard.projectName = project.name;
-        this.showNotice(`Project \`${project.name}\` registered — deploying...`);
+        this.showNotice(this.t("notice.registered", { name: project.name }));
         await this.deployFirstProject();
       } catch (err) {
-        this.showNotice(`Registration failed: ${err.message}`);
+        this.showNotice(this.t("notice.registerFailed", { error: err.message }));
       } finally {
         this.wizard.registering = false;
       }
@@ -709,7 +776,7 @@ function dashboard() {
         this.wizard.deploying = false;
         this.wizard.deployState = "timeout";
         this.wizard.deployMessage =
-          "Still building after 3 minutes — check the environment page for live logs.";
+          this.t("notice.stillBuilding");
         return;
       }
       try {
@@ -726,7 +793,7 @@ function dashboard() {
         if (env && env.state !== "building") {
           this.wizard.deploying = false;
           this.wizard.deployState = "failed";
-          this.wizard.deployMessage = `Environment state: ${env.state}`;
+          this.wizard.deployMessage = this.t("notice.envState", { state: this.stateLabel(env.state) });
           return;
         }
       } catch {
@@ -778,7 +845,7 @@ function dashboard() {
           }
         }, 1500);
       } catch {
-        this.showNotice("Clipboard unavailable — copy manually.");
+        this.showNotice(this.t("notice.clipboard"));
       }
     },
 
@@ -788,26 +855,26 @@ function dashboard() {
 
     async pause(env) {
       await this.apiSend("POST", `/api/v1/environments/${env.id}/pause`);
-      this.showNotice(`Paused \`${env.branch.name}\`.`);
+      this.showNotice(this.t("notice.paused", { branch: env.branch.name }));
       this.loadForRoute();
     },
 
     async wake(env) {
       await this.apiSend("POST", `/api/v1/environments/${env.id}/wake`);
-      this.showNotice(`Woke \`${env.branch.name}\`.`);
+      this.showNotice(this.t("notice.woken", { branch: env.branch.name }));
       this.loadForRoute();
     },
 
     async destroy(env) {
       if (
         !(await this.confirmDialog(
-          `Destroy environment \`${env.branch.name}\`? This cannot be undone.`,
+          this.t("confirm.destroyEnv", { branch: env.branch.name }),
         ))
       ) {
         return;
       }
       await this.apiSend("DELETE", `/api/v1/environments/${env.id}`);
-      this.showNotice(`Destroyed \`${env.branch.name}\`.`);
+      this.showNotice(this.t("notice.destroyed", { branch: env.branch.name }));
       if (this.route.name === "environment") {
         this.go("/ui/environments");
       } else {
@@ -818,13 +885,13 @@ function dashboard() {
     async removeProject(project) {
       if (
         !(await this.confirmDialog(
-          `Permanently delete project \`${project.name}\`? This destroys every environment and all its secrets.`,
+          this.t("confirm.deleteProject", { name: project.name }),
         ))
       ) {
         return;
       }
       await this.apiSend("DELETE", `/api/v1/projects/${project.id}`);
-      this.showNotice(`Deleted project \`${project.name}\`.`);
+      this.showNotice(this.t("notice.projectDeleted", { name: project.name }));
       this.go("/ui/projects");
     },
 
@@ -856,42 +923,46 @@ function dashboard() {
         });
         const updated = await res.json();
         this.showNotice(
-          `Updated \`${updated.name}\`: pause_after=${updated.config.pause_after} destroy_after=${updated.config.destroy_after}`,
+          this.t("notice.settingsUpdated", {
+            name: updated.name,
+            pause: updated.config.pause_after,
+            destroy: updated.config.destroy_after,
+          }),
         );
         // Force the next render to re-seed from the just-saved values.
         this._settingsFormProjectId = null;
         this.loadForRoute();
       } catch (err) {
-        this.showNotice(`Updating settings failed: ${err.message}`);
+        this.showNotice(this.t("notice.settingsFailed", { error: err.message }));
       }
     },
 
     async saveGitToken(project) {
       const token = this.projectSettingsForm.git_token.trim();
       if (!token) {
-        this.showNotice("Enter a token first, or use \"clear\" to remove it.");
+        this.showNotice(this.t("notice.enterToken"));
         return;
       }
       try {
         await this.apiSend("PATCH", `/api/v1/projects/${project.id}`, { git_token: token });
         this.projectSettingsForm.git_token = "";
-        this.showNotice(`Saved git token for \`${project.name}\`.`);
+        this.showNotice(this.t("notice.gitTokenSaved", { name: project.name }));
       } catch (err) {
-        this.showNotice(`Saving git token failed: ${err.message}`);
+        this.showNotice(this.t("notice.gitTokenFailed", { error: err.message }));
       }
     },
 
     async clearGitToken(project) {
-      const confirmed = await this.confirmDialog(`Clear the git token for \`${project.name}\`?`);
+      const confirmed = await this.confirmDialog(this.t("confirm.clearGitToken", { name: project.name }));
       if (!confirmed) {
         return;
       }
       try {
         await this.apiSend("PATCH", `/api/v1/projects/${project.id}`, { git_token: "" });
         this.projectSettingsForm.git_token = "";
-        this.showNotice(`Cleared git token for \`${project.name}\`.`);
+        this.showNotice(this.t("notice.gitTokenCleared", { name: project.name }));
       } catch (err) {
-        this.showNotice(`Clearing git token failed: ${err.message}`);
+        this.showNotice(this.t("notice.gitTokenClearFailed", { error: err.message }));
       }
     },
 
@@ -907,12 +978,12 @@ function dashboard() {
         const body = await res.json();
         this.showNotice(
           body.status === "queued"
-            ? `\`${branch}\` queued for capacity (position ${body.position}).`
-            : `\`${branch}\` deployed.`,
+            ? this.t("notice.deployQueued", { branch, position: body.position })
+            : this.t("notice.deployStarted", { branch }),
         );
         this.deployBranch = "";
       } catch (err) {
-        this.showNotice(`Deploy failed: ${err.message}`);
+        this.showNotice(this.t("notice.deployFailed", { error: err.message }));
       }
       this.loadForRoute();
     },
@@ -920,7 +991,7 @@ function dashboard() {
     async rollback(project, env) {
       if (
         !(await this.confirmDialog(
-          `Roll back \`${env.branch.name}\` to the deploy immediately before this one?`,
+          this.t("confirm.rollback", { branch: env.branch.name }),
         ))
       ) {
         return;
@@ -929,9 +1000,9 @@ function dashboard() {
         await this.apiSend("POST", `/api/v1/projects/${project.id}/rollback`, {
           branch: env.branch.name,
         });
-        this.showNotice(`Rolled back \`${env.branch.name}\`.`);
+        this.showNotice(this.t("notice.rolledBack", { branch: env.branch.name }));
       } catch (err) {
-        this.showNotice(`Rollback failed: ${err.message}`);
+        this.showNotice(this.t("notice.rollbackFailed", { error: err.message }));
       }
       this.loadForRoute();
     },
@@ -960,7 +1031,7 @@ function dashboard() {
     async submitSecret() {
       const name = this.secretForm.name.trim();
       if (!name || !this.secretForm.value) {
-        this.showNotice("Secret name and value are both required.");
+        this.showNotice(this.t("notice.secretRequired"));
         return;
       }
       const projectId = this.secretsTargetProjectId();
@@ -972,15 +1043,15 @@ function dashboard() {
           value: this.secretForm.value,
           branch: this.secretForm.scope === "branch" ? this.secretForm.branch : null,
         });
-        this.showNotice(`Secret \`${name}\` set.`);
+        this.showNotice(this.t("notice.secretSet", { name }));
         await this.reloadSecrets();
       } catch (err) {
-        this.showNotice(`Setting secret failed: ${err.message}`);
+        this.showNotice(this.t("notice.secretFailed", { error: err.message }));
       }
     },
 
     async deleteSecret(secret) {
-      if (!(await this.confirmDialog(`Delete secret \`${secret.name}\` (${secret.scope})?`))) {
+      if (!(await this.confirmDialog(this.t("confirm.deleteSecret", { name: secret.name, scope: secret.scope })))) {
         return;
       }
       const projectId = this.secretsTargetProjectId();
@@ -990,10 +1061,10 @@ function dashboard() {
       const qs = secret.branch ? `?branch=${encodeURIComponent(secret.branch)}` : "";
       try {
         await this.apiSend("DELETE", base + qs);
-        this.showNotice(`Secret \`${secret.name}\` deleted.`);
+        this.showNotice(this.t("notice.secretDeleted", { name: secret.name }));
         await this.reloadSecrets();
       } catch (err) {
-        this.showNotice(`Deleting secret failed: ${err.message}`);
+        this.showNotice(this.t("notice.secretDeleteFailed", { error: err.message }));
       }
     },
 
@@ -1010,28 +1081,28 @@ function dashboard() {
         const res = await this.apiSend("POST", "/api/v1/tokens", { name });
         const body = await res.json();
         this.showNotice(
-          `Token created for \`${name}\`: ${body.token} — copy it now, it won't be shown again.`,
+          this.t("notice.tokenCreated", { name, token: body.token }),
         );
         this.newTokenName = "";
         this.loadForRoute();
       } catch (err) {
-        this.showNotice(`Creating token failed: ${err.message}`);
+        this.showNotice(this.t("notice.tokenCreateFailed", { error: err.message }));
       }
     },
 
     async revokeToken(tok) {
-      if (!(await this.confirmDialog(`Revoke token \`${tok.name}\`?`))) {
+      if (!(await this.confirmDialog(this.t("confirm.revokeToken", { name: tok.name })))) {
         return;
       }
       await this.apiSend("DELETE", `/api/v1/tokens/${tok.id}`);
-      this.showNotice(`Revoked token \`${tok.name}\`.`);
+      this.showNotice(this.t("notice.tokenRevoked", { name: tok.name }));
       this.loadForRoute();
     },
 
     async rotateKey() {
       if (
         !(await this.confirmDialog(
-          "Rotate the master encryption key? Every secret is re-encrypted with zero downtime, but this cannot be undone.",
+          this.t("confirm.rotateKey"),
         ))
       ) {
         return;
@@ -1039,9 +1110,9 @@ function dashboard() {
       try {
         const res = await this.apiSend("POST", "/api/v1/rotate-key");
         const body = await res.json();
-        this.showNotice(body.note ?? "Master key rotated.");
+        this.showNotice(body.note ?? this.t("notice.keyRotated"));
       } catch (err) {
-        this.showNotice(`Key rotation failed: ${err.message}`);
+        this.showNotice(this.t("notice.keyRotationFailed", { error: err.message }));
       }
     },
 
@@ -1055,9 +1126,9 @@ function dashboard() {
         a.download = "oxid-backup.tar";
         a.click();
         URL.revokeObjectURL(url);
-        this.showNotice("Backup downloaded.");
+        this.showNotice(this.t("notice.backupDownloaded"));
       } catch (err) {
-        this.showNotice(`Backup failed: ${err.message}`);
+        this.showNotice(this.t("notice.backupFailed", { error: err.message }));
       }
     },
 
