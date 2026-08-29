@@ -502,11 +502,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     && other.branch.name != branch
             })
         {
-            let err = CpError::Validation(format!(
-                "branch `{branch}` resolves to `{url}`, which branch `{}` is already using — \
-                 DNS labels can't tell `/`, `_` and `.` apart from `-`. Rename one of the two \
-                 branches, or destroy the other environment first.",
-                other.branch.name
+            let err = CpError::Validation(crate::i18n::tf(
+                "deploy.subdomainTaken",
+                &[
+                    ("branch", branch.as_str()),
+                    ("url", &url),
+                    ("other", other.branch.name.as_str()),
+                ],
             ));
             self.record_deploy_failure(&mut env, operator.as_ref(), &err)
                 .await;

@@ -3332,3 +3332,46 @@ fn every_dashboard_string_exists_in_every_language() {
         }
     }
 }
+
+/// The API answers in the caller's language.
+///
+/// The dashboard sends `Accept-Language` with whatever its switcher is set
+/// to, so a Spanish UI showing an English error is the gap this closes. The
+/// locale rides the request as task-local context, so this also exercises
+/// that a message built outside the handler — in the auth middleware here —
+/// still sees it.
+#[tokio::test]
+async fn errors_are_returned_in_the_requested_language() {
+    let app = test_app_with_token("s3cr3t").await;
+
+    let ask = async |accept: Option<&str>| {
+        let mut builder = Request::builder().method("GET").uri("/api/v1/stats");
+        if let Some(accept) = accept {
+            builder = builder.header("accept-language", accept);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    };
+
+    assert!(
+        ask(None).await.contains("bearer"),
+        "default must be English"
+    );
+    assert!(ask(Some("en")).await.contains("bearer"));
+    let spanish = ask(Some("es-ES,es;q=0.9")).await;
+    assert!(spanish.contains("token bearer"), "{spanish}");
+
+    // An unknown language is not an error — it falls back rather than
+    // failing a request over a header nobody meant as a demand.
+    assert!(ask(Some("de-DE")).await.contains("bearer"));
+    // And an unknown tag must not stop the search before a known one.
+    assert!(ask(Some("de, es")).await.contains("token bearer"));
+}

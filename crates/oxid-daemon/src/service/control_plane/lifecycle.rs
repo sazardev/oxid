@@ -214,8 +214,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             ContainerStatus::Paused => self.oci.unpause(&name).await?,
             ContainerStatus::Stopped => self.oci.start(&name).await?,
             ContainerStatus::Missing => {
-                return Err(CpError::NotFound(format!(
-                    "container `{name}` no longer exists; redeploy this branch to recreate it"
+                return Err(CpError::NotFound(crate::i18n::tf(
+                    "deploy.containerGone",
+                    &[("name", &name)],
                 )));
             }
         }

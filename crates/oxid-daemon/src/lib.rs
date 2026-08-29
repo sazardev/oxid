@@ -11,6 +11,7 @@
 
 pub mod adapter;
 pub mod api;
+pub mod i18n;
 pub mod request_context;
 pub mod service;
 

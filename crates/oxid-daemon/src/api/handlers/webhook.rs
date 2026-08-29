@@ -120,16 +120,18 @@ async fn handle_push<
         .into_iter()
         .filter(|p| repo_matches(p.repo_url.as_str(), &event.repo_hint));
     let project = matches.next().ok_or_else(|| {
-        ApiError::not_found(format!("no project registered for `{}`", event.repo_hint))
+        ApiError::not_found(crate::i18n::tf(
+            "notFound.repo",
+            &[("repo", &event.repo_hint)],
+        ))
     })?;
     // Two projects registered against the same repository is an operator
     // mistake, and silently picking whichever came back first would deploy
     // an arbitrary one of them on every push.
     if matches.next().is_some() {
-        return Err(ApiError::from_validation(format!(
-            "more than one project is registered for `{}`; remove the duplicate registration \
-             so pushes route to exactly one project",
-            event.repo_hint
+        return Err(ApiError::from_validation(crate::i18n::tf(
+            "invalid.duplicateRepo",
+            &[("repo", &event.repo_hint)],
         )));
     }
     let branch = parse_branch(&event.branch)?;
@@ -200,7 +202,7 @@ fn require_secret<
     state.webhook_secret.as_deref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "webhook secret is not configured; set OXID_WEBHOOK_SECRET",
+            crate::i18n::t("webhook.noSecret"),
         )
     })
 }
@@ -300,7 +302,10 @@ pub async fn gitlab_webhook<
             ApiError::new(StatusCode::UNAUTHORIZED, "missing `X-Gitlab-Token` header")
         })?;
     if !constant_time_eq(token.as_bytes(), secret.as_bytes()) {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "token mismatch"));
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            crate::i18n::t("webhook.badToken"),
+        ));
     }
 
     let payload: Value = serde_json::from_slice(&body)

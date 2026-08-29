@@ -76,6 +76,18 @@ When adding a capability, prefer: domain rules and new port methods in `oxid-cor
 
 The project (`oxid.toml`) config schema and its `[project]`/`[build]`/`[routing]`/`[dependencies]` sections are specified in `IDEA.md`; `crates/oxid-core/src/domain/project_config.rs` is the domain-side model for it.
 
+## Internationalisation
+
+Spanish and English, in three places that each resolve the language their own way:
+
+- **Dashboard** — `crates/oxid-daemon/web/i18n.js` holds the catalog; `t()` on the Alpine component reads the active locale on every call, so the switcher re-renders every binding without a reload. Language: previous choice (`localStorage`), else `navigator.languages`, else English.
+- **CLI** — `crates/oxid-cli/src/i18n.rs`. Language: `--lang`, else `OXID_LANG`, else `LC_ALL`/`LC_MESSAGES`/`LANG`, else English.
+- **Daemon** — `crates/oxid-daemon/src/i18n.rs`, for messages the API returns to a person. The locale comes from `Accept-Language` and travels as a `tokio::task_local!` set in `request_id_middleware`, exactly like the request id, so a message built deep in `ControlPlane` needs no extra parameter.
+
+Deliberately **not** translated, and each for a reason worth keeping: `--json` output and API field names (scripts parse them); log lines (aggregators match on their text); and anything wrapping a `git2`/`bollard`/`sqlx` error (those strings come from those libraries and are what an operator searches for).
+
+Every catalog is guarded by tests that fail on a missing key or a placeholder a translation dropped or invented — `every_dashboard_string_exists_in_every_language` also checks the reverse, that no key the UI asks for is undefined.
+
 ## Hooks & CI
 
 - `.githooks/pre-commit` (fast): `fmt --check`, merge-marker check, forbidden paths (`.env`/`secret.key`/`*.pem`), staged secret scan (`gitleaks` if installed, else built-in), `cargo check` if Rust changed, hexagonal-boundary check if `oxid-core/Cargo.toml` is staged.

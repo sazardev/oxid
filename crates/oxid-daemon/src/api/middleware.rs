@@ -68,11 +68,26 @@ pub(crate) async fn request_id_middleware(request: Request, next: Next) -> Respo
     let uri = request.uri().clone();
     let span = tracing::info_span!("http_request", request_id = %request_id, %method, %uri);
 
+    // The caller's language rides along with the request id: both are
+    // ambient, request-scoped context that anything down the call chain may
+    // need, and neither is worth threading through every signature. Absent
+    // or unparseable `Accept-Language` means English.
+    let locale = request
+        .headers()
+        .get(axum::http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(crate::i18n::Locale::default, |header| {
+            crate::i18n::Locale::from_accept_language(header)
+        });
+
     let mut response = {
         use tracing::Instrument;
-        crate::request_context::scope(request_id.clone(), next.run(request))
-            .instrument(span)
-            .await
+        crate::i18n::scope(
+            locale,
+            crate::request_context::scope(request_id.clone(), next.run(request)),
+        )
+        .instrument(span)
+        .await
     };
 
     if let Ok(value) = HeaderValue::from_str(&request_id) {
@@ -162,8 +177,7 @@ pub(crate) fn require_unscoped(authed: &Option<Extension<AuthedAs>>) -> ApiResul
     if operator_scopes(authed.as_ref()).is_some() {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "this endpoint requires an unscoped credential \
-             (the master OXID_API_TOKEN or a named token without --project scopes)",
+            crate::i18n::t("auth.unscopedOnly"),
         ));
     }
     Ok(())
@@ -191,7 +205,7 @@ pub(crate) async fn require_bearer_token<
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let Some(token) = provided else {
-        return ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
+        return ApiError::new(StatusCode::UNAUTHORIZED, crate::i18n::t("auth.missing"))
             .into_response();
     };
     if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
@@ -205,8 +219,9 @@ pub(crate) async fn require_bearer_token<
                 .insert(AuthedAs::Operator(identity));
             next.run(request).await
         }
-        _ => ApiError::new(StatusCode::UNAUTHORIZED, "missing or invalid bearer token")
-            .into_response(),
+        _ => {
+            ApiError::new(StatusCode::UNAUTHORIZED, crate::i18n::t("auth.missing")).into_response()
+        }
     }
 }
 
@@ -237,7 +252,7 @@ pub(crate) fn require_master<
         Some(Extension(AuthedAs::Master)) => Ok(()),
         _ => Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "token management requires the master OXID_API_TOKEN",
+            crate::i18n::t("auth.masterOnly"),
         )),
     }
 }
