@@ -419,7 +419,11 @@ fn error(msg: impl std::fmt::Display) {
 fn colored_state(state: &str) -> String {
     match state {
         "running" => format!("{GREEN}{state}{RESET}"),
-        "building" => format!("{ORANGE}{state}{RESET}"),
+        // `build_failed` shares `building`'s attention colour on purpose:
+        // both are states an operator is waiting on the outcome of, and a
+        // failed deploy must not fade into `destroyed`'s muted red — the two
+        // mean very different things even though neither is serving.
+        "building" | "build_failed" => format!("{ORANGE}{state}{RESET}"),
         "paused" | "hibernating" => format!("{DIM_ITALIC}{state}{RESET}"),
         "destroyed" => format!("{RED}{state}{RESET}"),
         other => other.to_owned(),
@@ -1005,6 +1009,12 @@ async fn cmd_rollback(
 /// minute, second, ...]`). Comparing the arrays element-by-element sorts
 /// chronologically since each field is listed in decreasing significance.
 fn timestamp_sort_key(value: &Value) -> Vec<i64> {
+    // RFC 3339 sorts correctly as plain text (fixed-width, most-significant
+    // first), so the string is turned into its byte sequence rather than
+    // parsed into a date the CLI would otherwise need a calendar for.
+    if let Some(text) = value.as_str() {
+        return text.bytes().map(i64::from).collect();
+    }
     value
         .as_array()
         .map(|parts| parts.iter().filter_map(Value::as_i64).collect())
@@ -1266,15 +1276,27 @@ async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Re
     Ok(())
 }
 
-/// Formats an `AuditEvent.occurred_at` (`time::OffsetDateTime`'s default,
-/// non-human-readable serde array: `[year, ordinal_day, hour, min, sec, ...]`)
-/// into a compact, readable timestamp without pulling in a formatting crate
-/// on the CLI side.
+/// Formats an API timestamp into a compact `YYYY-MM-DD HH:MM:SS` without
+/// pulling a formatting crate into the CLI.
+///
+/// The daemon sends RFC 3339, so this is a trim rather than a conversion.
+/// The array branch is kept for one release so a newer CLI still prints
+/// something sane against an older daemon, which serialized `time`'s
+/// positional array — that shape is why timestamps used to render as
+/// `2026-day241 15:20:45`: the second slot is the *ordinal day of the year*,
+/// not a month, and there is no way to recover a calendar date from it here.
 fn format_occurred_at(value: &Value) -> String {
+    if let Some(text) = value.as_str() {
+        let trimmed = text
+            .split_once('.')
+            .map_or(text, |(head, _fraction)| head)
+            .trim_end_matches('Z');
+        return trimmed.replacen('T', " ", 1);
+    }
     let parts = value.as_array().map_or(&[][..], Vec::as_slice);
     let get = |i: usize| parts.get(i).and_then(Value::as_i64).unwrap_or(0);
     format!(
-        "{:04}-day{:03} {:02}:{:02}:{:02}",
+        "{:04}-{:03}d {:02}:{:02}:{:02}",
         get(0),
         get(1),
         get(2),
@@ -2040,7 +2062,16 @@ fn print_infra_report(value: &Value) {
     }
 
     match value["traefik_status"].as_str().unwrap_or("missing") {
-        "running" => ok("Traefik is running"),
+        "running" => {
+            let port = value["traefik_http_port"].as_u64().unwrap_or(80);
+            if port == 80 {
+                ok("Traefik is running");
+            } else {
+                ok(format!(
+                    "Traefik is running (published on host port {port} — branch URLs need it)"
+                ));
+            }
+        }
         "paused" => bg("Traefik container exists but is paused"),
         "stopped" => bg("Traefik container exists but is stopped"),
         _ => bg("Traefik is not running"),
@@ -2055,8 +2086,13 @@ fn print_infra_report(value: &Value) {
                 .as_bool()
                 .unwrap_or(false);
             let wake = wiring["references_oxid_wake"].as_bool().unwrap_or(false);
-            if joined && labeled && wake {
+            let catchall = wiring["has_wake_catchall"].as_bool().unwrap_or(false);
+            if joined && labeled && wake && catchall {
                 ok("This daemon's own container is fully wired for wake-on-request");
+            } else if joined && labeled && wake {
+                bg(
+                    "Wake-on-request can't reach scaled-to-zero branches: the catch-all router is missing",
+                );
             } else {
                 bg("This daemon's own container is NOT fully wired for wake-on-request");
             }

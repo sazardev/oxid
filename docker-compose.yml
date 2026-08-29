@@ -27,6 +27,12 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --providers.docker.network=oxid-net
+      # Traefik batches provider config reloads, and the 2s default is by far
+      # the largest component of a wake: a scaled-to-zero branch starts its
+      # container in ~150ms, then waits out this window before its route
+      # exists again. Measured end-to-end (asleep -> app serving) across the
+      # same environment: 2280ms at the default, ~830ms at 100ms.
+      - --providers.providersThrottleDuration=100ms
       - --entrypoints.web.address=:80
       # Uncomment for TLS once you have real certificates / an ACME resolver
       # configured — do not expose plain HTTP beyond localhost otherwise.
@@ -46,9 +52,20 @@ services:
       # *label* provider silently drops them (confirmed: never appears in
       # `/api/rawdata`) — so this is set once, globally, applying to every
       # Oxid-managed service automatically.
-      - --serversTransport.forwardingTimeouts.dialTimeout=2s
+      # A stopped container's address usually black-holes rather than
+      # refusing, so this timeout — not an error — is what a request to a
+      # sleeping branch waits out before the `errors` middleware can hand it
+      # to `/api/v1/wake`. Dialling a container on a local bridge network is
+      # sub-millisecond when it is actually up, so 500ms is generous while
+      # cutting ~1.5s off every wake that arrives before the route is gone.
+      - --serversTransport.forwardingTimeouts.dialTimeout=500ms
       - --serversTransport.forwardingTimeouts.responseHeaderTimeout=5s
     ports:
+      # Host side only. Traefik's `web` entrypoint always listens on 80
+      # inside the container; change the left number (and set
+      # OXID_TRAEFIK_HTTP_PORT to match, so `oxid infra status` reports the
+      # same thing) if this host's 80 belongs to another proxy. Branch URLs
+      # then need that port, since wildcard DNS alone cannot add one.
       - "80:80"
       # - "443:443"
       - "8081:8081" # Traefik dashboard (remove or protect before exposing this host)
@@ -120,6 +137,25 @@ services:
       - traefik.enable=true
       - traefik.docker.network=oxid-net
       - traefik.http.services.oxid-wake.loadbalancer.server.port=8080
+      # Wake-on-request's *discovery* half. A scaled-to-zero branch is a
+      # stopped container, and Traefik only publishes routers for running
+      # ones — so the branch's own `Host()` router is gone precisely when
+      # someone needs it, and the request would 404 at the proxy with
+      # nothing left to trigger the wake. This catch-all lives on the daemon
+      # (which is never scaled to zero), matches any host nothing else
+      # claimed, and rewrites the path to `/api/v1/wake`, which resolves the
+      # original `Host` header back to its environment and starts it.
+      #
+      # `priority=1` is the lowest Traefik accepts: any real branch router
+      # outranks it, so this only ever sees hosts with no live container
+      # behind them. Unknown hosts get the same 404 they always did, just
+      # from the daemon instead of the proxy.
+      - traefik.http.routers.oxid-wake-catchall.rule=HostRegexp(`^.+$`)
+      - traefik.http.routers.oxid-wake-catchall.priority=1
+      - traefik.http.routers.oxid-wake-catchall.entrypoints=web
+      - traefik.http.routers.oxid-wake-catchall.service=oxid-wake
+      - traefik.http.routers.oxid-wake-catchall.middlewares=oxid-wake-rewrite
+      - traefik.http.middlewares.oxid-wake-rewrite.replacepath.path=/api/v1/wake
     restart: unless-stopped
 
   # OPTIONAL: streaming replication of the SQLite database to off-site

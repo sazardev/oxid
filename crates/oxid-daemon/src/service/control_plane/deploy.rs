@@ -16,7 +16,9 @@ use super::helpers::{
     hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
     sanitize_label, state_err,
 };
-use super::types::{Admission, DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
+use super::types::{
+    Admission, AdmissionMode, DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats,
+};
 use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
@@ -32,6 +34,25 @@ use oxid_core::{
     SecretValue, SelfWiringStatus, StateTransition, TraefikSpec, Ttl,
 };
 
+/// How many times a queued deploy may fail for a retryable reason before it
+/// is abandoned. Bounded so an unreachable repository or a branch deleted
+/// upstream doesn't get retried on every scheduler tick forever.
+const MAX_DEPLOY_ATTEMPTS: u32 = 5;
+
+/// Whether a failed deploy is worth trying again later.
+///
+/// Only failures that happened *before* the deploy could really begin
+/// qualify: a clone that couldn't resolve DNS, a storage blip, a resource
+/// pool that wasn't reachable yet. A build failure is deliberately excluded —
+/// a broken Dockerfile fails identically on every retry, and it now leaves a
+/// `BuildFailed` environment behind that says so.
+fn is_retryable(err: &CpError) -> bool {
+    matches!(
+        err,
+        CpError::Git(_) | CpError::Store(_) | CpError::Pool(_) | CpError::DeployNotReady(_)
+    )
+}
+
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     pub async fn deploy(
         &self,
@@ -39,7 +60,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
     ) -> Result<Environment, CpError> {
         match self
-            .deploy_at(project_id, branch, None, None, false)
+            .deploy_at(project_id, branch, None, None, AdmissionMode::Enqueue)
             .await?
         {
             DeployOutcome::Deployed(env, _) => Ok(env),
@@ -63,7 +84,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         operator: Option<String>,
     ) -> Result<Environment, CpError> {
         match self
-            .deploy_at(project_id, branch, None, operator, false)
+            .deploy_at(project_id, branch, None, operator, AdmissionMode::Enqueue)
             .await?
         {
             DeployOutcome::Deployed(env, _) => Ok(env),
@@ -92,7 +113,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         branch: BranchName,
         operator: Option<String>,
     ) -> Result<DeployOutcome, CpError> {
-        self.deploy_at(project_id, branch, None, operator, true)
+        self.deploy_at(project_id, branch, None, operator, AdmissionMode::Enqueue)
             .await
     }
 
@@ -115,44 +136,235 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Returns [`CpError`] if the queue or host capacity itself can't be
     /// read at all.
     pub async fn retry_queued_deploys(&self) -> Result<Vec<(u64, CpError)>, CpError> {
+        // Both the scheduler and every accepted webhook call this. Only one
+        // drain may run at a time or two of them can read the same pending
+        // row before either removes it and deploy the same push twice;
+        // bailing out is correct rather than merely safe, because the drain
+        // already running will reach anything just enqueued.
+        let Ok(_drain) = self.deploy_drain_lock.try_lock() else {
+            tracing::debug!("deploy queue drain already in progress; skipping");
+            return Ok(Vec::new());
+        };
         let mut failures = Vec::new();
         for queued in self.store.list_deploy_queue().await? {
-            let project = match self.ensure_project(queued.project_id).await {
-                Ok(p) => p,
-                Err(e) => {
-                    failures.push((queued.id, e));
-                    continue;
-                }
-            };
-            match self.check_admission(&project).await {
-                Ok(Admission::Fits) => {}
-                Ok(Admission::Queue) => break,
-                Err(e) => {
-                    failures.push((queued.id, e));
-                    continue;
-                }
-            }
-
-            self.store.remove_from_deploy_queue(queued.id).await?;
             let branch = match BranchName::parse(&queued.branch) {
                 Ok(b) => b,
                 Err(e) => {
+                    // An unparseable branch will never become parseable.
+                    let _ = self.store.remove_from_deploy_queue(queued.id).await;
                     failures.push((queued.id, e.into()));
                     continue;
                 }
             };
+            // The entry is held until the deploy resolves, rather than
+            // removed up front. A drain that crashed — or a daemon that was
+            // restarted mid-deploy — used to lose the push outright, and now
+            // that accepted webhooks land here that would be the normal path
+            // rather than a rare one. The drain lock is what makes holding
+            // it safe: no second drain can pick up the same row meanwhile.
             match self
-                .deploy_at(queued.project_id, branch, None, queued.operator, false)
+                .deploy_at(
+                    queued.project_id,
+                    branch,
+                    None,
+                    queued.operator.clone(),
+                    AdmissionMode::AlreadyQueued,
+                )
                 .await
             {
-                Ok(DeployOutcome::Deployed(_, _)) => {}
-                Ok(DeployOutcome::Queued { .. }) => {
-                    unreachable!("check_admission is off, so this never queues")
+                Ok(DeployOutcome::Deployed(_, _)) => {
+                    self.store.remove_from_deploy_queue(queued.id).await?;
                 }
-                Err(e) => failures.push((queued.id, e)),
+                // Still doesn't fit. The entry stays exactly where it is,
+                // and the loop stops rather than skipping ahead to a smaller
+                // request behind it — FIFO fairness, so a big deploy is
+                // never starved by a stream of small ones.
+                Ok(DeployOutcome::Queued { .. }) => break,
+                Err(e) => {
+                    let attempts = queued.attempts + 1;
+                    if is_retryable(&e) && attempts < MAX_DEPLOY_ATTEMPTS {
+                        tracing::warn!(
+                            queue_id = queued.id,
+                            attempts,
+                            error = %e,
+                            "queued deploy failed transiently; keeping it queued"
+                        );
+                        self.store.bump_deploy_attempts(queued.id).await?;
+                    } else {
+                        self.store.remove_from_deploy_queue(queued.id).await?;
+                        failures.push((queued.id, e));
+                    }
+                }
             }
         }
         Ok(failures)
+    }
+
+    /// Accepts a push for `branch` without deploying it inline: the deploy
+    /// is persisted on the queue and returns its position.
+    ///
+    /// Webhook deliveries used to run the whole pipeline — clone, build,
+    /// start — inside the HTTP request. GitHub abandons a delivery after 10
+    /// seconds and does not retry push events, while a first build of a
+    /// branch with real dependencies measured 54 seconds, so the delivery
+    /// was reported as failed even though the environment came up fine;
+    /// re-sending it by hand then deployed the same commit a second time.
+    /// Queueing makes the response immediate and survives a daemon restart,
+    /// which inline deploys never did.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the queue can't be written.
+    pub async fn enqueue_push(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+        operator: Option<&str>,
+    ) -> Result<u64, CpError> {
+        let queue_id = self
+            .store
+            .enqueue_deploy(project_id, branch, operator)
+            .await?;
+        let position = self
+            .store
+            .list_deploy_queue()
+            .await?
+            .iter()
+            .position(|q| q.id == queue_id)
+            .map_or(1, |i| i as u64 + 1);
+        tracing::info!(%project_id, %branch, position, ?operator, "push queued for deploy");
+        Ok(position)
+    }
+
+    /// Reports a deploy that doesn't currently fit, enqueuing it first
+    /// unless it is already on the queue.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the queue can't be read or written.
+    async fn queue_or_report(
+        &self,
+        project_id: ProjectId,
+        branch: &BranchName,
+        operator: Option<String>,
+        admission: AdmissionMode,
+    ) -> Result<DeployOutcome, CpError> {
+        let position = match admission {
+            AdmissionMode::Enqueue => {
+                self.enqueue_push(project_id, branch, operator.as_deref())
+                    .await?
+            }
+            // Already on the queue: report where it sits without adding a
+            // duplicate entry the drain would deploy twice.
+            AdmissionMode::AlreadyQueued | AdmissionMode::Bypass => self
+                .store
+                .list_deploy_queue()
+                .await?
+                .iter()
+                .position(|q| q.project_id == project_id && q.branch == branch.as_str())
+                .map_or(1, |i| i as u64 + 1),
+        };
+        tracing::info!(%project_id, %branch, position, "deploy waiting for host capacity");
+        Ok(DeployOutcome::Queued { position })
+    }
+
+    /// Returns `project` with the build settings, routed port and
+    /// dependencies taken from the checked-out commit's `oxid.toml`.
+    ///
+    /// A malformed or invalid `oxid.toml` fails the deploy — the branch
+    /// asked for something specific and guessing at it is how the silent
+    /// mismatch this replaces came about. A branch with *no* config file at
+    /// all keeps the project's settings and only warns: dropping the file is
+    /// a normal thing to do on a branch, and `parse_project` already falls
+    /// back to a `docker-compose.yml`/`Dockerfile` when one is present.
+    fn branch_config(&self, project: &Project, repo_dir: &Path) -> Result<Project, CpError> {
+        let parsed = match config::parse_project(repo_dir) {
+            Ok(parsed) => parsed,
+            Err(err @ (config::ConfigError::Parse(_) | config::ConfigError::Validation(_))) => {
+                return Err(CpError::from(err));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    error = %err,
+                    "no readable oxid.toml on this commit; keeping the project's registered config"
+                );
+                return Ok(project.clone());
+            }
+        };
+
+        let mut effective = project.clone();
+        if effective.config.build != parsed.config.build {
+            tracing::info!(project_id = %project.id, "branch overrides [build] from its own oxid.toml");
+        }
+        if effective.config.port != parsed.config.port {
+            tracing::info!(
+                project_id = %project.id,
+                from = effective.config.port,
+                to = parsed.config.port,
+                "branch overrides [routing].port from its own oxid.toml"
+            );
+        }
+        if effective.config.dependencies != parsed.config.dependencies {
+            tracing::info!(
+                project_id = %project.id,
+                count = parsed.config.dependencies.len(),
+                "branch overrides [dependencies] from its own oxid.toml"
+            );
+        }
+        effective.config.build = parsed.config.build;
+        effective.config.port = parsed.config.port;
+        effective.config.dependencies = parsed.config.dependencies;
+        Ok(effective)
+    }
+
+    /// Records a failed deploy everywhere an operator might look for it:
+    /// the environment row flips to `BuildFailed`, an audit event captures
+    /// the reason and who triggered it, and an ERROR line lands in the log.
+    ///
+    /// Every failure path in `deploy_at` funnels through here. Before this
+    /// existed the recovery was inlined in a single `match` arm that a
+    /// failing image build never reached, so the most common failure in the
+    /// product was also its most invisible one.
+    ///
+    /// Deliberately infallible: this runs while already returning an error,
+    /// and a bookkeeping failure must not mask the original cause. Each step
+    /// is best-effort and logged rather than propagated.
+    async fn record_deploy_failure(
+        &self,
+        env: &mut Environment,
+        operator: Option<&String>,
+        err: &CpError,
+    ) {
+        let now = OffsetDateTime::now_utc();
+        if env.transition(StateTransition::BuildFailed, now).is_ok() {
+            if let Err(e) = EnvironmentStore::update(&self.store, env).await {
+                tracing::warn!(environment_id = %env.id, error = %e, "could not persist failed deploy state");
+            }
+            if let Err(e) = self
+                .store
+                .record(
+                    &AuditEvent::with_operator(
+                        u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                        env.id,
+                        StateTransition::BuildFailed,
+                        Some(err.to_string()),
+                        now,
+                        operator.cloned(),
+                    )
+                    .with_request_id(current_request_id()),
+                )
+                .await
+            {
+                tracing::warn!(environment_id = %env.id, error = %e, "could not record failed deploy audit event");
+            }
+        }
+        tracing::error!(
+            environment_id = %env.id,
+            project_id = %env.project_id,
+            branch = %env.branch.name,
+            operator = ?operator,
+            error = %err,
+            "deploy failed"
+        );
     }
 
     /// Deploys `branch`, pinned to `sha_override` instead of the branch's
@@ -165,14 +377,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] on any pipeline step failure.
     #[allow(clippy::too_many_lines)]
-    #[tracing::instrument(skip(self, sha_override, operator), fields(%project_id, %branch, ?operator, check_admission))]
+    #[tracing::instrument(skip(self, sha_override, operator), fields(%project_id, %branch, ?operator, ?admission))]
     pub(crate) async fn deploy_at(
         &self,
         project_id: ProjectId,
         branch: BranchName,
         sha_override: Option<String>,
         operator: Option<String>,
-        check_admission: bool,
+        admission: AdmissionMode,
     ) -> Result<DeployOutcome, CpError> {
         tracing::info!(%project_id, %branch, "deploy started");
         // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
@@ -182,26 +394,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let _guard = self.lifecycle_lock.lock().await;
 
         let project = self.ensure_project(project_id).await?;
-
-        if check_admission && let Admission::Queue = self.check_admission(&project).await? {
-            let queue_id = self
-                .store
-                .enqueue_deploy(project_id, &branch, operator.as_deref())
-                .await?;
-            // `enqueue_deploy` returns the row's own id, not its rank among
-            // still-pending entries (earlier ones may already have been
-            // retried and removed) — look it up so `position` reports what
-            // it documents.
-            let position = self
-                .store
-                .list_deploy_queue()
-                .await?
-                .iter()
-                .position(|q| q.id == queue_id)
-                .map_or(1, |i| i as u64 + 1);
-            tracing::info!(%project_id, %branch, position, "deploy queued (insufficient host capacity)");
-            return Ok(DeployOutcome::Queued { position });
-        }
 
         // 0. A redeploy of an already-live branch (a webhook firing on a new
         // push, or a second `oxid up`) used to destroy the previous
@@ -214,7 +406,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let previous = self
             .find_environment_by_branch(project_id, &branch)
             .await?
-            .filter(|e| e.state != EnvironmentState::Destroyed);
+            // A `BuildFailed` row is kept around so the failure stays
+            // visible, but it never had a healthy container serving
+            // traffic — treating it as the live previous instance would
+            // make the cutover try to retire something that was never up.
+            .filter(|e| {
+                !matches!(
+                    e.state,
+                    EnvironmentState::Destroyed | EnvironmentState::BuildFailed
+                )
+            });
 
         // 1. Clone cache + resolve (or reuse an explicit rollback target)
         // + checkout the commit. `git_token`, when set, authenticates the
@@ -236,29 +437,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         };
         self.git.checkout_commit(&repo_dir, &commit.sha).await?;
 
-        // 2. Build the image.
+        // 2. Create the environment row (`Building`) *before* anything that
+        // can fail.
         //
-        // `[build].context` (e.g. a monorepo subdirectory like `backend/`)
-        // was parsed from `oxid.toml` and persisted, but never actually
-        // consulted here — every build used the whole repo checkout as its
-        // context regardless. Found while wiring `docker-compose.yml`
-        // support, whose `build.context`/`build.dockerfile` pair only makes
-        // sense if `dockerfile` really is resolved relative to `context`.
-        let image = image_name(&project, &branch);
-        let build = BuildSpec {
-            context: repo_dir.join(&project.config.build.context),
-            dockerfile: project
-                .config
-                .build
-                .dockerfile
-                .clone()
-                .unwrap_or_else(|| "Dockerfile".to_owned()),
-            image: image.clone(),
-        };
-        let build_report = self.oci.build(&build).await?;
-
-        // 3. Create the environment (Building) and persist it.
+        // It used to be created after the image build, which meant a broken
+        // Dockerfile — by far the most common way a deploy fails — bailed
+        // out through `?` before any row existed, skipping the recovery
+        // block below entirely: no environment, no audit event, and not one
+        // ERROR line in the log. The only symptom was a 500 on the webhook,
+        // so from inside the dashboard or `oxid status` a colleague's failed
+        // push was indistinguishable from a push that never happened.
+        // Persisting the row first is what gives every later failure
+        // somewhere to be recorded against.
         let url = subdomain_for(&branch, &project.config.base_domain);
+
         let now = OffsetDateTime::now_utc();
         let mut env = Environment::new(
             EnvironmentId(0),
@@ -280,16 +472,142 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             env.id.0
         ));
 
+        // Two different branches can normalise to one subdomain —
+        // `feat/dup-x` and `feat-dup-x` both become `feat-dup-x`, which is
+        // exactly what happens when someone renames a branch and pushes
+        // both. Both environments then report themselves as running on the
+        // same URL while the proxy can only ever route to one of them, so
+        // the loser is unreachable forever with nothing anywhere saying why.
+        //
+        // Checked after the row exists rather than before, so the refusal is
+        // recorded against it: the push arrived over a webhook that was
+        // already answered, so an error returned to nobody is an error the
+        // dev who pushed will never see.
+        if let Some(other) = EnvironmentStore::list_by_project(&self.store, project_id)
+            .await?
+            .into_iter()
+            .find(|other| {
+                !matches!(
+                    other.state,
+                    EnvironmentState::Destroyed | EnvironmentState::BuildFailed
+                ) && other.url == url
+                    && other.branch.name != branch
+            })
+        {
+            let err = CpError::Validation(format!(
+                "branch `{branch}` resolves to `{url}`, which branch `{}` is already using — \
+                 DNS labels can't tell `/`, `_` and `.` apart from `-`. Rename one of the two \
+                 branches, or destroy the other environment first.",
+                other.branch.name
+            ));
+            self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                .await;
+            return Err(err);
+        }
+
+        // Re-read `oxid.toml` from the commit actually being deployed.
+        //
+        // Every deploy used to run against the config captured when the
+        // project was first registered, so anything a branch changed in its
+        // own `oxid.toml` was silently ignored: a branch declaring a new
+        // Postgres dependency deployed "successfully" with no database and
+        // no `DATABASE_URL`, and a branch asking for more memory quietly got
+        // the project's. Nothing warned, because nothing ever looked.
+        //
+        // Build settings, the routed port and dependencies are properties of
+        // the commit, so they come from the branch. The base domain and the
+        // idle/lifetime policy stay with the project: those are operator
+        // decisions owned by `oxid configure`, and letting any branch rewrite
+        // them would let one push change another branch's URL or TTL.
+        let project = match self.branch_config(&project, &repo_dir) {
+            Ok(effective) => effective,
+            Err(err) => {
+                self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                    .await;
+                return Err(err);
+            }
+        };
+
+        // The one and only admission decision, taken here because this is
+        // the first point where the *actual* request is known: the branch's
+        // own `oxid.toml` may ask for far more (or less) memory than the
+        // project was registered with. Deciding earlier — the only option
+        // before branch config was honoured — meant the gate was weighing a
+        // number the deploy wasn't going to use.
+        // A rollback replaces an environment the host is already carrying,
+        // so gating it on free capacity would refuse the one deploy whose
+        // whole purpose is getting back to a working state.
+        let admitted = if admission == AdmissionMode::Bypass {
+            Ok(Admission::Fits)
+        } else {
+            self.check_admission(&project).await
+        };
+        match admitted {
+            Ok(Admission::Fits) => {}
+            // Doesn't fit right now, but could later. Drop the row created
+            // above: nothing outside this lock has seen it, and leaving a
+            // `Building` row behind for a deploy that hasn't started would
+            // show the branch as deploying while it sits in a queue.
+            Ok(Admission::Queue) => {
+                let _ = EnvironmentStore::delete(&self.store, env.id).await;
+                return self
+                    .queue_or_report(project_id, &branch, operator, admission)
+                    .await;
+            }
+            // Cannot ever fit on this host, so queueing would mean waiting
+            // forever. Recorded against the row so it is visible, then
+            // failed.
+            Err(err) => {
+                let detail = match &err {
+                    CpError::InsufficientCapacity(detail) => detail.clone(),
+                    other => other.to_string(),
+                };
+                let err = CpError::InsufficientCapacity(format!("branch `{branch}` of {detail}"));
+                self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                    .await;
+                return Err(err);
+            }
+        }
+
+        // 3. Build the image.
+        //
+        // `[build].context` (e.g. a monorepo subdirectory like `backend/`)
+        // was parsed from `oxid.toml` and persisted, but never actually
+        // consulted here — every build used the whole repo checkout as its
+        // context regardless. Found while wiring `docker-compose.yml`
+        // support, whose `build.context`/`build.dockerfile` pair only makes
+        // sense if `dockerfile` really is resolved relative to `context`.
+        let image = image_name(&project, &branch);
+        let build = BuildSpec {
+            context: repo_dir.join(&project.config.build.context),
+            dockerfile: project
+                .config
+                .build
+                .dockerfile
+                .clone()
+                .unwrap_or_else(|| "Dockerfile".to_owned()),
+            image: image.clone(),
+        };
+        let build_report = match self.oci.build(&build).await {
+            Ok(report) => report,
+            Err(err) => {
+                let err = CpError::from(err);
+                self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                    .await;
+                return Err(err);
+            }
+        };
+
         // 4-7: resolve secrets, run the container, run `on_start` hooks,
         // wait for it to be ready, then cut over from `previous` (if any)
         // and activate. Everything from here on can fail (a bad secret, a
-        // Docker error, a failing hook, a readiness timeout) *after* the row
-        // above was already persisted as `Building` — but `previous`, if
-        // any, is never touched until the new instance is confirmed ready,
-        // so a failed redeploy leaves the branch exactly as reachable as it
-        // was before the redeploy started. Leaving the new row stuck as
-        // `Building` on error would brick the branch permanently otherwise
-        // (`Building` cannot transition to `Destroy`), see regression test
+        // Docker error, a failing hook, a readiness timeout) — but
+        // `previous`, if any, is never touched until the new instance is
+        // confirmed ready, so a failed redeploy leaves the branch exactly as
+        // reachable as it was before the redeploy started. Leaving the new
+        // row stuck as `Building` on error would brick the branch
+        // permanently otherwise (`Building` cannot transition to `Destroy`),
+        // see regression test
         // `failed_deploy_does_not_permanently_block_branch`.
         let dependencies = match self
             .run_and_activate(
@@ -305,25 +623,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         {
             Ok(dependency_lines) => dependency_lines,
             Err(err) => {
-                let now = OffsetDateTime::now_utc();
-                if env.transition(StateTransition::BuildFailed, now).is_ok() {
-                    let _ = EnvironmentStore::update(&self.store, &env).await;
-                    let _ = self
-                        .store
-                        .record(
-                            &AuditEvent::with_operator(
-                                u64::try_from(now.unix_timestamp()).unwrap_or_default(),
-                                env.id,
-                                StateTransition::BuildFailed,
-                                Some(err.to_string()),
-                                now,
-                                operator.clone(),
-                            )
-                            .with_request_id(current_request_id()),
-                        )
-                        .await;
-                }
-                tracing::error!(%project_id, %branch, environment_id = %env.id, error = %err, "deploy failed");
+                self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                    .await;
                 return Err(err);
             }
         };
@@ -418,7 +719,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         };
 
         match self
-            .deploy_at(project_id, branch, Some(target_sha), operator, false)
+            .deploy_at(
+                project_id,
+                branch,
+                Some(target_sha),
+                operator,
+                AdmissionMode::Bypass,
+            )
             .await?
         {
             DeployOutcome::Deployed(env, report) => Ok((env, report)),

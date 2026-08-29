@@ -1,0 +1,12 @@
+-- Bounded retries for queued deploys.
+--
+-- The queue only ever held deploys waiting on host capacity, so a drain that
+-- failed simply logged and dropped the entry: a momentary DNS or network
+-- failure while cloning lost the push entirely, with no environment row and
+-- nothing to retry from. Webhook deliveries now land here too, which makes
+-- that data loss the normal path rather than an edge case.
+--
+-- `attempts` counts drains that failed for a reason worth retrying, so a
+-- genuinely unreachable repository or a deleted branch is abandoned after a
+-- bounded number of tries instead of being retried on every tick forever.
+ALTER TABLE deploy_queue ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;

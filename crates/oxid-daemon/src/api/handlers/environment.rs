@@ -42,6 +42,33 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use tower_governor::GovernorLayer;
 
+/// `GET /api/v1/environments/{env_id}` — one environment by id.
+///
+/// The route previously only accepted `DELETE`, so fetching a single
+/// environment meant listing its whole project and filtering client-side,
+/// and callers who guessed the obvious URL got a bare `405` with nothing
+/// naming the alternative.
+pub async fn get_environment<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<Json<Environment>> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize_project(&authed, project_id)?;
+    let env = state
+        .cp
+        .find_environment(EnvironmentId(env_id))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("environment `{env_id}`")))?;
+    Ok(Json(env))
+}
+
 pub async fn list_environments<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,

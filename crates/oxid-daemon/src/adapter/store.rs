@@ -254,8 +254,23 @@ impl SqliteStore {
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
     pub async fn find_by_url(&self, url: &str) -> Result<Option<Environment>, RepositoryError> {
+        // Ranked by whether the row can actually serve, *then* by recency.
+        // Ordering by id alone let a higher-id `destroyed` or `build_failed`
+        // row shadow the live one on the same URL — which is not a rare
+        // shape: a failed redeploy leaves one, and so does a branch refused
+        // for colliding with the subdomain another branch already owns.
+        // Waking then resolved to the dead row and reported its missing
+        // container instead of starting the environment that URL belongs to.
         let row = sqlx::query(&format!(
-            "SELECT {ENV_COLUMNS} FROM environments WHERE url = ? ORDER BY id DESC LIMIT 1"
+            "SELECT {ENV_COLUMNS} FROM environments WHERE url = ? \
+             ORDER BY CASE state \
+                 WHEN 'running' THEN 0 \
+                 WHEN 'paused' THEN 0 \
+                 WHEN 'hibernating' THEN 0 \
+                 WHEN 'building' THEN 0 \
+                 ELSE 1 END, \
+               id DESC \
+             LIMIT 1"
         ))
         .bind(url)
         .fetch_optional(&self.pool)
@@ -538,7 +553,7 @@ impl SqliteStore {
     /// Returns [`RepositoryError`] on query failure.
     pub async fn list_deploy_queue(&self) -> Result<Vec<QueuedDeploy>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT id, project_id, branch, operator, requested_at \
+            "SELECT id, project_id, branch, operator, requested_at, attempts \
              FROM deploy_queue ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -560,9 +575,25 @@ impl SqliteStore {
                     branch,
                     operator,
                     requested_at,
+                    attempts: u32::try_from(r.try_get::<i64, _>("attempts").unwrap_or(0))
+                        .unwrap_or(0),
                 })
             })
             .collect()
+    }
+
+    /// Records one more failed drain of a queued deploy, leaving the entry
+    /// in place so the next tick tries again.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn bump_deploy_attempts(&self, id: u64) -> Result<(), RepositoryError> {
+        sqlx::query("UPDATE deploy_queue SET attempts = attempts + 1 WHERE id = ?1")
+            .bind(i64::try_from(id).map_err(|_| storage("queue id overflowed i64"))?)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
     }
 
     /// Removes a queued deploy — called once it's either been dequeued for
@@ -593,7 +624,12 @@ pub struct QueuedDeploy {
     /// Operator who requested it, if authenticated with a named token.
     pub operator: Option<String>,
     /// When it was queued.
+    #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
+    /// How many drains have already failed for this entry with a reason
+    /// worth retrying. Bounds the retry loop so an unreachable repository or
+    /// a branch deleted upstream is eventually abandoned.
+    pub attempts: u32,
 }
 
 /// Non-secret view of an `api_tokens` row (no hash, no raw token).
@@ -604,6 +640,7 @@ pub struct ApiTokenSummary {
     /// Human-readable name chosen at creation (e.g. an operator's username).
     pub name: String,
     /// When the token was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// Whether the token has been revoked.
     pub revoked: bool,

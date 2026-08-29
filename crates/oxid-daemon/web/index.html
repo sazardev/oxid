@@ -86,6 +86,10 @@
         <div class="stat-label">Hibernating</div>
       </div>
       <div class="stat-card">
+        <div class="stat-value state-build_failed" x-text="stats.environments_build_failed ?? '—'"></div>
+        <div class="stat-label">Failed</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-value" x-text="stats.queue_length ?? '—'"></div>
         <div class="stat-label">Queued</div>
       </div>
@@ -119,6 +123,7 @@
               <option value="paused">paused</option>
               <option value="building">building</option>
               <option value="hibernating">hibernating</option>
+              <option value="build_failed">build failed</option>
             </select>
             <input
               class="token-input mono"

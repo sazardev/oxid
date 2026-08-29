@@ -153,7 +153,7 @@ pub fn router<
         )
         .route(
             "/api/v1/environments/{env_id}",
-            delete(handlers::lifecycle::destroy),
+            get(handlers::environment::get_environment).delete(handlers::lifecycle::destroy),
         )
         .route(
             "/api/v1/secrets",

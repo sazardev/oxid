@@ -84,6 +84,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             EnvVarScope::Runtime,
             url.clone(),
         );
+        // The commit actually deployed. Apps routinely want it for a
+        // `/version` endpoint, a Sentry release tag or a build banner, and
+        // without it there was no way to tell from inside a container which
+        // revision it was running — the branch name alone moves under you on
+        // every push.
+        set_secret(
+            &mut sources,
+            "OXID_COMMIT",
+            EnvVarScope::Runtime,
+            env.branch.commit_sha.clone(),
+        );
         let env_vars = sources
             .resolve()
             .into_iter()

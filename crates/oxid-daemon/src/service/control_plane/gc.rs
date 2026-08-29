@@ -107,9 +107,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             std::collections::HashMap::new();
 
         for mut env in self.store.list_all_environments().await? {
+            // Nothing to reconcile for a row that never had a healthy
+            // container: `Building` is mid-flight, `Destroyed` is gone, and
+            // `BuildFailed` is a record of a deploy that never came up.
             if matches!(
                 env.state,
-                EnvironmentState::Destroyed | EnvironmentState::Building
+                EnvironmentState::Destroyed
+                    | EnvironmentState::Building
+                    | EnvironmentState::BuildFailed
             ) {
                 continue;
             }
@@ -180,8 +185,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     EnvironmentState::Running | EnvironmentState::Paused,
                     ContainerStatus::Missing,
                 ) => self.mark_destroyed(&mut env).await,
+                // `stop`, matching how suspension is applied everywhere
+                // else: a `pause`d container is invisible to Traefik's
+                // router table, so re-suspending a rebooted environment
+                // that way would silently make it unreachable again.
                 (EnvironmentState::Paused, ContainerStatus::Running) => {
-                    self.oci.pause(&name).await.map_err(CpError::from)
+                    self.oci.stop(&name).await.map_err(CpError::from)
                 }
                 (EnvironmentState::Running, ContainerStatus::Stopped) => {
                     match self.oci.start(&name).await {
@@ -230,25 +239,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .expect("Keep is filtered out before calling apply_gc_action");
         let name = resolved_container_name(project, &env);
 
-        // Idempotency: Docker returns 409 if we pause an already-paused
-        // container, or 304/404 on stop. Treat those as success so the
-        // scheduler does not spam WARNs every 30s — the real guard is the
-        // state-aware `gc::evaluate` above, this is belt-and-suspenders.
+        // Every suspending action stops the container. `Pause` used to call
+        // `docker pause` instead, which Traefik's Docker provider cannot
+        // see: it only publishes routers for `running` containers and
+        // ignores pause/unpause events entirely, so a paused branch lost
+        // its route permanently and answered 404 instead of waking. See the
+        // long note in `ControlPlane::pause`.
+        //
+        // Idempotency: Docker returns 304/404 when stopping something
+        // already stopped. Treat that as success so the scheduler does not
+        // spam WARNs every tick — the real guard is the state-aware
+        // `gc::evaluate` above, this is belt-and-suspenders.
         match action {
-            GcAction::Pause => {
-                if let Err(e) = self.oci.pause(&name).await {
-                    let msg = e.to_string();
-                    if msg.contains("already paused") || msg.contains("is already paused") {
-                        tracing::debug!(%name, "container already paused, treating as success");
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            }
-            GcAction::Hibernate | GcAction::Destroy => {
+            GcAction::Pause | GcAction::Hibernate | GcAction::Destroy => {
                 if let Err(e) = self.oci.stop(&name).await {
                     let msg = e.to_string();
-                    if msg.contains("already stopped")
+                    if matches!(e, OciError::NotFound(_))
+                        || msg.contains("already stopped")
                         || msg.contains("is already stopped")
                         || msg.contains("304")
                     {
@@ -270,7 +277,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
         if action == GcAction::Destroy {
-            self.oci.remove(&name).await?;
+            match self.oci.remove(&name).await {
+                Ok(()) | Err(OciError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
             match self
                 .oci
                 .remove_image(&image_name(project, &env.branch.name))

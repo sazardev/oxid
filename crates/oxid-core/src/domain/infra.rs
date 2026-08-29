@@ -33,7 +33,9 @@ pub struct TraefikSpec {
     pub image: String,
     /// Name of the Traefik container itself.
     pub container_name: String,
-    /// Host port Traefik's `web` entrypoint is published on.
+    /// Host port Traefik's `web` entrypoint is published on. The container
+    /// side is always 80; this is only where it surfaces on the host, so an
+    /// operator whose 80 is already taken can still run `oxid infra setup`.
     pub http_port: u16,
     /// Path to the Docker socket, mounted read-only into the container so
     /// Traefik's Docker provider can watch for label changes.
@@ -48,7 +50,14 @@ impl TraefikSpec {
     pub fn new(network: impl Into<String>) -> Self {
         Self {
             network: network.into(),
-            image: "traefik:v3.3".to_owned(),
+            // `latest`, matching `docker-compose.yml` (verified live):
+            // Docker Engine >= 29 rejects API versions below 1.40, and
+            // Traefik up to v3.5 vendors a client that negotiates 1.24 and
+            // ignores `DOCKER_API_VERSION` — every router silently 404s with
+            // "client version 1.24 is too old" in the proxy log. A pinned
+            // older tag here meant `oxid infra setup` produced a Traefik
+            // that routed nothing on a current Docker.
+            image: "traefik:latest".to_owned(),
             container_name: "oxid-traefik".to_owned(),
             http_port: 80,
             docker_socket_path: "/var/run/docker.sock".to_owned(),
@@ -99,12 +108,19 @@ pub enum SelfWiringStatus {
         /// (the `errors` middleware wiring described in
         /// `control_plane.rs`'s `traefik_labels` doc comment).
         references_oxid_wake: bool,
+        /// Whether the daemon carries the lowest-priority catch-all router
+        /// that makes wake-on-request reachable at all. A scaled-to-zero
+        /// branch is a stopped container, and Traefik only publishes
+        /// routers for running ones — without this router its host matches
+        /// nothing and the request 404s at the proxy instead of waking the
+        /// environment.
+        has_wake_catchall: bool,
     },
 }
 
 impl SelfWiringStatus {
     /// True only when fully wired for wake-on-request: detected, joined to
-    /// the network, and carrying both required labels.
+    /// the network, and carrying every required label.
     #[must_use]
     pub fn is_fully_wired(&self) -> bool {
         matches!(
@@ -113,6 +129,7 @@ impl SelfWiringStatus {
                 joined_network: true,
                 has_traefik_enable_label: true,
                 references_oxid_wake: true,
+                has_wake_catchall: true,
                 ..
             }
         )
@@ -136,6 +153,7 @@ mod tests {
             joined_network: true,
             has_traefik_enable_label: true,
             references_oxid_wake: true,
+            has_wake_catchall: true,
         };
         assert!(full.is_fully_wired());
 
@@ -144,6 +162,7 @@ mod tests {
             joined_network: true,
             has_traefik_enable_label: false,
             references_oxid_wake: true,
+            has_wake_catchall: true,
         };
         assert!(!missing_label.is_fully_wired());
 
@@ -152,6 +171,7 @@ mod tests {
             joined_network: false,
             has_traefik_enable_label: true,
             references_oxid_wake: true,
+            has_wake_catchall: true,
         };
         assert!(!missing_network.is_fully_wired());
 
@@ -160,7 +180,17 @@ mod tests {
             joined_network: true,
             has_traefik_enable_label: true,
             references_oxid_wake: false,
+            has_wake_catchall: true,
         };
         assert!(!missing_wake.is_fully_wired());
+
+        let missing_catchall = SelfWiringStatus::Detected {
+            container_id: "abc123".to_owned(),
+            joined_network: true,
+            has_traefik_enable_label: true,
+            references_oxid_wake: true,
+            has_wake_catchall: false,
+        };
+        assert!(!missing_catchall.is_fully_wired());
     }
 }

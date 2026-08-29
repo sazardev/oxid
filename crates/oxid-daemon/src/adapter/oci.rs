@@ -557,21 +557,40 @@ impl ContainerPort for DockerClient {
         let references_oxid_wake = labels
             .iter()
             .any(|(k, v)| k.contains("oxid-wake") || v.contains("oxid-wake"));
+        // The catch-all router is what lets a *stopped* environment be
+        // woken at all, so it is checked separately from the `oxid-wake`
+        // service above: a daemon can carry the service labels (wired
+        // before this existed) and still 404 every scaled-to-zero branch.
+        let has_wake_catchall = labels
+            .keys()
+            .any(|k| k.contains("routers.oxid-wake-catchall"));
 
         Ok(SelfWiringStatus::Detected {
             container_id: hostname,
             joined_network,
             has_traefik_enable_label,
             references_oxid_wake,
+            has_wake_catchall,
         })
     }
 }
+
+/// Port Traefik's `web` entrypoint listens on *inside* its container. Fixed:
+/// only the host port it is published on is an operator's choice.
+const TRAEFIK_ENTRYPOINT_PORT: u16 = 80;
 
 impl DockerClient {
     /// Creates and starts a brand-new Traefik container from `spec`. Only
     /// called by `ensure_traefik` when no container by that name exists yet.
     async fn create_and_start_traefik(&self, spec: &TraefikSpec) -> Result<(), OciError> {
-        let port_key = format!("{}/tcp", spec.http_port);
+        // The container side is always 80 — that is where Traefik's `web`
+        // entrypoint listens (`--entrypoints.web.address=:80` below), and it
+        // has nothing to do with which host port the operator publishes it
+        // on. Both sides used to be `spec.http_port`, which happened to work
+        // only because the port was hardcoded to 80: any other value
+        // published a host port onto a container port nothing was listening
+        // on, so Traefik came up and answered nothing.
+        let port_key = format!("{TRAEFIK_ENTRYPOINT_PORT}/tcp");
         let mut exposed_ports = HashMap::new();
         // Docker's API represents "expose this port" as a mapping to an
         // empty JSON object (`{"80/tcp": {}}`) — same shape `run` above uses
@@ -591,12 +610,28 @@ impl DockerClient {
         let config = Config {
             image: Some(spec.image.clone()),
             exposed_ports: Some(exposed_ports),
+            // Kept in step with `docker-compose.yml`'s traefik service —
+            // an operator who runs `oxid infra setup` instead of using the
+            // compose file must get the same working proxy, and these flags
+            // are what make wake-on-request work at all rather than merely
+            // faster. See the comments there for the measurements.
             cmd: Some(vec![
                 "--providers.docker=true".to_owned(),
                 format!("--providers.docker.network={}", spec.network),
                 "--providers.docker.exposedbydefault=false".to_owned(),
-                "--entrypoints.web.address=:80".to_owned(),
+                // Config reloads are batched; the 2s default dominates every
+                // wake, since a branch's route only comes back on a reload.
+                "--providers.providersThrottleDuration=100ms".to_owned(),
+                format!("--entrypoints.web.address=:{TRAEFIK_ENTRYPOINT_PORT}"),
+                // A sleeping branch's container black-holes rather than
+                // refusing, so these two timeouts are what turn a request to
+                // it into the 5xx the `errors` middleware forwards to
+                // `/api/v1/wake`. Without them the request hangs on Docker's
+                // default instead, and wake-on-request never fires.
+                "--serversTransport.forwardingTimeouts.dialTimeout=500ms".to_owned(),
+                "--serversTransport.forwardingTimeouts.responseHeaderTimeout=5s".to_owned(),
             ]),
+            env: Some(vec!["DOCKER_API_VERSION=1.41".to_owned()]),
             host_config: Some(HostConfig {
                 port_bindings: Some(port_bindings),
                 binds: Some(vec![format!(

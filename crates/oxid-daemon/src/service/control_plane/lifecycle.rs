@@ -33,14 +33,46 @@ use oxid_core::{
 };
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
+    /// Suspends an environment (scale-to-zero), unattributed.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on missing records or Docker failures.
     pub async fn pause(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+        self.pause_with_operator(environment_id, None).await
+    }
+
+    /// Identical to [`Self::pause`], attributing the resulting audit event
+    /// to `operator`.
+    ///
+    /// # Errors
+    /// Same as [`Self::pause`].
+    pub async fn pause_with_operator(
+        &self,
+        environment_id: EnvironmentId,
+        operator: Option<String>,
+    ) -> Result<(), CpError> {
         let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
+        // Scale-to-zero suspends with `docker stop`, deliberately *not*
+        // `docker pause`. Traefik's Docker provider only ever publishes
+        // routers for containers in the `running` state and does not react
+        // to `pause`/`unpause` events at all: a paused container's router
+        // silently disappears at the provider's next refresh and never
+        // comes back, so every request to a paused branch 404s at the
+        // proxy. That 404 also means the `errors` middleware that powers
+        // wake-on-request (see `traefik_labels`) never fires, because it
+        // only triggers on a 5xx from a router that still exists —
+        // measured live: a container left unpaused for 60s never regained
+        // its router, while stop/start regained it in under 3s.
+        //
+        // `stop` costs a process restart on wake that `unpause` would not,
+        // which is the honest price of a suspension the router layer can
+        // actually observe.
         self.oci
-            .pause(&resolved_container_name(&project, &env))
+            .stop(&resolved_container_name(&project, &env))
             .await?;
         if self.docker_network.is_none() {
             self.proxy
@@ -52,8 +84,43 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         env.transition(StateTransition::IdleTimeout, now)
             .map_err(|e| state_err(&e))?;
         EnvironmentStore::update(&self.store, &env).await?;
+        // The GC sweep has always audited the pauses it performs; a pause
+        // asked for by a person did not, so the trail showed the automatic
+        // half of the lifecycle and none of the deliberate half.
+        self.record_lifecycle(&env, StateTransition::IdleTimeout, now, operator)
+            .await;
         tracing::info!(%environment_id, "environment paused");
         Ok(())
+    }
+
+    /// Best-effort audit write for a lifecycle transition that already
+    /// happened. Never fails the operation it describes: the state change is
+    /// committed by the time this runs, and losing the audit row is strictly
+    /// better than reporting a failure for work that succeeded.
+    async fn record_lifecycle(
+        &self,
+        env: &Environment,
+        kind: StateTransition,
+        now: OffsetDateTime,
+        operator: Option<String>,
+    ) {
+        if let Err(e) = self
+            .store
+            .record(
+                &AuditEvent::with_operator(
+                    u64::try_from(now.unix_timestamp()).unwrap_or_default(),
+                    env.id,
+                    kind,
+                    None,
+                    now,
+                    operator,
+                )
+                .with_request_id(current_request_id()),
+            )
+            .await
+        {
+            tracing::warn!(environment_id = %env.id, ?kind, error = %e, "could not record audit event");
+        }
     }
 
     /// Wakes a suspended environment.
@@ -65,7 +132,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Returns [`CpError`] on missing records or Docker failures.
     #[tracing::instrument(skip(self), fields(%environment_id))]
     pub async fn wake(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
-        self.wake_env(environment_id).await
+        self.wake_env_with_operator(environment_id, None).await
+    }
+
+    /// Identical to [`Self::wake`], attributing the resulting audit event to
+    /// `operator`.
+    ///
+    /// # Errors
+    /// Same as [`Self::wake`].
+    pub async fn wake_with_operator(
+        &self,
+        environment_id: EnvironmentId,
+        operator: Option<String>,
+    ) -> Result<(), CpError> {
+        self.wake_env_with_operator(environment_id, operator).await
     }
 
     /// Wakes the environment routed at `url` (matched against the `Host`
@@ -104,15 +184,40 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     }
 
     pub(crate) async fn wake_env(&self, environment_id: EnvironmentId) -> Result<(), CpError> {
+        self.wake_env_with_operator(environment_id, None).await
+    }
+
+    pub(crate) async fn wake_env_with_operator(
+        &self,
+        environment_id: EnvironmentId,
+        operator: Option<String>,
+    ) -> Result<(), CpError> {
         let _guard = self.lifecycle_lock.lock().await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         let name = resolved_container_name(&project, &env);
-        match env.state {
-            EnvironmentState::Hibernating => self.oci.start(&name).await?,
-            _ => self.oci.unpause(&name).await?,
+        // Wake against what Docker *actually* reports, never against the
+        // state this database happens to hold. The two drift constantly in
+        // practice — a container crashes, is OOM-killed, gets stopped by an
+        // operator, or two requests race into the wake path at once — and
+        // dispatching on the stored state alone meant any drift surfaced a
+        // raw `Docker responded with status code 500: ... is not paused`
+        // straight into the visitor's browser, with every retry reproducing
+        // it identically. Waking something already awake is a success, not
+        // an error.
+        match self.oci.container_status(&name).await? {
+            ContainerStatus::Running => {
+                tracing::debug!(%environment_id, "wake: container already running");
+            }
+            ContainerStatus::Paused => self.oci.unpause(&name).await?,
+            ContainerStatus::Stopped => self.oci.start(&name).await?,
+            ContainerStatus::Missing => {
+                return Err(CpError::NotFound(format!(
+                    "container `{name}` no longer exists; redeploy this branch to recreate it"
+                )));
+            }
         }
 
         // Backfills `host_port` for an environment that predates dynamic
@@ -149,8 +254,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         let now = OffsetDateTime::now_utc();
-        env.transition(StateTransition::Woken, now)
-            .map_err(|e| state_err(&e))?;
+        // `Woken` out of `Running` is a no-op transition, which the state
+        // machine reports as an error. That is the correct answer for the
+        // domain and the wrong one here: reaching this point means the
+        // container is confirmed up, so the caller got what it asked for.
+        // Only a genuinely forbidden move (e.g. out of `Destroyed`) is a
+        // real failure.
+        match env.transition(StateTransition::Woken, now) {
+            Ok(()) => {}
+            Err(_) if env.state == EnvironmentState::Running => {}
+            Err(e) => return Err(state_err(&e)),
+        }
         // Without this, a woken environment's idle clock still reads its
         // pre-sleep timestamp: the very next GC sweep sees it as still idle
         // past `pause_after` and pauses it right back — observed live,
@@ -160,6 +274,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // follow-up heartbeat that may not land before the next tick.
         let _ = env.touch(now);
         EnvironmentStore::update(&self.store, &env).await?;
+        self.record_lifecycle(&env, StateTransition::Woken, now, operator)
+            .await;
         tracing::info!(%environment_id, "environment woken");
         Ok(())
     }
@@ -203,8 +319,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         let name = resolved_container_name(&project, &env);
-        self.oci.stop(&name).await?;
-        self.oci.remove(&name).await?;
+        // A container that isn't there is the desired end state, not an
+        // error. `BuildFailed` environments frequently have none at all
+        // (the image build never produced one), and an operator may have
+        // removed one by hand — refusing to tear down the record in either
+        // case would leave a row nothing could ever clean up.
+        match self.oci.stop(&name).await {
+            Ok(()) | Err(OciError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match self.oci.remove(&name).await {
+            Ok(()) | Err(OciError::NotFound(_)) => {}
+            Err(e) => return Err(e.into()),
+        }
         // Best-effort: an image that never finished building (a deploy that
         // failed at the `build` step) simply won't exist yet.
         match self
@@ -270,10 +397,11 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// Finds the current environment for `branch` within a project, if any.
     /// A branch can have multiple historical rows (each `deploy` call
     /// creates a new one), so this prefers the most recent *live*
-    /// (non-`Destroyed`) row over a merely higher-id one — a redeploy that
+    /// (serving) row over a merely higher-id one — a redeploy that
     /// zero-downtime-cuts-over successfully leaves exactly one live row as
     /// the highest id, but a *failed* redeploy leaves a higher-id
-    /// `Destroyed` row sitting on top of a still-`Running` older one, which
+    /// `Destroyed`/`BuildFailed` row sitting on top of a still-`Running`
+    /// older one, which
     /// would otherwise "hide" it from callers that need to know whether the
     /// branch is actually still live (e.g. the webhook branch-deletion
     /// handler). Only falls back to the highest-id row overall (which will
@@ -294,9 +422,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .into_iter()
             .filter(|e| &e.branch.name == branch)
             .collect();
+        // "Live" means a row that actually has (or is getting) a container,
+        // which deliberately excludes `BuildFailed` as well as `Destroyed`.
+        // A failed deploy leaves a higher-id row sitting on top of the
+        // still-serving older one exactly like a failed redeploy does, and
+        // treating it as current made a subsequent successful deploy miss
+        // the real previous instance and leave it running forever.
         if let Some(live) = envs
             .iter()
-            .filter(|e| e.state != EnvironmentState::Destroyed)
+            .filter(|e| {
+                matches!(
+                    e.state,
+                    EnvironmentState::Running
+                        | EnvironmentState::Paused
+                        | EnvironmentState::Hibernating
+                        | EnvironmentState::Building
+                )
+            })
             .max_by_key(|e| e.id.0)
         {
             return Ok(Some(live.clone()));
@@ -355,5 +497,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         environment_id: EnvironmentId,
     ) -> Result<ProjectId, CpError> {
         Ok(self.ensure_environment(environment_id).await?.project_id)
+    }
+
+    /// Looks up a single environment by id, or `None` when it doesn't exist.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on persistence failures.
+    pub async fn find_environment(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<Option<Environment>, CpError> {
+        Ok(EnvironmentStore::get(&self.store, environment_id).await?)
     }
 }

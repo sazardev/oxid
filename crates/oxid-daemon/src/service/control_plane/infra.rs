@@ -45,6 +45,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 EnvironmentState::Paused => stats.environments_paused += 1,
                 EnvironmentState::Building => stats.environments_building += 1,
                 EnvironmentState::Hibernating => stats.environments_hibernating += 1,
+                EnvironmentState::BuildFailed => stats.environments_build_failed += 1,
                 EnvironmentState::Destroyed => stats.environments_destroyed += 1,
             }
         }
@@ -75,7 +76,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         tracing::info!(network, "checking infra bootstrap status");
 
         let network_exists = self.oci.network_exists(network).await?;
-        let traefik_spec = TraefikSpec::new(network.to_owned());
+        let traefik_spec = self.traefik_spec(network.to_owned());
         let traefik_status = self
             .oci
             .container_status(&traefik_spec.container_name)
@@ -86,6 +87,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             network.to_owned(),
             network_exists,
             traefik_status,
+            self.traefik_http_port(),
             self_wiring,
         ))
     }
@@ -118,11 +120,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
         let traefik_status = self
             .oci
-            .ensure_traefik(TraefikSpec::new(network.clone()))
+            .ensure_traefik(self.traefik_spec(network.clone()))
             .await?;
         tracing::info!(?traefik_status, "traefik ensured");
 
         self.infra_status().await
+    }
+
+    /// The Traefik spec this daemon bootstraps, with the operator's chosen
+    /// host port applied. Built in one place so `infra_status` and
+    /// `infra_bootstrap` can never disagree about which container they mean.
+    fn traefik_spec(&self, network: String) -> TraefikSpec {
+        TraefikSpec {
+            http_port: self.traefik_http_port(),
+            ..TraefikSpec::new(network)
+        }
     }
 
     pub(crate) fn no_network_configured() -> CpError {

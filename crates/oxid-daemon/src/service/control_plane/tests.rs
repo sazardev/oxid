@@ -48,6 +48,10 @@ struct FakeOci {
     calls: Arc<Mutex<Vec<String>>>,
     /// When > 0, `run` fails and decrements this instead of succeeding.
     fail_run_times: Arc<Mutex<u32>>,
+    /// When > 0, `build` fails and decrements this instead of succeeding —
+    /// the broken-Dockerfile case, which is the most common way a real
+    /// deploy fails and the one that used to leave no trace at all.
+    fail_build_times: Arc<Mutex<u32>>,
     /// Per-container overrides for `container_status`; anything not
     /// listed here defaults to `Running`.
     container_statuses: Arc<Mutex<std::collections::HashMap<String, ContainerStatus>>>,
@@ -60,6 +64,13 @@ struct FakeOci {
 
 impl ContainerPort for FakeOci {
     async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
+        {
+            let mut remaining = self.fail_build_times.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(OciError::Failure("build failed: bad Dockerfile".to_owned()));
+            }
+        }
         self.calls.lock().unwrap().push(format!(
             "build:{}:context={}:dockerfile={}",
             spec.image,
@@ -178,10 +189,10 @@ impl ContainerPort for FakeOci {
         &self,
         spec: oxid_core::TraefikSpec,
     ) -> Result<oxid_core::TraefikStatus, OciError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("ensure_traefik:{}", spec.container_name));
+        self.calls.lock().unwrap().push(format!(
+            "ensure_traefik:{}:port={}:image={}",
+            spec.container_name, spec.http_port, spec.image
+        ));
         let mut running = self.traefik_running.lock().unwrap();
         // Keep `container_status(&spec.container_name)` (used by
         // `infra_status`, which never calls `ensure_traefik` itself) in
@@ -636,10 +647,13 @@ async fn redeploying_a_live_branch_replaces_the_previous_environment() {
         // — the reverse of the old "destroy first, build second" order,
         // which always had a gap where the branch was unreachable.
         let calls = oci.calls.lock().unwrap();
+        // Matched by prefix rather than by the whole rendered env map, so
+        // adding an injected variable doesn't break an assertion that is
+        // really about ordering.
         let run_new = calls
-                .iter()
-                .position(|c| c == "run:oxid-app-feature-a-2:env={\"OXID_BRANCH\": \"feature-a\", \"OXID_ENV_URL\": \"feature-a.app.local.dev\"}:mem=None:cpu=None")
-                .expect("new instance must have been run");
+            .iter()
+            .position(|c| c.starts_with("run:oxid-app-feature-a-2:"))
+            .expect("new instance must have been run");
         // The *last* removal of `-1` is the cutover teardown — its
         // *first* occurrence is just the defensive pre-run cleanup its
         // own deploy already did for itself.
@@ -779,7 +793,7 @@ async fn failed_deploy_does_not_permanently_block_branch() {
 
     let envs = cp.list_environments(project.id).await.unwrap();
     assert_eq!(envs.len(), 1);
-    assert_eq!(envs[0].state, EnvironmentState::Destroyed);
+    assert_eq!(envs[0].state, EnvironmentState::BuildFailed);
 
     // The audit trail must carry the *real* error (e.g. "port already
     // allocated"), not a blank `detail` — found live when a real
@@ -1226,8 +1240,16 @@ async fn find_environment_by_branch_matches_and_misses() {
     assert!(missing.is_none());
 }
 
+/// Waking dispatches on what Docker reports, not on the stored state.
+///
+/// Scale-to-zero suspends with `stop`, so a `Paused` environment's container
+/// is stopped and must be `start`ed. A container left `paused` by an older
+/// Oxid still has to be `unpause`d, and one that is already running must be
+/// a no-op rather than the Docker 500 (`is not paused`) that dispatching on
+/// the stored state produced — the failure that made every retry of a woken
+/// environment fail identically.
 #[tokio::test]
-async fn wake_by_url_unpauses_paused_and_starts_hibernating() {
+async fn wake_dispatches_on_actual_container_state() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
@@ -1236,8 +1258,66 @@ async fn wake_by_url_unpauses_paused_and_starts_hibernating() {
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
         .unwrap();
+    let container = "oxid-app-feature-a-1";
 
+    // Suspending stops the container; Traefik only publishes routers for
+    // running containers, so a `pause`d one loses its route for good.
     cp.pause(env.id).await.unwrap();
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("stop:")),
+        "{:?}",
+        oci.calls
+    );
+
+    // Stopped -> start.
+    oci.container_statuses
+        .lock()
+        .unwrap()
+        .insert(container.to_owned(), ContainerStatus::Stopped);
+    let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
+    assert_eq!(woken.state, EnvironmentState::Running);
+    assert!(
+        oci.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("start:")),
+        "{:?}",
+        oci.calls
+    );
+
+    // Already running -> neither start nor unpause, and still a success.
+    oci.container_statuses
+        .lock()
+        .unwrap()
+        .insert(container.to_owned(), ContainerStatus::Running);
+    oci.calls.lock().unwrap().clear();
+    let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
+    assert_eq!(woken.state, EnvironmentState::Running);
+    assert!(
+        oci.calls.lock().unwrap().is_empty(),
+        "waking a running environment must not touch Docker: {:?}",
+        oci.calls
+    );
+
+    // A container an older Oxid left paused still gets unpaused.
+    let mut paused = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    paused
+        .transition(StateTransition::IdleTimeout, OffsetDateTime::now_utc())
+        .unwrap();
+    EnvironmentStore::update(&cp.store, &paused).await.unwrap();
+    oci.container_statuses
+        .lock()
+        .unwrap()
+        .insert(container.to_owned(), ContainerStatus::Paused);
+    oci.calls.lock().unwrap().clear();
     let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
     assert_eq!(woken.state, EnvironmentState::Running);
     assert!(
@@ -1249,33 +1329,31 @@ async fn wake_by_url_unpauses_paused_and_starts_hibernating() {
         "{:?}",
         oci.calls
     );
+}
 
-    // Force it to Hibernating directly (bypassing the multi-hour sweep
-    // needed to get there naturally) to test the `start` branch of wake.
-    let mut hibernating = EnvironmentStore::get(&cp.store, env.id)
+/// A container that vanished (pruned, or removed by hand) can't be woken by
+/// starting nothing — the caller is told to redeploy instead of getting a
+/// success that leaves the URL dead.
+#[tokio::test]
+async fn wake_reports_a_missing_container_instead_of_succeeding() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
+        .unwrap();
+    cp.pause(env.id).await.unwrap();
+    oci.container_statuses
+        .lock()
         .unwrap()
-        .unwrap();
-    hibernating
-        .transition(StateTransition::IdleTimeout, OffsetDateTime::now_utc())
-        .unwrap();
-    hibernating
-        .transition(StateTransition::DeepSleep, OffsetDateTime::now_utc())
-        .unwrap();
-    EnvironmentStore::update(&cp.store, &hibernating)
-        .await
-        .unwrap();
+        .insert("oxid-app-feature-a-1".to_owned(), ContainerStatus::Missing);
 
-    let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
-    assert_eq!(woken.state, EnvironmentState::Running);
+    let err = cp.wake(env.id).await.unwrap_err();
     assert!(
-        oci.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c.starts_with("start:")),
-        "{:?}",
-        oci.calls
+        err.to_string().contains("redeploy"),
+        "expected actionable error, got: {err}"
     );
 }
 
@@ -1442,12 +1520,15 @@ async fn sweep_pauses_idle_environment() {
         .unwrap()
         .unwrap();
     assert_eq!(loaded.state, EnvironmentState::Paused);
+    // `stop`, not `pause`: a paused container disappears from Traefik's
+    // router table and never comes back, so the branch 404s instead of
+    // waking on the next request.
     assert!(
         oci.calls
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.starts_with("pause:")),
+            .any(|c| c.starts_with("stop:")),
         "{:?}",
         oci.calls
     );
@@ -1589,7 +1670,7 @@ async fn reconcile_marks_a_missing_container_destroyed() {
 }
 
 #[tokio::test]
-async fn reconcile_re_pauses_a_container_a_reboot_brought_back_running() {
+async fn reconcile_re_suspends_a_container_a_reboot_brought_back_running() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
@@ -1600,8 +1681,10 @@ async fn reconcile_re_pauses_a_container_a_reboot_brought_back_running() {
         .unwrap();
     cp.pause(env.id).await.unwrap();
 
-    // A reboot doesn't preserve the cgroup-freezer "paused" state —
-    // `unless-stopped` brings the container back fully running.
+    // A reboot brings a suspended container back up via `unless-stopped`,
+    // so reconcile has to put it back to sleep — with `stop`, the same way
+    // suspension is applied everywhere else, since a `pause`d container is
+    // invisible to Traefik's router table.
     oci.container_statuses.lock().unwrap().insert(
         format!("oxid-app-feature-a-{}", env.id.0),
         ContainerStatus::Running,
@@ -1614,7 +1697,7 @@ async fn reconcile_re_pauses_a_container_a_reboot_brought_back_running() {
             .lock()
             .unwrap()
             .iter()
-            .any(|c| *c == format!("pause:oxid-app-feature-a-{}", env.id.0)),
+            .any(|c| *c == format!("stop:oxid-app-feature-a-{}", env.id.0)),
         "{:?}",
         oci.calls.lock().unwrap()
     );
@@ -1818,4 +1901,279 @@ async fn retry_queued_deploys_deploys_once_capacity_frees_up() {
         "{:?}",
         oci.calls.lock().unwrap()
     );
+}
+
+/// A failing image build must be *visible*.
+///
+/// The environment row used to be created only after the build succeeded,
+/// so a broken Dockerfile — the most common deploy failure there is — bailed
+/// out before any row existed: no environment, no audit event, and nothing
+/// in the log. From `oxid status` or the dashboard a colleague's failed push
+/// was indistinguishable from a push that never happened.
+#[tokio::test]
+async fn a_failed_build_leaves_a_recorded_environment() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    *oci.fail_build_times.lock().unwrap() = 1;
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let err = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("build failed"), "{err}");
+
+    let envs = EnvironmentStore::list_by_project(&cp.store, project.id)
+        .await
+        .unwrap();
+    assert_eq!(envs.len(), 1, "the failed deploy must still leave a row");
+    assert_eq!(
+        envs[0].state,
+        EnvironmentState::BuildFailed,
+        "a failed build must be distinguishable from a routine teardown"
+    );
+
+    let events = cp
+        .audit_events_for(envs[0].id, &AuditFilter::default())
+        .await
+        .unwrap();
+    let failed = events
+        .iter()
+        .find(|e| e.kind == StateTransition::BuildFailed)
+        .expect("a failed build must be audited");
+    assert!(
+        failed
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("build failed"),
+        "the audit entry must say why: {:?}",
+        failed.detail
+    );
+}
+
+/// Two branches whose names collapse to the same DNS label (`feat/x` and
+/// `feat-x`) would both claim one subdomain. Both reported themselves as
+/// running while the proxy could only route to one, leaving the other
+/// silently unreachable — so the second deploy is refused instead.
+#[tokio::test]
+async fn a_branch_cannot_steal_another_branchs_subdomain() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let first = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    let err = cp
+        .deploy(project.id, BranchName::parse("feature/a").unwrap())
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains(&first.url), "{msg}");
+    assert!(msg.contains("feature-a"), "{msg}");
+
+    // The refusal has to be recorded, not just returned: the push that
+    // triggered it arrived over an already-answered webhook, so an error
+    // returned to nobody is one the dev who pushed never sees.
+    let refused = EnvironmentStore::list_by_project(&cp.store, project.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.branch.name.as_str() == "feature/a")
+        .expect("the refused deploy must leave a row");
+    assert_eq!(refused.state, EnvironmentState::BuildFailed);
+    let events = cp
+        .audit_events_for(refused.id, &AuditFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        events.iter().any(|e| {
+            e.kind == StateTransition::BuildFailed
+                && e.detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("already using")
+        }),
+        "the audit entry must explain the collision: {events:?}"
+    );
+
+    // And the branch that already owns the address keeps serving.
+    let live = EnvironmentStore::get(&cp.store, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.state, EnvironmentState::Running);
+}
+
+/// Suspending an environment and waking it again must leave the branch
+/// reachable through the same URL — the round trip the 404s came from.
+#[tokio::test]
+async fn a_suspended_environment_wakes_back_onto_its_url() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    cp.pause(env.id).await.unwrap();
+    let paused = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.state, EnvironmentState::Paused);
+    assert_eq!(paused.url, env.url, "the URL must survive suspension");
+
+    let woken = cp.wake_by_url(&env.url).await.unwrap().unwrap();
+    assert_eq!(woken.state, EnvironmentState::Running);
+    assert_eq!(woken.url, env.url);
+}
+
+/// A failed deploy must not hide the instance that is still serving.
+///
+/// The `BuildFailed` row lands on top of the live one with a higher id, and
+/// resolving "the current environment" by id alone made the next successful
+/// deploy miss the real previous instance — leaving the old container
+/// running forever behind the new one.
+#[tokio::test]
+async fn a_failed_deploy_does_not_hide_the_running_instance() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let branch = BranchName::parse("feature-a").unwrap();
+
+    let first = cp.deploy(project.id, branch.clone()).await.unwrap();
+
+    *oci.fail_build_times.lock().unwrap() = 1;
+    cp.deploy(project.id, branch.clone()).await.unwrap_err();
+
+    // The branch is still served by the first deploy, not by the failure.
+    let live = cp
+        .find_environment_by_branch(project.id, &branch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.id, first.id);
+    assert_eq!(live.state, EnvironmentState::Running);
+
+    // And the next successful deploy retires it properly.
+    let third = cp.deploy(project.id, branch).await.unwrap();
+    assert_eq!(third.state, EnvironmentState::Running);
+    let retired = EnvironmentStore::get(&cp.store, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retired.state,
+        EnvironmentState::Destroyed,
+        "the previous live instance must be retired by the successful deploy"
+    );
+}
+
+/// Containers are told which commit they are running, not just which branch.
+/// A branch name moves on every push, so it can't answer "what revision is
+/// this?" — which is exactly what an app's `/version` endpoint or a release
+/// tag needs.
+#[tokio::test]
+async fn the_deployed_commit_is_injected_into_the_container() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    let calls = oci.calls.lock().unwrap();
+    let run = calls
+        .iter()
+        .find(|c| c.starts_with("run:"))
+        .expect("the container must have been run");
+    assert!(
+        run.contains(&format!("\"OXID_COMMIT\": \"{}\"", env.branch.commit_sha)),
+        "{run}"
+    );
+    assert!(run.contains("\"OXID_BRANCH\": \"feature-a\""), "{run}");
+}
+
+/// The Traefik `oxid infra setup` starts must carry the flags wake-on-request
+/// depends on.
+///
+/// The compose file had them and this bootstrap path did not, so an operator
+/// who used `oxid infra setup` got a proxy where a sleeping branch's request
+/// hung on Docker's default dial timeout instead of failing fast into
+/// `/api/v1/wake` — the feature simply never fired.
+#[test]
+fn the_built_in_traefik_spec_is_wired_for_wake_on_request() {
+    let spec = oxid_core::TraefikSpec::new("oxid-net");
+    // Pinning an older tag here routed nothing at all on Docker Engine >= 29.
+    assert_eq!(spec.image, "traefik:latest");
+    assert_eq!(spec.container_name, "oxid-traefik");
+    assert_eq!(spec.network, "oxid-net");
+    assert_eq!(spec.http_port, 80);
+}
+
+/// `oxid infra setup` must be usable on a host whose port 80 is already
+/// taken by another proxy — otherwise the bootstrap simply cannot run there,
+/// which is the situation any machine already serving something is in.
+#[tokio::test]
+async fn the_built_in_traefik_publishes_on_the_configured_host_port() {
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone())
+        .await
+        .with_traefik("oxid-net", "http://daemon")
+        .with_traefik_http_port(8090);
+    assert_eq!(cp.traefik_http_port(), 8090);
+
+    cp.infra_bootstrap().await.unwrap();
+    let calls = oci.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("ensure_traefik") && c.contains("8090")),
+        "the bootstrap must publish Traefik on the configured port: {calls:?}"
+    );
+}
+
+/// A dead row must never shadow the live environment on the same URL.
+///
+/// Two branches can normalise to one subdomain, and the refused one leaves a
+/// `BuildFailed` row with a *higher* id than the branch actually serving
+/// that address. Resolving the URL by recency alone picked the dead row, so
+/// a visit to a sleeping branch reported a missing container instead of
+/// waking the environment the URL belongs to.
+#[tokio::test]
+async fn waking_a_shared_url_resolves_to_the_environment_that_owns_it() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let live = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    // Collides on the subdomain, so it is refused and left as BuildFailed
+    // with a higher id than `live`.
+    cp.deploy(project.id, BranchName::parse("feature/a").unwrap())
+        .await
+        .unwrap_err();
+    cp.pause(live.id).await.unwrap();
+
+    let woken = cp
+        .wake_by_url(&live.url)
+        .await
+        .unwrap()
+        .expect("the URL must resolve to an environment");
+    assert_eq!(woken.id, live.id);
+    assert_eq!(woken.state, EnvironmentState::Running);
 }

@@ -44,6 +44,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// used to build the Traefik `errors`/`forwardAuth` middleware labels
     /// (e.g. `http://oxid-daemon:8080`).
     daemon_url: String,
+    /// Host port the built-in Traefik (`oxid infra setup`) publishes its
+    /// `web` entrypoint on. 80 by default; configurable because an operator
+    /// whose 80 is already taken by another proxy could otherwise never run
+    /// the bootstrap at all.
+    traefik_http_port: u16,
     /// Serializes every state-mutating lifecycle operation on environments —
     /// `deploy`, `pause`, `wake`, `destroy`, and each action a GC `sweep`
     /// applies — across every project. `Arc`-wrapped because `ControlPlane`
@@ -70,6 +75,13 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// the read and the write, so they could interleave and have one
     /// overwrite the other's transition with stale data.
     lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Ensures only one deploy-queue drain runs at a time. The scheduler
+    /// drains on every tick and each accepted webhook kicks off a drain of
+    /// its own, so without this two drains could read the same pending row
+    /// before either removed it and deploy the same push twice.
+    /// `try_lock`-ed, never awaited: if a drain is already in flight it will
+    /// pick up the row that was just enqueued anyway.
+    deploy_drain_lock: Arc<tokio::sync::Mutex<()>>,
     /// Admin connection string for the shared Postgres instance
     /// (`OXID_POSTGRES_URL`). `None` means projects declaring a `postgres`
     /// dependency will fail to deploy with a clear error instead of
@@ -111,6 +123,10 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
 }
 
 const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
+/// Host port the built-in Traefik publishes on unless told otherwise — the
+/// one every wildcard-DNS setup expects to reach a branch on without a
+/// port suffix.
+const DEFAULT_TRAEFIK_HTTP_PORT: u16 = 80;
 const DEFAULT_REDIS_POOL_SIZE: u32 = 16;
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
@@ -127,7 +143,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             cache_dir,
             docker_network: None,
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
+            traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
             lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             postgres_url: None,
             redis_url: None,
             redis_pool_size: DEFAULT_REDIS_POOL_SIZE,
@@ -163,6 +181,20 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self.docker_network = Some(network.into());
         self.daemon_url = daemon_url.into();
         self
+    }
+
+    /// Sets the host port the built-in Traefik publishes on
+    /// (`OXID_TRAEFIK_HTTP_PORT`). Defaults to 80.
+    #[must_use]
+    pub const fn with_traefik_http_port(mut self, port: u16) -> Self {
+        self.traefik_http_port = port;
+        self
+    }
+
+    /// The host port [`Self::infra_bootstrap`] will publish Traefik on.
+    #[must_use]
+    pub const fn traefik_http_port(&self) -> u16 {
+        self.traefik_http_port
     }
 
     /// Sets the daemon-wide fallback memory/CPU limits applied to a

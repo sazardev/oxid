@@ -34,10 +34,13 @@ pub struct Environment {
     /// Public URL, e.g. `feature-login.my-awesome-api.local.dev`.
     pub url: String,
     /// When the environment was created.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When the state last changed.
+    #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     /// Last time traffic hit the URL (drives scale-to-zero).
+    #[serde(with = "time::serde::rfc3339")]
     pub last_accessed_at: OffsetDateTime,
     /// Host port this environment's container is actually published on,
     /// when running in direct-publish mode (`OXID_DOCKER_NETWORK` unset).

@@ -43,7 +43,15 @@ use sha2::Sha256;
 use tower_governor::GovernorLayer;
 
 /// Body for `POST /api/v1/tokens`.
+///
+/// `deny_unknown_fields` is load-bearing, not tidiness: serde otherwise
+/// ignores a key it doesn't recognise, so `{"projects_ids": [2]}` or any
+/// other near-miss spelling quietly minted a token with *no* scope — one
+/// carrying the same reach as the master credential — while the caller
+/// believed they had restricted it. Rejecting the request is the only
+/// answer that can't fail open.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTokenBody {
     /// Human-readable name for the operator this token identifies.
     name: String,

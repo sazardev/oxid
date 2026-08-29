@@ -227,6 +227,10 @@ h2 {
   color: var(--oxid-orange);
 }
 
+.state-build_failed {
+  color: var(--oxid-orange);
+}
+
 .page-container {
   padding: 20px;
   max-width: 1400px;
@@ -346,6 +350,13 @@ h2 {
   opacity: 0.5;
 }
 
+/* A failed deploy is the one row an operator needs to notice, so it keeps
+   full contrast and a tinted ground instead of the muted treatment the
+   other non-running states get. */
+.row-build_failed {
+  background: #3a1f1a;
+}
+
 .row-failed {
   background: #3a1f1a;
 }
@@ -381,6 +392,12 @@ h2 {
 .badge-building {
   color: var(--oxid-orange);
   border-color: var(--oxid-orange);
+}
+
+.badge-build_failed {
+  color: var(--oxid-orange);
+  border-color: var(--oxid-orange);
+  background: #3a1f1a;
 }
 
 .badge-destroyed {

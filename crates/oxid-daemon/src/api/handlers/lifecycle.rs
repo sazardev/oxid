@@ -56,7 +56,10 @@ pub async fn pause<
         .environment_project_id(EnvironmentId(env_id))
         .await?;
     authorize_project(&authed, project_id)?;
-    state.cp.pause(EnvironmentId(env_id)).await?;
+    state
+        .cp
+        .pause_with_operator(EnvironmentId(env_id), operator_name(authed.as_ref()))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -73,7 +76,10 @@ pub async fn wake<
         .environment_project_id(EnvironmentId(env_id))
         .await?;
     authorize_project(&authed, project_id)?;
-    state.cp.wake(EnvironmentId(env_id)).await?;
+    state
+        .cp
+        .wake_with_operator(EnvironmentId(env_id), operator_name(authed.as_ref()))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -184,10 +190,18 @@ pub async fn wake_by_host<
         .map_or_else(|| host.clone(), |e| e.branch.name.to_string());
     Ok((
         StatusCode::OK,
+        // Marks this response as the interstitial rather than the app's own
+        // output, so the page's poll below can tell the two apart on the
+        // same URL without parsing any HTML.
+        [(WAKING_HEADER, HeaderValue::from_static("1"))],
         axum::response::Html(wake_page_html(&branch)),
     )
         .into_response())
 }
+
+/// Present only on the wake interstitial. Its absence is what tells the page
+/// the environment is serving again.
+const WAKING_HEADER: &str = "x-oxid-waking";
 
 /// Heartbeat endpoint (SPEC.md §3.2 traffic monitor): wired as a Traefik
 /// `forwardAuth` middleware on every router, it refreshes `last_accessed_at`
@@ -211,13 +225,35 @@ pub async fn heartbeat_by_host<
 fn wake_page_html(branch: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
-<html><head><meta http-equiv="refresh" content="1">
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
 <style>
 body {{ background:#121212; color:#F4F4F5; font-family:monospace;
        display:flex; height:100vh; align-items:center; justify-content:center; }}
 strong {{ color:#DE5236; }}
 </style></head>
-<body><p>[~] Waking up <strong>{branch}</strong>&hellip;</p></body></html>"#
+<body><p>[~] Waking up <strong>{branch}</strong>&hellip;</p>
+<script>
+// A stopped container is usually back and routable in well under a second,
+// so a fixed reload timer was most of the visible wake: the page sat out its
+// full interval and, if the proxy had not caught up yet, sat out another
+// one. This polls the same URL instead and reloads the moment the response
+// stops being this interstitial. The <meta refresh> above stays as the
+// no-JavaScript fallback.
+(function () {{
+  var tries = 0;
+  function poll() {{
+    if (++tries > 120) return; // ~30s, then leave it to the meta refresh
+    fetch(location.href, {{ cache: "no-store" }})
+      .then(function (r) {{
+        if (!r.headers.get("x-oxid-waking")) {{ location.reload(); return; }}
+        setTimeout(poll, 250);
+      }})
+      .catch(function () {{ setTimeout(poll, 250); }});
+  }}
+  setTimeout(poll, 250);
+}})();
+</script>
+</body></html>"#
     )
 }
 

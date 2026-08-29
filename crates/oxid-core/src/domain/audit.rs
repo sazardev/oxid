@@ -18,6 +18,12 @@ pub struct AuditEvent {
     /// Optional human-readable detail (e.g. build log tail).
     pub detail: Option<String>,
     /// When the event happened.
+    ///
+    /// Serialized as RFC 3339. `time`'s default serde representation is a
+    /// positional array (`[year, ordinal_day, hour, ...]`) that no consumer
+    /// can read without reimplementing the calendar — it had already leaked
+    /// into the CLI as timestamps rendered `2026-day241 15:20:45`.
+    #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
     /// Name of the operator (named API token) who triggered this event.
     /// `None` for the master `OXID_API_TOKEN` or system-initiated events

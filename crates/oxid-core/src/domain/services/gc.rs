@@ -84,9 +84,11 @@ pub fn evaluate(environment: &Environment, project: &Project, now: OffsetDateTim
                 return GcAction::Hibernate;
             }
         }
-        EnvironmentState::Hibernating => {
-            // Only Destroy (already handled) remains — never re-hibernate.
-        }
+        // `Hibernating` has only `Destroy` left, already handled above —
+        // never re-hibernate. `BuildFailed` has no container to suspend at
+        // all; it is kept so the failure stays visible and swept up by the
+        // same `destroy_after` check.
+        EnvironmentState::Hibernating | EnvironmentState::BuildFailed => {}
         EnvironmentState::Destroyed | EnvironmentState::Building => unreachable!(),
     }
 

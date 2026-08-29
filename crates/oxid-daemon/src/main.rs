@@ -25,6 +25,12 @@
 //!   `last_accessed_at` on real traffic, which nothing calls in direct-publish
 //!   mode — the GC sweep is a deliberate no-op there instead of auto-pausing/
 //!   destroying environments on data it has no way to know is accurate.
+//! - `OXID_TRAEFIK_HTTP_PORT` — host port `oxid infra setup` publishes the
+//!   built-in Traefik's `web` entrypoint on (default `80`). Traefik always
+//!   listens on 80 *inside* its container; this only chooses where that
+//!   surfaces on the host, for operators whose 80 is already taken by
+//!   another proxy. Branch URLs then need that port (or a front proxy that
+//!   forwards to it), since wildcard DNS alone can't add one.
 //! - `OXID_DAEMON_URL` — this daemon's own address as reachable from inside
 //!   `OXID_DOCKER_NETWORK` (default `http://oxid-daemon:8080`), used to build
 //!   the Traefik `forwardAuth`/`errors` middleware labels.
@@ -184,6 +190,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let daemon_url = std::env::var("OXID_DAEMON_URL")
             .unwrap_or_else(|_| "http://oxid-daemon:8080".to_owned());
         cp = cp.with_traefik(network, daemon_url);
+        if let Some(port) = std::env::var("OXID_TRAEFIK_HTTP_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|&p| p > 0)
+        {
+            cp = cp.with_traefik_http_port(port);
+        }
     }
     let postgres_url = std::env::var("OXID_POSTGRES_URL").ok();
     let redis_url = std::env::var("OXID_REDIS_URL").ok();

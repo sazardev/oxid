@@ -50,6 +50,57 @@ struct PushEvent {
     repo_hint: String,
     branch: String,
     deleted: bool,
+    /// Who pushed, as the provider reported them. Recorded as the audit
+    /// `operator` so a deploy can be traced back to a person instead of
+    /// showing up unattributed like every webhook deploy used to.
+    pusher: Option<String>,
+}
+
+/// Reduces a clone URL to its `owner/name` path, lowercased and stripped of
+/// any `.git` suffix, so it can be compared with the `full_name` a webhook
+/// reports. Handles both `https://host/owner/name.git` and scp-style
+/// `git@host:owner/name.git`.
+fn repo_path(repo_url: &str) -> String {
+    let rest = repo_url
+        .split_once("://")
+        .map_or(repo_url, |(_, rest)| rest);
+    // After the scheme, the path starts at the first `/` (HTTPS) or the `:`
+    // that separates host from path in scp-style remotes.
+    let path = rest.find(['/', ':']).map_or(rest, |i| &rest[i + 1..]);
+    path.trim_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase()
+}
+
+/// Whether `repo_url` is the repository a webhook identified as `hint`.
+///
+/// Matching used to be `repo_url.contains(hint)`, which accepts any hint
+/// that happens to be a prefix of a registered URL: a push claiming
+/// `org/app` deployed the project registered for `org/app-api`, and a push
+/// naming a repository that was never registered at all was accepted and
+/// deployed someone else's project. Comparing whole path segments is what
+/// makes `org/app` and `org/app-api` distinct.
+fn repo_matches(repo_url: &str, hint: &str) -> bool {
+    let path = repo_path(repo_url);
+    let hint = hint
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
+    if hint.is_empty() {
+        return false;
+    }
+    path == hint || path.ends_with(&format!("/{hint}"))
+}
+
+/// Pulls the pushing user out of a provider payload, trying the spellings
+/// each provider actually uses. Best-effort: an unattributed deploy is still
+/// a deploy, so a missing field never fails the webhook.
+fn pusher_from(payload: &Value, paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|p| payload.pointer(p).and_then(Value::as_str))
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// The shared tail of every webhook provider's handler: resolve the repo
@@ -62,15 +113,25 @@ async fn handle_push<
     state: &ApiState<G, O>,
     event: PushEvent,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let project = state
+    let mut matches = state
         .cp
         .list_projects()
         .await?
         .into_iter()
-        .find(|p| p.repo_url.as_str().contains(&event.repo_hint))
-        .ok_or_else(|| {
-            ApiError::not_found(format!("no project registered for `{}`", event.repo_hint))
-        })?;
+        .filter(|p| repo_matches(p.repo_url.as_str(), &event.repo_hint));
+    let project = matches.next().ok_or_else(|| {
+        ApiError::not_found(format!("no project registered for `{}`", event.repo_hint))
+    })?;
+    // Two projects registered against the same repository is an operator
+    // mistake, and silently picking whichever came back first would deploy
+    // an arbitrary one of them on every push.
+    if matches.next().is_some() {
+        return Err(ApiError::from_validation(format!(
+            "more than one project is registered for `{}`; remove the duplicate registration \
+             so pushes route to exactly one project",
+            event.repo_hint
+        )));
+    }
     let branch = parse_branch(&event.branch)?;
 
     if event.deleted {
@@ -80,7 +141,10 @@ async fn handle_push<
             .await?
         {
             Some(env) if env.state != EnvironmentState::Destroyed => {
-                state.cp.destroy(env.id, false).await?;
+                state
+                    .cp
+                    .destroy_with_operator(env.id, false, event.pusher.clone())
+                    .await?;
                 Ok((
                     StatusCode::OK,
                     Json(json!({ "status": "destroyed", "environment_id": env.id.0 })),
@@ -90,16 +154,37 @@ async fn handle_push<
         };
     }
 
-    match state.cp.deploy_or_queue(project.id, branch, None).await? {
-        DeployOutcome::Deployed(env, _report) => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "status": "deployed", "environment_id": env.id.0 })),
-        )),
-        DeployOutcome::Queued { position } => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({ "status": "queued", "position": position })),
-        )),
-    }
+    // Accept the push, then build. Providers give a webhook delivery only a
+    // few seconds (GitHub: 10, with no retry for push events) while a real
+    // first build takes far longer, so deploying inline reported failures
+    // for deploys that actually succeeded and invited duplicate manual
+    // redeliveries. The queue is persisted, so an accepted push also
+    // survives a daemon restart, which an inline deploy never did.
+    let position = state
+        .cp
+        .enqueue_push(project.id, &branch, event.pusher.as_deref())
+        .await?;
+
+    // Kick the queue right away rather than waiting for the scheduler's next
+    // tick; the drain is single-flighted, so this is safe to fire on every
+    // delivery. Ownership is moved into the task because the response is
+    // already on its way back to the provider by the time it runs.
+    let cp = state.cp.clone();
+    tokio::spawn(async move {
+        match cp.retry_queued_deploys().await {
+            Ok(failures) => {
+                for (id, err) in &failures {
+                    tracing::warn!(queue_id = id, error = %err, "queued deploy failed");
+                }
+            }
+            Err(err) => tracing::error!(error = %err, "deploy queue drain failed"),
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "status": "queued", "position": position })),
+    ))
 }
 
 /// The shared head of every webhook provider's handler: the daemon refuses
@@ -184,6 +269,10 @@ pub async fn github_webhook<
             repo_hint: full_name.to_owned(),
             branch: branch.to_owned(),
             deleted,
+            pusher: pusher_from(
+                &payload,
+                &["/pusher/name", "/sender/login", "/pusher/username"],
+            ),
         },
     )
     .await
@@ -246,6 +335,7 @@ pub async fn gitlab_webhook<
             repo_hint: repo_hint.to_owned(),
             branch: branch.to_owned(),
             deleted,
+            pusher: pusher_from(&payload, &["/user_username", "/user_name"]),
         },
     )
     .await
@@ -351,6 +441,15 @@ async fn gitea_provider_webhook<
             repo_hint: full_name.to_owned(),
             branch: branch.to_owned(),
             deleted,
+            pusher: pusher_from(
+                &payload,
+                &[
+                    "/pusher/username",
+                    "/pusher/login",
+                    "/pusher/name",
+                    "/sender/login",
+                ],
+            ),
         },
     )
     .await

@@ -31,11 +31,12 @@ Daemon configuration is via environment variables (see `crates/oxid-daemon/src/m
 - `OXID_DATA_DIR` (default `/data`) — holds `audit.sqlite` (WAL), `git-cache/`, `secret.key` (0600, AES-GCM)
 - `OXID_ADDR` (default `0.0.0.0:8080`)
 - `OXID_MASTER_KEY` — 64-hex-char AES-GCM key for secret encryption; auto-generated and persisted to `secret.key` if unset
-- `OXID_WEBHOOK_SECRET` — HMAC-SHA256 secret verifying GitHub/Gitea/Gogs push webhooks (+ token echo for GitLab); webhooks are rejected while unset. Routes: `/api/v1/webhooks/{github,gitlab,gitea,gogs}`
+- `OXID_WEBHOOK_SECRET` — HMAC-SHA256 secret verifying GitHub/Gitea/Gogs push webhooks (+ token echo for GitLab); webhooks are rejected while unset. Routes: `/api/v1/webhooks/{github,gitlab,gitea,gogs}`. A push is matched to a project by exact repository path (`repo_matches`), never by substring, and answered `202 queued`; the pushing user is recorded as the audit `operator`.
 - `OXID_API_TOKEN` — bearer auth; the daemon refuses to start on a non-loopback bind without it (override with `OXID_ALLOW_OPEN_API=1`). Named, project-scopable tokens via `oxid token create [--project id]`; scoped tokens get 404 outside their project and 403 on node-wide routes (`api/middleware.rs::authorize_project`)
 - `OXID_GC_INTERVAL_SECS` (default 30) — scheduler tick for scale-to-zero GC
 - `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required together) — per-client-IP bucket on protected routes
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
+- `OXID_TRAEFIK_HTTP_PORT` (default 80) — host port `oxid infra setup` publishes the built-in Traefik on. Traefik always listens on 80 *inside* its container; only the host side is configurable, so a machine whose 80 is already taken can still bootstrap
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. — see `main.rs`
 
 CLI targets the daemon via `OXID_API` (default `http://127.0.0.1:8080`) and `OXID_API_TOKEN`. Docker is required for the daemon (build/run/pause) but not for `cargo test` — `oxid-core` tests are pure and instant; `oxid-daemon` integration tests use in-memory SQLite unless marked `#[ignore]` (Docker-dependent).
@@ -58,6 +59,16 @@ Hexagonal / ports-and-adapters, split across three crates:
 - **`oxid-cli`** — thin `clap`-based HTTP client (binary `oxid`) that talks to the daemon's REST API; holds no business logic itself (multi-context config in `cli/config.rs`).
 
 Data flow for a deploy: webhook/CLI request → `api/handlers/*` → `ControlPlane::deploy` → `GitPort` (clone/checkout) → `SecretStore` + `var_resolution` (compute injected env) → `ContainerPort` (build + run + exec `on_start`) → `EnvironmentStore`/`AuditStore` (persist state + audit trail).
+
+Four invariants in that pipeline are load-bearing and easy to undo by accident:
+
+- **Webhooks are accepted, not served.** `handle_push` answers `202 queued` and the deploy runs on the persisted queue (`enqueue_push` → `retry_queued_deploys`, single-flighted by `deploy_drain_lock`). Providers abandon a delivery in seconds — GitHub at 10, with no retry for push events — while a real first build takes far longer. Never move the deploy back inside the request.
+- **Scale-to-zero stops containers, it does not pause them.** Traefik's Docker provider only publishes routers for `running` containers and ignores pause/unpause events, so a `docker pause`d environment loses its route permanently and 404s instead of waking. `ControlPlane::pause` and the GC both use `stop`; waking dispatches on `container_status`, never on the stored state.
+- **Wake-on-request needs the daemon's catch-all router.** A stopped environment has no router of its own, so the lowest-priority `oxid-wake-catchall` router on the daemon's container is what catches the request and rewrites it to `/api/v1/wake`. It ships in `docker-compose.yml` and `oxid infra status` reports it missing.
+- **The environment row is created before the image build.** It is what gives a failure somewhere to be recorded; every failure path funnels through `record_deploy_failure` so a broken Dockerfile leaves an `EnvironmentState::BuildFailed` row, an audit event and an ERROR line instead of nothing at all. `BuildFailed` is a real state, distinct from `Destroyed`: it means "someone's push is broken", it can only transition onward to `Destroy`/`TtlExpired`, and it is deliberately excluded from `find_environment_by_branch`'s notion of *live* so a failure never hides the instance still serving the branch.
+- **Admission is decided once, after the checkout.** `check_admission` runs inside `deploy_at` with the branch's own effective config, because that is the first point the real memory request is known. `AdmissionMode` says what to do when it doesn't fit — enqueue, report (the queue drain already holds the entry), or bypass (rollback). Deciding earlier means weighing a number the deploy won't use.
+
+Per-deploy config comes from the commit: `branch_config` re-reads `oxid.toml` from the checkout for `[build]`, `[routing].port` and `[dependencies]`. `base_domain` and the idle/lifetime policy stay with the project, because those are operator decisions owned by `oxid configure`. Containers are injected `OXID_BRANCH`, `OXID_ENV_URL` and `OXID_COMMIT`.
 
 Redeploys are zero-downtime: the new container is built and started before traffic cuts over through the reverse proxy, so a broken push never takes the previous build down.
 

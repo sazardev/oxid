@@ -82,6 +82,20 @@ struct FakeOci {
     calls: Arc<Mutex<Vec<String>>>,
     /// Docker networks `ensure_network`/`network_exists` believe exist.
     networks: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Per-container lifecycle state, kept in step with the calls below.
+    /// `container_status` used to answer a constant `Running`, which made
+    /// it impossible to test the wake path now that waking dispatches on
+    /// what Docker actually reports rather than on the stored state.
+    statuses: Arc<Mutex<std::collections::HashMap<String, oxid_core::ContainerStatus>>>,
+}
+
+impl FakeOci {
+    fn set_status(&self, name: &str, status: oxid_core::ContainerStatus) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), status);
+    }
 }
 
 impl ContainerPort for FakeOci {
@@ -108,18 +122,22 @@ impl ContainerPort for FakeOci {
     }
     async fn start(&self, name: &str) -> Result<(), OciError> {
         self.calls.lock().unwrap().push(format!("start:{name}"));
+        self.set_status(name, oxid_core::ContainerStatus::Running);
         Ok(())
     }
     async fn pause(&self, name: &str) -> Result<(), OciError> {
         self.calls.lock().unwrap().push(format!("pause:{name}"));
+        self.set_status(name, oxid_core::ContainerStatus::Paused);
         Ok(())
     }
     async fn unpause(&self, name: &str) -> Result<(), OciError> {
         self.calls.lock().unwrap().push(format!("unpause:{name}"));
+        self.set_status(name, oxid_core::ContainerStatus::Running);
         Ok(())
     }
     async fn stop(&self, name: &str) -> Result<(), OciError> {
         self.calls.lock().unwrap().push(format!("stop:{name}"));
+        self.set_status(name, oxid_core::ContainerStatus::Stopped);
         Ok(())
     }
     async fn remove(&self, name: &str) -> Result<(), OciError> {
@@ -153,8 +171,14 @@ impl ContainerPort for FakeOci {
             .push(format!("exec:{name}:{command}"));
         Ok(())
     }
-    async fn container_status(&self, _name: &str) -> Result<oxid_core::ContainerStatus, OciError> {
-        Ok(oxid_core::ContainerStatus::Running)
+    async fn container_status(&self, name: &str) -> Result<oxid_core::ContainerStatus, OciError> {
+        Ok(self
+            .statuses
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(oxid_core::ContainerStatus::Running))
     }
     async fn host_capacity(&self) -> Result<oxid_core::HostCapacity, OciError> {
         Ok(oxid_core::HostCapacity {
@@ -337,6 +361,31 @@ port = 8080
     )
     .unwrap();
     dir
+}
+
+/// Blocks until an accepted webhook has actually produced an environment.
+///
+/// Webhook deliveries are answered `queued` and deployed on a background
+/// drain, so a test that asserts on the deploy has to wait for it rather
+/// than read straight after the response. Bounded, and panics rather than
+/// hanging if the drain never runs.
+async fn wait_for_environments(app: &Router, project_id: u64) -> Vec<Environment> {
+    for _ in 0..200 {
+        let (_, body) = json_request(
+            app,
+            "GET",
+            &format!("/api/v1/projects/{project_id}/environments"),
+            json!({}),
+        )
+        .await;
+        if let Ok(envs) = serde_json::from_slice::<Vec<Environment>>(&body)
+            && !envs.is_empty()
+        {
+            return envs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("queued deploy never produced an environment");
 }
 
 async fn json_request(app: &Router, method: &str, uri: &str, body: Value) -> (StatusCode, Vec<u8>) {
@@ -2078,7 +2127,12 @@ async fn webhook_deploys_branch_when_signed() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let value: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["status"], "deployed");
+    // The delivery is acknowledged immediately and deployed on a
+    // background drain — providers abandon a webhook long before a real
+    // build finishes.
+    assert_eq!(value["status"], "queued");
+    let envs = wait_for_environments(&app, 1).await;
+    assert_eq!(envs.len(), 1);
 }
 
 /// Regression test: GitHub sends a `ping` event (no `ref` at all) the
@@ -2122,6 +2176,10 @@ async fn webhook_destroys_environment_on_branch_deletion() {
         }),
     )
     .await;
+
+    // The push is deployed asynchronously; the branch has to actually exist
+    // as an environment before deleting it can destroy anything.
+    wait_for_environments(&app, 1).await;
 
     let (status, body) = signed_webhook(
         &app,
@@ -2320,7 +2378,12 @@ async fn gitlab_webhook_deploys_branch_when_token_valid() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let value: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["status"], "deployed");
+    // The delivery is acknowledged immediately and deployed on a
+    // background drain — providers abandon a webhook long before a real
+    // build finishes.
+    assert_eq!(value["status"], "queued");
+    let envs = wait_for_environments(&app, 1).await;
+    assert_eq!(envs.len(), 1);
 }
 
 #[tokio::test]
@@ -2381,6 +2444,10 @@ async fn gitlab_webhook_destroys_environment_on_branch_deletion() {
     )
     .await;
 
+    // The push is deployed asynchronously; the branch has to actually exist
+    // as an environment before deleting it can destroy anything.
+    wait_for_environments(&app, 1).await;
+
     let (status, body) = gitlab_request(
         &app,
         json!({
@@ -2430,7 +2497,12 @@ async fn gitea_webhook_deploys_branch_when_signed() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let value: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["status"], "deployed");
+    // The delivery is acknowledged immediately and deployed on a
+    // background drain — providers abandon a webhook long before a real
+    // build finishes.
+    assert_eq!(value["status"], "queued");
+    let envs = wait_for_environments(&app, 1).await;
+    assert_eq!(envs.len(), 1);
 }
 
 /// Gogs speaks the same wire format as Gitea under `x-gogs-*` headers.
@@ -2458,7 +2530,12 @@ async fn gogs_webhook_deploys_branch_when_signed() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let value: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["status"], "deployed");
+    // The delivery is acknowledged immediately and deployed on a
+    // background drain — providers abandon a webhook long before a real
+    // build finishes.
+    assert_eq!(value["status"], "queued");
+    let envs = wait_for_environments(&app, 1).await;
+    assert_eq!(envs.len(), 1);
 }
 
 #[tokio::test]
@@ -2983,12 +3060,14 @@ async fn wake_by_host_wakes_matching_environment() {
     let (status, body) = request_with_host(&app, "POST", "/api/v1/wake", &env.url).await;
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("feature-login"));
+    // Suspending stops the container (a paused one loses its Traefik
+    // router), so waking it starts it again.
     assert!(
         oci.calls
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.starts_with("unpause:")),
+            .any(|c| c.starts_with("start:")),
         "{:?}",
         oci.calls
     );
@@ -3026,4 +3105,159 @@ async fn heartbeat_always_ok() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody.local.dev").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A webhook whose repository name is merely a *prefix* of a registered
+/// clone URL must not deploy that project.
+///
+/// Matching used to be a substring test, so a push from `org/ap` — or from
+/// any repository that was never registered but whose name happened to be a
+/// prefix — was accepted and deployed `org/app`. In an organisation with
+/// both `app` and `app-api`, pushes silently crossed between projects.
+#[tokio::test]
+async fn webhook_rejects_a_repository_that_only_prefixes_a_registered_one() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    for hint in ["org/ap", "org/a", "rg/app"] {
+        let (status, _) = signed_webhook(
+            &app,
+            json!({
+                "ref": "refs/heads/feature-hook",
+                "repository": { "full_name": hint }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "`{hint}` must not resolve to the registered project"
+        );
+    }
+}
+
+/// The exact registered repository still resolves, including when the
+/// webhook spells it with a `.git` suffix or different casing.
+#[tokio::test]
+async fn webhook_accepts_the_exact_repository_in_any_spelling() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    for hint in ["org/app", "org/app.git", "Org/App"] {
+        let (status, _) = signed_webhook(
+            &app,
+            json!({
+                "ref": "refs/heads/feature-hook",
+                "repository": { "full_name": hint }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "`{hint}` should resolve");
+    }
+}
+
+/// A misspelled scope key must not mint a token with full access.
+///
+/// Unknown fields used to be ignored, so `project_ids` (instead of
+/// `projects`) silently produced an *unscoped* token carrying the same reach
+/// as the master credential, while the caller believed they had restricted
+/// it. Failing the request is the only behaviour that can't fail open.
+#[tokio::test]
+async fn creating_a_token_rejects_a_misspelled_scope_key() {
+    let (app, _) = test_app().await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "ci", "project_ids": [1] }),
+        Some("test-token"),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CREATED,
+        "a misspelled scope key must not create a full-access token"
+    );
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "ci", "projects": [1] }),
+        Some("test-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["projects"], json!([1]));
+}
+
+/// The wake interstitial identifies itself with a header.
+///
+/// It is served on the environment's own URL, so without a marker the page's
+/// poll cannot tell "still waking" from "the app is answering again" — and
+/// falls back to sitting out a fixed reload timer, which was most of the
+/// visible wake time.
+#[tokio::test]
+async fn the_wake_page_marks_itself_so_the_poll_can_tell_when_it_is_gone() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app_with_traefik().await;
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+        json!({ "branch": "feature-login" }),
+    )
+    .await;
+    let env: Environment = serde_json::from_slice(&body).unwrap();
+    json_request(
+        &app,
+        "POST",
+        format!("/api/v1/environments/{}/pause", env.id.0).as_str(),
+        json!({}),
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/wake")
+                .header("host", env.url.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-oxid-waking")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
 }

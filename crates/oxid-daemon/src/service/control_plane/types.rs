@@ -13,6 +13,29 @@ pub struct GcSummary {
     pub errors: Vec<(EnvironmentId, String)>,
 }
 
+/// What a deploy should do when the host has no room for it right now.
+///
+/// Admission used to be a plain `bool` decided *before* the git checkout,
+/// against the project's registered config — the only thing known that
+/// early. Once a branch's own `oxid.toml` started being honoured that was no
+/// longer the request being made, so the gate could wave through a branch
+/// asking for far more memory than was free. The check now happens once,
+/// after the checkout, with the real numbers; this says what to do with the
+/// answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionMode {
+    /// A fresh request (`oxid up`, a webhook). Doesn't fit: put it on the
+    /// queue and report its position.
+    Enqueue,
+    /// A retry of something already on the queue. Doesn't fit: report that
+    /// without enqueuing it a second time — the caller keeps the entry it
+    /// already holds.
+    AlreadyQueued,
+    /// Deploy regardless of capacity (a rollback, which replaces an
+    /// environment that is already accounted for).
+    Bypass,
+}
+
 /// Aggregate node-wide counts for the web dashboard's overview — see
 /// [`crate::service::control_plane::ControlPlane::node_stats`].
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -27,6 +50,10 @@ pub struct NodeStats {
     pub environments_building: u64,
     /// Environments currently `Hibernating`.
     pub environments_hibernating: u64,
+    /// Environments whose deploy failed. Counted separately from
+    /// `environments_destroyed` so the dashboard can surface "someone's push
+    /// is broken" rather than folding it into routine teardowns.
+    pub environments_build_failed: u64,
     /// Environments currently `Destroyed` (kept for rollback history).
     pub environments_destroyed: u64,
     /// Deploys currently waiting for host capacity.
@@ -53,6 +80,10 @@ pub struct InfraStatus {
     pub network_exists: bool,
     /// The built-in Traefik container's actual Docker state.
     pub traefik_status: ContainerStatus,
+    /// Host port Traefik's `web` entrypoint is published on
+    /// (`OXID_TRAEFIK_HTTP_PORT`, default 80). Reported because a branch URL
+    /// is only reachable without a port suffix when this is 80.
+    pub traefik_http_port: u16,
     /// Whether this daemon's own container is joined to `network` and
     /// labeled for wake-on-request — detection only, see
     /// [`SelfWiringStatus`].
@@ -67,6 +98,7 @@ impl InfraStatus {
         network: String,
         network_exists: bool,
         traefik_status: ContainerStatus,
+        traefik_http_port: u16,
         self_wiring: SelfWiringStatus,
     ) -> Self {
         let mut next_steps = Vec::new();
@@ -94,14 +126,22 @@ impl InfraStatus {
                  \x20\x20labels:\n\
                  \x20\x20\x20\x20- \"traefik.enable=true\"\n\
                  \x20\x20\x20\x20- \"traefik.http.services.oxid-wake.loadbalancer.server.port=8080\"\n\
-                 (plus the per-router `errors` middleware labels documented on \
-                 `ControlPlane::traefik_labels`)."
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.rule=HostRegexp(`^.+$`)\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.priority=1\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.entrypoints=web\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.service=oxid-wake\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.middlewares=oxid-wake-rewrite\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.middlewares.oxid-wake-rewrite.replacepath.path=/api/v1/wake\"\n\
+                 The catch-all router is what makes a scaled-to-zero branch \
+                 reachable: its container is stopped, so Traefik publishes no \
+                 router of its own for it. See `docker-compose.yml`."
             ));
         }
         Self {
             network,
             network_exists,
             traefik_status,
+            traefik_http_port,
             self_wiring,
             next_steps,
         }
