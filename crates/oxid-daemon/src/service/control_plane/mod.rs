@@ -116,6 +116,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// `try_lock`-ed, never awaited: if a drain is already in flight it will
     /// pick up the row that was just enqueued anyway.
     deploy_drain_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One in-flight `git fetch` per project, shared by everyone who asked
+    /// for fresh refs at the same time. A fetch brings down every branch of
+    /// a repository, so a burst of pushes to one project needs one of them,
+    /// not one each — see [`crate::service::refresh_coalescer`].
+    git_fetches: Arc<crate::service::refresh_coalescer::RefreshCoalescer<ProjectId, PathBuf>>,
     /// How many queued deploys a single drain runs at once. Builds are
     /// mostly waiting on Docker, so overlapping them is nearly free; the cap
     /// exists so a large backlog cannot ask the host to build everything
@@ -197,6 +202,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
             deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             deploy_concurrency: default_deploy_concurrency(),
+            git_fetches: Arc::new(crate::service::refresh_coalescer::RefreshCoalescer::default()),
             postgres_url: None,
             redis_url: None,
             redis_pool_size: DEFAULT_REDIS_POOL_SIZE,

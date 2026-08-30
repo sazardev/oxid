@@ -366,17 +366,25 @@
               <tr><th>Scenario</th><th>Before</th><th>After</th><th>Runs</th><th></th></tr>
             </thead>
             <tbody>
-              <tr><td>15 simultaneous pushes</td><td>27.3 s</td><td>8.1 s</td><td>23.3 / 28.3 / 27.3 → 9.1 / 8.1 / 8.1</td><td><span class="bench-gain">3.4×</span></td></tr>
+              <tr><td>15 simultaneous pushes</td><td>27.3 s</td><td>7.1 s</td><td>23.3 / 28.3 / 27.3 → 7.1 / 7.1 / 8.1</td><td><span class="bench-gain">3.8×</span></td></tr>
+              <tr><td>…with <code>OXID_DEPLOY_CONCURRENCY=16</code></td><td>—</td><td>4.2 s</td><td>median of 12</td><td><span class="bench-gain">6.5×</span></td></tr>
             </tbody>
           </table>
         </div>
         <p class="bench-note">
-          Two things were in the way. Every deploy on the node held one mutex, though sibling
-          branches share no checkout, no container name and no environment row. And a burst
-          waited out a whole scheduler tick doing nothing, because the pushes landed after the
-          drain had already read the queue. Read the figure as a floor: the Docker layer cache
-          was warm here, so it is dominated by lock contention — on cold builds, whole builds
-          overlap instead.
+          Three things were in the way, each hiding the next. Every deploy on the node held one
+          mutex, though sibling branches share no checkout, no container name and no environment
+          row. A burst then waited out a whole scheduler tick doing nothing, because the pushes
+          landed after the drain had already read the queue. And with those gone, every deploy
+          was still doing its own <code>git fetch</code>, one at a time — fourteen deploys
+          starting in the same millisecond and finishing 425&nbsp;ms apart, which is exactly what
+          a fetch to GitHub costs from this machine. One fetch brings down every branch, so they
+          share it now.
+        </p>
+        <p class="bench-note">
+          Read the figure as a floor, and note which way: the Docker layer cache was warm here,
+          so each build is a second or two. On cold builds the gap is larger, because what
+          overlaps is then whole builds rather than the bookkeeping around them.
         </p>
 
         <h3 class="bench-subhead">Heartbeat — the busiest path in the system</h3>

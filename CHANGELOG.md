@@ -18,8 +18,8 @@ is the breaking position.
   table. Sibling branches build and start at the same time.
 
   Fifteen branches pushed simultaneously — real signed webhooks, real Docker
-  and Traefik — settle in **8.1 s instead of 27.3 s** (median of three runs
-  each, alternating on the same host). See `BENCHMARKS.md`.
+  and Traefik — settle in **7.1 s instead of 27.3 s**, or 4.2 s with
+  `OXID_DEPLOY_CONCURRENCY=16`. See `BENCHMARKS.md`.
 - The deploy queue drains in waves of `OXID_DEPLOY_CONCURRENCY` (default 4)
   rather than one entry at a time. Order is still respected between waves,
   and a wave that reports the host is full still stops the drain, so a large
@@ -27,6 +27,14 @@ is the breaking position.
 
 ### Fixed
 
+- **Every deploy did its own `git fetch`, one at a time.** A fetch brings
+  down every branch of a repository, so the first of a burst had already
+  retrieved what the rest were about to ask for — and they repeated it
+  anyway, serialized behind the lock that protects the shared checkout, one
+  network round-trip each. On fifteen branches that was three quarters of
+  the wall-clock. Concurrent deploys of one project now share a fetch,
+  decided on when each caller *asked* rather than on the age of the result,
+  so nobody is served data older than their own request.
 - **A burst of pushes waited out a scheduler tick doing nothing.** Webhooks
   arrive faster than a drain can read the queue, so most of them landed after
   its snapshot and were answered "a drain is already running" — true, but

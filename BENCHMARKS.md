@@ -54,13 +54,14 @@ stack, measured from the first webhook to the last environment leaving
 
 | | Before | After | |
 |---|---|---|---|
-| 15 simultaneous pushes | 27.3 s | 8.1 s | 3.4× |
+| 15 simultaneous pushes, default settings | 27.3 s | 7.1 s | 3.8× |
+| …with `OXID_DEPLOY_CONCURRENCY=16` | — | 4.2 s | 6.5× |
 
-Three runs each, alternating, on the same host with the same warm Docker
-layer cache: before 23.3 / 28.3 / 27.3 s, after 9.1 / 8.1 / 8.1 s. All
-fifteen branches came up in every run.
+Same host, same warm Docker layer cache, runs alternated: before 23.3 / 28.3
+/ 27.3 s; after 7.1 / 7.1 / 8.1 s; at concurrency 16, twelve runs with a
+median of 4.2 s.
 
-Two separate things were in the way, and the second was the larger:
+Three separate things were in the way, each hiding the next:
 
 - **Every deploy on the node held one mutex.** Sibling branches share no
   checkout, no container name and no environment row, so they had no reason
@@ -71,11 +72,22 @@ Two separate things were in the way, and the second was the larger:
   snapshot and were told a drain was already running — true, but that drain
   had already read past them. Sixteen of the first measurement's
   twenty-eight seconds were that idle wait.
+- **Every deploy did its own `git fetch`, one at a time.** This one was
+  invisible until the other two were gone, and it is worth showing how it
+  was found. With the concurrency cap raised from 4 to 16 the burst barely
+  improved — 8.1 s to 7.2 s — which rules out the cap. The daemon's own log
+  said why: all fourteen deploys started in *the same millisecond* and then
+  finished spaced 425 ms apart, like clockwork. A `git fetch` against that
+  repository from this machine measures 402–428 ms. They were queueing for
+  the network, under the lock that protects the shared checkout. A fetch
+  brings down every branch at once, so the first one had already retrieved
+  what the other fourteen were about to ask for. They now share it.
 
-Read this as a floor, not a ceiling: the layer cache was warm, so each build
-here is a second or two and the figure is dominated by lock contention. On
-cold builds — the first push to a new branch — the gap is larger, because
-what overlaps is then whole builds rather than the bookkeeping around them.
+Read this as a floor, not a ceiling — and note which way. The layer cache
+was warm, so each build here is a second or two: that *understates* the gain
+on cold builds, where whole builds overlap rather than the bookkeeping
+around them. It also means the remaining seconds are now mostly real work
+(container start, readiness), which is where they belong.
 
 ### Heartbeat
 

@@ -633,6 +633,80 @@ async fn deploy_injects_a_distinct_redis_index_per_branch_and_reuses_on_redeploy
     );
 }
 
+/// `FakeGit`, counting how many times it was asked to refresh the
+/// repository. A fetch is a network round-trip in the real adapter, so
+/// counting them is counting the thing that actually costs. The counter is
+/// per instance rather than global: tests run in parallel in one process.
+#[derive(Clone, Default)]
+struct CountingGit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingGit {
+    fn fetches(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl GitPort for CountingGit {
+    async fn remote_url(&self, repo_dir: &Path) -> Result<RepoUrl, GitError> {
+        FakeGit.remote_url(repo_dir).await
+    }
+    async fn ensure_repo(
+        &self,
+        url: &RepoUrl,
+        token: Option<&str>,
+        cache_dir: &Path,
+    ) -> Result<PathBuf, GitError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        FakeGit.ensure_repo(url, token, cache_dir).await
+    }
+    async fn resolve_branch_head(
+        &self,
+        repo_dir: &Path,
+        branch: &BranchName,
+    ) -> Result<oxid_core::CommitRef, GitError> {
+        FakeGit.resolve_branch_head(repo_dir, branch).await
+    }
+    async fn checkout_commit(&self, repo_dir: &Path, sha: &str) -> Result<(), GitError> {
+        FakeGit.checkout_commit(repo_dir, sha).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_branches_pushed_together_share_one_fetch() {
+    // A fetch brings down every branch of the repository, so the first one
+    // of a burst has already retrieved what the rest are about to ask for.
+    // They used to repeat it anyway, serialized behind the git lock, one
+    // network round-trip each — about three quarters of the wall-clock of
+    // a fifteen-branch push.
+    let repo = repo_dir_with_config();
+    let cache = tempfile::tempdir().unwrap();
+    let git = CountingGit::default();
+    let cp = Arc::new(
+        ControlPlane::new(
+            store().await,
+            git.clone(),
+            FakeOci::default(),
+            cache.path().to_owned(),
+        )
+        .with_readiness_check(false),
+    );
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let baseline = git.fetches();
+
+    let deploys = (0..8).map(|i| {
+        let cp = Arc::clone(&cp);
+        let branch = BranchName::parse(format!("sibling-{i}")).unwrap();
+        async move { cp.deploy(project.id, branch).await.unwrap() }
+    });
+    futures_util::future::join_all(deploys).await;
+
+    let fetches = git.fetches() - baseline;
+    assert!(
+        fetches < 8,
+        "every sibling fetched for itself ({fetches} fetches for 8 branches)"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_branches_never_share_a_redis_index() {
     // Slots are handed out by reading which are taken and picking the

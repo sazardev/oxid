@@ -533,6 +533,27 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `Self::set_project_git_token`) — this daemon-side cache is cloned
         // independently of whatever git credential helper an operator's own
         // shell has configured, so a private repo needs its own credential.
+        //
+        // The fetch is deliberately *outside* the git lock and shared with
+        // any sibling deploy that asked at the same time. It brings down
+        // every branch of the repository, so fifteen branches pushed at once
+        // need one fetch, not fifteen — and it is a network round-trip, so
+        // repeating it under a lock made a burst of pushes finish one
+        // round-trip at a time. Measured on this repository against GitHub,
+        // fourteen redundant fetches were about three quarters of the
+        // wall-clock of the whole burst.
+        let asked_at = std::time::Instant::now();
+        let git_token = self.store.get_git_token(project.id).await?;
+        let repo_url = project.repo_url.clone();
+        let repo_dir = self
+            .git_fetches
+            .run(project_id, asked_at, || async {
+                self.git
+                    .ensure_repo(&repo_url, git_token.as_deref(), &self.cache_dir)
+                    .await
+            })
+            .await?;
+
         // Everything from here to the build context being captured touches
         // the one working directory every branch of this project shares.
         // Held per project rather than globally, and released before the
@@ -541,11 +562,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .lifecycle_lock
             .acquire(LockKey::GitCache(project_id))
             .await;
-        let git_token = self.store.get_git_token(project.id).await?;
-        let repo_dir = self
-            .git
-            .ensure_repo(&project.repo_url, git_token.as_deref(), &self.cache_dir)
-            .await?;
         let commit = match sha_override {
             Some(sha) => CommitRef {
                 branch: branch.clone(),
