@@ -249,6 +249,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             ));
         }
 
+        // Held from "which slots are taken?" until the lease exists, for
+        // the pools that hand out a slot rather than deriving a name.
+        let mut slot_guard = None;
         let resource_name = match dependency.kind {
             PoolKind::Postgres => {
                 let db_name = format!(
@@ -275,6 +278,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     ))
                     .into());
                 }
+                // Held across the read-then-claim below, and released only
+                // once the lease exists: picking the lowest free slot is a
+                // read followed by a write, and concurrent deploys would
+                // otherwise interleave into the same slot.
+                slot_guard = Some(
+                    self.lifecycle_lock
+                        .acquire(super::LockKey::ResourcePool(
+                            PoolKind::Redis,
+                            dependency.shared_instance.clone(),
+                        ))
+                        .await,
+                );
                 let used = self
                     .store
                     .used_resource_names(PoolKind::Redis, &dependency.shared_instance)
@@ -301,6 +316,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 &resource_name,
             )
             .await?;
+        drop(slot_guard);
         Ok((
             self.resource_url(dependency, &resource_name)?,
             describe(&resource_name, false),

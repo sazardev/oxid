@@ -12,7 +12,7 @@ figures can be argued with rather than taken on faith.
 | Memory | 16 GB |
 | Storage | NVMe SSD, btrfs |
 | OS | Linux 7.2, Docker Engine 29.7.2 |
-| Toolchain | Rust 1.98, `debug` profile |
+| Toolchain | Rust 1.98 — `debug` profile for the HTTP figures, the released static musl binary for the deploy one |
 
 The machine was **not** idle: it ran its owner's usual containers throughout. That
 adds noise, so it applies equally to both halves of every comparison — and it is
@@ -38,11 +38,44 @@ grow with use. The fixture is a team a few months in, not a fresh install:
 - **Each daemon measured alone.** Running both at once made them compete for
   CPU and produced a difference that vanished when they were separated; that
   false result is why this is spelled out.
-- **Median of five runs after a warmup**, per data point.
+- **Median of five runs after a warmup**, per data point — three for the deploy figure, which costs about a minute per run.
 - Load generated over keep-alive HTTP connections, so the figures measure the
   daemon rather than connection setup or a process spawn per request.
 
 ## Results
+
+### Deploy throughput
+
+Fifteen branches pushed simultaneously at one node — the shape of a team
+starting its morning, and the number the whole exercise was about. Real
+signed GitHub webhooks against a real repository, the full Docker + Traefik
+stack, measured from the first webhook to the last environment leaving
+`building`.
+
+| | Before | After | |
+|---|---|---|---|
+| 15 simultaneous pushes | 27.3 s | 8.1 s | 3.4× |
+
+Three runs each, alternating, on the same host with the same warm Docker
+layer cache: before 23.3 / 28.3 / 27.3 s, after 9.1 / 8.1 / 8.1 s. All
+fifteen branches came up in every run.
+
+Two separate things were in the way, and the second was the larger:
+
+- **Every deploy on the node held one mutex.** Sibling branches share no
+  checkout, no container name and no environment row, so they had no reason
+  to queue behind one another. Locking is now keyed by what is actually
+  shared.
+- **A burst waited out a scheduler tick doing nothing.** Webhooks arrive
+  faster than a drain can read the queue, so most of them landed after its
+  snapshot and were told a drain was already running — true, but that drain
+  had already read past them. Sixteen of the first measurement's
+  twenty-eight seconds were that idle wait.
+
+Read this as a floor, not a ceiling: the layer cache was warm, so each build
+here is a second or two and the figure is dominated by lock contention. On
+cold builds — the first push to a new branch — the gap is larger, because
+what overlaps is then whole builds rather than the bookkeeping around them.
 
 ### Heartbeat
 

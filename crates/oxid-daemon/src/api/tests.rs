@@ -53,10 +53,15 @@ impl GitPort for FakeGit {
         if let Some(message) = &self.ensure_error {
             return Err(GitError::Failure(message.clone()));
         }
-        Ok(self
+        // Same reason as the control-plane fake: the real one leaves a
+        // checkout behind, and the deploy copies the build context out of
+        // it, so this has to be a directory that exists.
+        let dir = self
             .checkout
             .clone()
-            .unwrap_or_else(|| cache_dir.join("app")))
+            .unwrap_or_else(|| cache_dir.join("app"));
+        std::fs::create_dir_all(&dir).map_err(|e| GitError::Failure(e.to_string()))?;
+        Ok(dir)
     }
     async fn resolve_branch_head(
         &self,

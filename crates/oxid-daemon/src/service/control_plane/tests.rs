@@ -26,7 +26,23 @@ impl GitPort for FakeGit {
         _token: Option<&str>,
         cache_dir: &Path,
     ) -> Result<PathBuf, GitError> {
-        Ok(cache_dir.join("app"))
+        // The real `ensure_repo` leaves a checkout on disk, and the deploy
+        // now copies the build context out of it before releasing the git
+        // lock — so a fake that returns a path to nothing is a fake that
+        // cannot exercise the deploy path.
+        // A small tree with a distinguishable subdirectory, so a test can
+        // tell a root context from a `[build].context = "backend"` one by
+        // what the deploy actually captured.
+        let dir = cache_dir.join("app");
+        let nested = dir.join("backend");
+        let write = |path: std::path::PathBuf, body: &str| -> Result<(), GitError> {
+            std::fs::write(path, body).map_err(|e| GitError::Failure(e.to_string()))
+        };
+        std::fs::create_dir_all(&nested).map_err(|e| GitError::Failure(e.to_string()))?;
+        write(dir.join("Dockerfile"), "FROM scratch\n")?;
+        write(nested.join("Dockerfile.prod"), "FROM scratch\n")?;
+        write(nested.join("api.py"), "print('hi')\n")?;
+        Ok(dir)
     }
     async fn resolve_branch_head(
         &self,
@@ -63,6 +79,15 @@ struct FakeOci {
     /// Labels the most recent `run` was given — the Traefik router,
     /// middleware and service wiring a deployed environment carries.
     last_run_labels: Arc<Mutex<std::collections::BTreeMap<String, String>>>,
+    /// Builds currently in flight, and the highest that number ever
+    /// reached. A serial drain never gets past 1; this is what lets a test
+    /// assert the queue actually overlaps its work rather than merely
+    /// finishing it.
+    builds_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    peak_builds_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, every `build` yields for this long, so overlapping builds
+    /// have a window in which to be observed overlapping.
+    build_delay: Arc<Mutex<Option<std::time::Duration>>>,
 }
 
 impl ContainerPort for FakeOci {
@@ -74,10 +99,30 @@ impl ContainerPort for FakeOci {
                 return Err(OciError::Failure("build failed: bad Dockerfile".to_owned()));
             }
         }
+        let delay = *self.build_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            use std::sync::atomic::Ordering;
+            let in_flight = self.builds_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_builds_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            self.builds_in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+        // The context is a private copy now, so its *path* no longer says
+        // which subdirectory was captured — its contents do.
+        let mut entries: Vec<String> = std::fs::read_dir(&spec.context)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort();
         self.calls.lock().unwrap().push(format!(
-            "build:{}:context={}:dockerfile={}",
+            "build:{}:context={}:entries=[{}]:dockerfile={}",
             spec.image,
             spec.context.display(),
+            entries.join(","),
             spec.dockerfile
         ));
         // Non-zero totals so tests can tell a propagated report apart from
@@ -243,7 +288,13 @@ impl GitPort for SequentialGit {
         _token: Option<&str>,
         cache_dir: &Path,
     ) -> Result<PathBuf, GitError> {
-        Ok(cache_dir.join("app"))
+        // Same as `FakeGit`: the deploy copies the build context out of the
+        // checkout, so it has to be a directory that exists.
+        let dir = cache_dir.join("app");
+        std::fs::create_dir_all(&dir).map_err(|e| GitError::Failure(e.to_string()))?;
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\n")
+            .map_err(|e| GitError::Failure(e.to_string()))?;
+        Ok(dir)
     }
     async fn resolve_branch_head(
         &self,
@@ -497,11 +548,16 @@ port = 8080
         .iter()
         .find(|c| c.starts_with("build:"))
         .expect("a build call was made");
-    // `FakeGit::ensure_repo` always resolves to `<cache_dir>/app`; the
-    // context must be that path joined with the configured `backend`
-    // subdirectory, and the dockerfile must be resolved relative to it.
+    // The build context is a private copy of the checkout, so its path no
+    // longer names the subdirectory — what proves `[build].context` was
+    // honoured is that the copy holds `backend/`'s contents and not the
+    // repository root's.
     assert!(
-        build_call.ends_with("/app/backend:dockerfile=Dockerfile.prod"),
+        build_call.contains("entries=[Dockerfile.prod,api.py]"),
+        "the configured `backend` subdirectory must be what got captured: {build_call}"
+    );
+    assert!(
+        build_call.ends_with(":dockerfile=Dockerfile.prod"),
         "{build_call}"
     );
 }
@@ -574,6 +630,57 @@ async fn deploy_injects_a_distinct_redis_index_per_branch_and_reuses_on_redeploy
     assert_eq!(
         redis_lease_for(&cp, project.id, "feature-a").await,
         Some(index_a)
+    );
+}
+
+#[tokio::test]
+async fn concurrent_branches_never_share_a_redis_index() {
+    // Slots are handed out by reading which are taken and picking the
+    // lowest free one. Deploys used to be serialized node-wide, so that
+    // read-then-claim could not interleave; now that sibling branches
+    // deploy at the same time, it can — and two branches sharing one Redis
+    // database is not something a uniqueness constraint would catch, since
+    // a lease is unique per branch rather than per slot.
+    //
+    // This asserts the invariant under real concurrency; it cannot force
+    // the interleaving, so it is a guard against the invariant being
+    // dropped rather than proof the window is closed. The lock in
+    // `provision.rs` is what closes it.
+    let repo = repo_dir_with_redis_dependency();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = Arc::new(
+        ControlPlane::new(
+            store().await,
+            FakeGit,
+            FakeOci::default(),
+            cache.path().to_owned(),
+        )
+        .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16)
+        .with_readiness_check(false),
+    );
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let branches: Vec<String> = (0..8).map(|i| format!("feature-{i}")).collect();
+    let deploys = branches.iter().map(|b| {
+        let cp = Arc::clone(&cp);
+        let branch = BranchName::parse(b.clone()).unwrap();
+        async move { cp.deploy(project.id, branch).await.unwrap() }
+    });
+    futures_util::future::join_all(deploys).await;
+
+    let mut indexes = Vec::new();
+    for b in &branches {
+        indexes.push(
+            redis_lease_for(&cp, project.id, b)
+                .await
+                .unwrap_or_else(|| panic!("{b} got no redis lease")),
+        );
+    }
+    let unique: std::collections::BTreeSet<_> = indexes.iter().collect();
+    assert_eq!(
+        unique.len(),
+        branches.len(),
+        "branches shared a redis index: {indexes:?}"
     );
 }
 
@@ -1864,6 +1971,90 @@ async fn retry_queued_deploys_leaves_the_queue_untouched_when_nothing_fits_yet()
 }
 
 #[tokio::test]
+async fn the_queue_drains_several_deploys_at_a_time() {
+    // The queue is how every webhook push reaches a deploy, so a serial
+    // drain made a team's pushes finish one after another: with six
+    // branches waiting, the last one paid for the five in front of it.
+    // Builds are almost entirely waiting on Docker, so they should overlap.
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    *oci.build_delay.lock().unwrap() = Some(std::time::Duration::from_millis(80));
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    // Queued directly: `deploy_or_queue` would deploy them immediately,
+    // since nothing here is capacity-constrained.
+    for i in 0..6 {
+        cp.store
+            .enqueue_deploy(
+                project.id,
+                &BranchName::parse(format!("queued-{i}")).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let started = std::time::Instant::now();
+    let failures = cp.retry_queued_deploys().await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        cp.store.list_deploy_queue().await.unwrap().is_empty(),
+        "every queued branch should have deployed"
+    );
+    let peak = oci
+        .peak_builds_in_flight
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(peak > 1, "builds never overlapped (peak in flight: {peak})");
+    // Six serial 80ms builds cannot finish in less than 480ms.
+    assert!(
+        elapsed < std::time::Duration::from_millis(480),
+        "drain took {elapsed:?}, which is no better than serial"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_that_lands_mid_drain_is_picked_up_by_that_same_drain() {
+    // A burst of webhooks arrives faster than the drain can read the queue,
+    // so most of them are enqueued after its snapshot and answered "a drain
+    // is already running". That is correct, but the drain they were relying
+    // on had already read past them, and they used to sit untouched until
+    // the next scheduler tick — most of the wall-clock of a fifteen-branch
+    // push was that wait, with the node idle.
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    *oci.build_delay.lock().unwrap() = Some(std::time::Duration::from_millis(150));
+    let cp = Arc::new(cp(oci).await);
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    cp.store
+        .enqueue_deploy(project.id, &BranchName::parse("first").unwrap(), None)
+        .await
+        .unwrap();
+
+    let drain = {
+        let cp = Arc::clone(&cp);
+        tokio::spawn(async move { cp.retry_queued_deploys().await })
+    };
+    // Enqueued while the first deploy is still building, exactly as a second
+    // webhook would be.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cp.store
+        .enqueue_deploy(project.id, &BranchName::parse("late").unwrap(), None)
+        .await
+        .unwrap();
+
+    let failures = drain.await.unwrap().unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        cp.store.list_deploy_queue().await.unwrap().is_empty(),
+        "the late push should have been drained by the same pass"
+    );
+}
+
+#[tokio::test]
 async fn retry_queued_deploys_deploys_once_capacity_frees_up() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
@@ -2346,5 +2537,61 @@ async fn repeated_heartbeats_do_not_write_on_every_request() {
     assert_eq!(
         after, first,
         "heartbeats inside the window must not each persist a row"
+    );
+}
+
+/// Two branches of one project must deploy at the same time — and must not
+/// build each other's code while doing it.
+///
+/// A single process-wide mutex used to serialize every deploy on the node,
+/// which made a team's pushes queue behind one another. Removing it is only
+/// safe because the build context is copied out of the shared checkout
+/// before the git lock is released: `checkout_commit` force-rewrites one
+/// working directory that every branch of a project shares, so without the
+/// copy a sibling deploy would swap the tree out from under this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sibling_branches_deploy_concurrently_without_mixing_trees() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = std::sync::Arc::new(cp(oci.clone()).await);
+    let project = cp.register_project(repo.path()).await.unwrap();
+
+    let mut tasks = Vec::new();
+    for i in 0..6 {
+        let cp = cp.clone();
+        let id = project.id;
+        tasks.push(tokio::spawn(async move {
+            cp.deploy(id, BranchName::parse(format!("feature-{i}")).unwrap())
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await
+            .unwrap()
+            .expect("every sibling deploy must succeed");
+    }
+
+    let envs = EnvironmentStore::list_by_project(&cp.store, project.id)
+        .await
+        .unwrap();
+    assert_eq!(envs.len(), 6, "one environment per branch");
+    assert!(
+        envs.iter().all(|e| e.state == EnvironmentState::Running),
+        "{envs:?}"
+    );
+
+    // Each build must have had its own private context, or one branch was
+    // reading a directory another was rewriting.
+    let calls = oci.calls.lock().unwrap();
+    let contexts: std::collections::HashSet<&str> = calls
+        .iter()
+        .filter(|c| c.starts_with("build:"))
+        .filter_map(|c| c.split(":context=").nth(1))
+        .filter_map(|c| c.split(":entries=").next())
+        .collect();
+    assert_eq!(
+        contexts.len(),
+        6,
+        "each deploy needs its own build context, got {contexts:?}"
     );
 }

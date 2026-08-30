@@ -232,7 +232,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // pause/wake/destroy on the same environment between that snapshot
         // and this action being applied would have its change silently
         // clobbered by `store.update` writing back the GC's stale copy.
-        let _guard = self.lifecycle_lock.lock().await;
+        let _guard = self
+            .lifecycle_lock
+            .acquire(self.lock_key_for(env_id).await?)
+            .await;
         let mut env = self.ensure_environment(env_id).await?;
         let transition = action
             .transition()

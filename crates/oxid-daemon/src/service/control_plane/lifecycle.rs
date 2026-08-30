@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::ControlPlane;
+use super::LockKey;
 use super::error::CpError;
 use super::helpers::{
     hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
@@ -39,6 +40,20 @@ use oxid_core::{
 const TOUCH_COALESCE_WINDOW: time::Duration = time::Duration::seconds(15);
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
+    /// The lock an environment-addressed operation must hold.
+    ///
+    /// Read before locking on purpose: an environment's project and branch
+    /// never change, so this cannot go stale — and every caller re-fetches
+    /// the row *under* the lock, which is what keeps the read-modify-write
+    /// atomic.
+    pub(crate) async fn lock_key_for(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<LockKey, CpError> {
+        let env = self.ensure_environment(environment_id).await?;
+        Ok(LockKey::Branch(env.project_id, env.branch.name.to_string()))
+    }
+
     /// Suspends an environment (scale-to-zero), unattributed.
     ///
     /// # Errors
@@ -57,7 +72,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         environment_id: EnvironmentId,
         operator: Option<String>,
     ) -> Result<(), CpError> {
-        let _guard = self.lifecycle_lock.lock().await;
+        let _guard = self
+            .lifecycle_lock
+            .acquire(self.lock_key_for(environment_id).await?)
+            .await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
@@ -218,7 +236,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         environment_id: EnvironmentId,
         operator: Option<String>,
     ) -> Result<(), CpError> {
-        let _guard = self.lifecycle_lock.lock().await;
+        let _guard = self
+            .lifecycle_lock
+            .acquire(self.lock_key_for(environment_id).await?)
+            .await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
@@ -340,7 +361,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         purge_secrets: bool,
         operator: Option<String>,
     ) -> Result<(), CpError> {
-        let _guard = self.lifecycle_lock.lock().await;
+        let _guard = self
+            .lifecycle_lock
+            .acquire(self.lock_key_for(environment_id).await?)
+            .await;
         let mut env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?

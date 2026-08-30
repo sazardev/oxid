@@ -4,6 +4,52 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
+## [Unreleased]
+
+### Changed
+
+- **Deploys no longer serialize node-wide.** One mutex covered every deploy,
+  pause, wake and destroy on the daemon, so a team's pushes finished one
+  after another however many cores the host had — fifteen branches took as
+  long as fifteen builds run back to back. Locking is now keyed by what is
+  actually shared: a branch (its rows, its container, its cutover), a
+  project's git cache (held only until the build context is captured, never
+  across the build), the admission check, and a shared resource pool's slot
+  table. Sibling branches build and start at the same time.
+
+  Fifteen branches pushed simultaneously — real signed webhooks, real Docker
+  and Traefik — settle in **8.1 s instead of 27.3 s** (median of three runs
+  each, alternating on the same host). See `BENCHMARKS.md`.
+- The deploy queue drains in waves of `OXID_DEPLOY_CONCURRENCY` (default 4)
+  rather than one entry at a time. Order is still respected between waves,
+  and a wave that reports the host is full still stops the drain, so a large
+  deploy is not starved by a stream of small ones behind it.
+
+### Fixed
+
+- **A burst of pushes waited out a scheduler tick doing nothing.** Webhooks
+  arrive faster than a drain can read the queue, so most of them landed after
+  its snapshot and were answered "a drain is already running" — true, but
+  that drain had already read past them, and nobody looked again until the
+  next tick. On fifteen simultaneous pushes that idle wait was the majority
+  of the wall-clock. A drain now re-reads the queue before finishing.
+- **Concurrent deploys of sibling branches could build each other's code.**
+  `checkout_commit` force-rewrites one on-disk working directory shared by
+  every branch of a project; the build read straight from it. Each deploy now
+  takes a private copy of the build context (symlinks preserved) before the
+  git lock is released.
+- **Admission could over-commit under concurrency.** Two deploys arriving at
+  once each saw the same free memory and each claimed it. The check is
+  serialized, counts `building` alongside `running`, and excludes the row the
+  asking deploy just created.
+- **Two branches could be handed the same Redis database.** The lowest free
+  slot is chosen by reading which are taken and then claiming one, and a
+  lease is unique per branch, not per slot — so nothing caught the
+  collision. The read and the claim are now held under one lock per pool.
+- A branch with no `oxid.toml` of its own silently replaced its project's
+  registered configuration with zero-config defaults inferred from its
+  Dockerfile.
+
 ## [0.2.0] - 2026-08-29
 
 Scale-to-zero worked in every unit test and in no real deployment. Simulating

@@ -328,8 +328,8 @@
         <p class="bench-lead">
           Every number below comes from the same box running the same load, once against the
           commit before the work and once against the commit after — two real binaries, not a
-          flag. Medians of five runs after a warmup, each daemon measured alone so they never
-          competed for CPU.
+          flag. Medians of five runs after a warmup — three for the deploy figure, which costs a
+          minute a run — with each daemon measured alone so they never competed for CPU.
         </p>
 
         <div class="grid-2 bench-grid">
@@ -340,7 +340,7 @@
               <dt>Memory</dt><dd>16&nbsp;GB</dd>
               <dt>Storage</dt><dd>NVMe SSD, btrfs — <em>not</em> a RAM disk</dd>
               <dt>OS</dt><dd>Linux 7.2, Docker Engine 29.7.2</dd>
-              <dt>Build</dt><dd>Rust 1.98, debug profile</dd>
+              <dt>Build</dt><dd>Rust 1.98 — debug profile for the HTTP figures, the released static musl binary for the deploy one</dd>
             </dl>
           </div>
           <div class="card">
@@ -353,6 +353,31 @@
             </dl>
           </div>
         </div>
+
+        <h3 class="bench-subhead">Deploy throughput — fifteen branches pushed at once</h3>
+        <p class="bench-note">
+          A team starting its morning: fifteen simultaneous signed GitHub webhooks at one node,
+          the full Docker and Traefik stack, timed from the first webhook to the last environment
+          leaving <code>building</code>. All fifteen came up in every run.
+        </p>
+        <div class="bench-scroll">
+          <table class="bench-table">
+            <thead>
+              <tr><th>Scenario</th><th>Before</th><th>After</th><th>Runs</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>15 simultaneous pushes</td><td>27.3 s</td><td>8.1 s</td><td>23.3 / 28.3 / 27.3 → 9.1 / 8.1 / 8.1</td><td><span class="bench-gain">3.4×</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="bench-note">
+          Two things were in the way. Every deploy on the node held one mutex, though sibling
+          branches share no checkout, no container name and no environment row. And a burst
+          waited out a whole scheduler tick doing nothing, because the pushes landed after the
+          drain had already read the queue. Read the figure as a floor: the Docker layer cache
+          was warm here, so it is dominated by lock contention — on cold builds, whole builds
+          overlap instead.
+        </p>
 
         <h3 class="bench-subhead">Heartbeat — the busiest path in the system</h3>
         <p class="bench-note">

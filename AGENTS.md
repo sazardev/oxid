@@ -43,7 +43,7 @@ Rule: new capability → domain + port in `oxid-core`, adapter in `oxid-daemon/s
 
 Daemon env (`crates/oxid-daemon/src/main.rs`):
 - `OXID_DATA_DIR` default `/data` → `audit.sqlite` (WAL), `git-cache/`, `secret.key` (0600, AES-GCM, `OXID_MASTER_KEY` 64-hex or auto-generated)
-- `OXID_ADDR` default `0.0.0.0:8080`, `OXID_GC_INTERVAL_SECS` default `30`
+- `OXID_ADDR` default `0.0.0.0:8080`, `OXID_GC_INTERVAL_SECS` default `30`, `OXID_DEPLOY_CONCURRENCY` default `4` (queued deploys per drain wave; see `service/control_plane/mod.rs::default_deploy_concurrency`)
 - `OXID_WEBHOOK_SECRET` — HMAC-SHA256 (GitHub/Gitea/Gogs) + token echo (GitLab); webhooks rejected if unset; routes `/api/v1/webhooks/{github,gitlab,gitea,gogs}`
 - `OXID_API_TOKEN` — bearer auth; **daemon refuses to start on a non-loopback bind without it** (override `OXID_ALLOW_OPEN_API=1`); named tokens (`oxid token create [--project id]...`, migration `0010`) are project-scopable — scoped tokens get 404 outside their projects and 403 on node-wide routes (see `api/middleware.rs::authorize_project`)
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. (see `main.rs`)

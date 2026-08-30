@@ -318,13 +318,25 @@ impl SqliteStore {
     ///
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
-    pub async fn committed_memory_mb(&self, fallback_mb: u64) -> Result<u64, RepositoryError> {
+    pub async fn committed_memory_mb(
+        &self,
+        fallback_mb: u64,
+        exclude: Option<EnvironmentId>,
+    ) -> Result<u64, RepositoryError> {
+        // `building` counts as well as `running`. Deploys used to be
+        // strictly sequential, so a deploy that had passed admission but not
+        // yet started its container could not overlap with the next one
+        // asking. Now that siblings deploy concurrently, ignoring in-flight
+        // ones would let several each see the same free memory and all
+        // proceed. The caller excludes its own row, which is `building` by
+        // the time it asks.
         let total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(COALESCE(p.memory_limit_mb, ?)), 0) \
+            "SELECT COALESCE(SUM(COALESCE(p.memory_limit_mb, ?1)), 0) \
              FROM environments e JOIN projects p ON p.id = e.project_id \
-             WHERE e.state = 'running'",
+             WHERE e.state IN ('running', 'building') AND e.id != ?2",
         )
         .bind(i64::try_from(fallback_mb).unwrap_or(i64::MAX))
+        .bind(exclude.map_or(0, |id| id_as_i64(id.0)))
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -2174,6 +2186,6 @@ mod concurrency_tests {
             EnvironmentStore::create(&store, &env).await.unwrap();
         }
         // Two running environments of a project limited to 256 MB each.
-        assert_eq!(store.committed_memory_mb(512).await.unwrap(), 512);
+        assert_eq!(store.committed_memory_mb(512, None).await.unwrap(), 512);
     }
 }

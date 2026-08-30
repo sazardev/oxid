@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::ControlPlane;
+use super::LockKey;
 use super::error::CpError;
 use super::helpers::{
     hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
@@ -154,55 +155,104 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             return Ok(Vec::new());
         };
         let mut failures = Vec::new();
-        for queued in self.store.list_deploy_queue().await? {
-            let branch = match BranchName::parse(&queued.branch) {
-                Ok(b) => b,
-                Err(e) => {
-                    // An unparseable branch will never become parseable.
-                    let _ = self.store.remove_from_deploy_queue(queued.id).await;
-                    failures.push((queued.id, e.into()));
-                    continue;
-                }
-            };
-            // The entry is held until the deploy resolves, rather than
-            // removed up front. A drain that crashed — or a daemon that was
-            // restarted mid-deploy — used to lose the push outright, and now
-            // that accepted webhooks land here that would be the normal path
-            // rather than a rare one. The drain lock is what makes holding
-            // it safe: no second drain can pick up the same row meanwhile.
-            match self
-                .deploy_at(
-                    queued.project_id,
-                    branch,
-                    None,
-                    queued.operator.clone(),
-                    AdmissionMode::AlreadyQueued,
-                )
-                .await
-            {
-                Ok(DeployOutcome::Deployed(_, _)) => {
-                    self.store.remove_from_deploy_queue(queued.id).await?;
-                }
-                // Still doesn't fit. The entry stays exactly where it is,
-                // and the loop stops rather than skipping ahead to a smaller
-                // request behind it — FIFO fairness, so a big deploy is
-                // never starved by a stream of small ones.
-                Ok(DeployOutcome::Queued { .. }) => break,
-                Err(e) => {
-                    let attempts = queued.attempts + 1;
-                    if is_retryable(&e) && attempts < MAX_DEPLOY_ATTEMPTS {
-                        tracing::warn!(
-                            queue_id = queued.id,
-                            attempts,
-                            error = %e,
-                            "queued deploy failed transiently; keeping it queued"
-                        );
-                        self.store.bump_deploy_attempts(queued.id).await?;
-                    } else {
+        // Ids this pass has already tried. A bumped entry stays in the
+        // queue on purpose, so without this the re-read below would retry
+        // it immediately, forever.
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = self.store.list_deploy_queue().await?.into_iter();
+
+        // Drained in waves rather than one at a time.
+        //
+        // The queue is how every webhook push reaches a deploy, so a serial
+        // drain made a team's pushes finish one after another however many
+        // cores the host had: fifteen branches took as long as fifteen
+        // builds run back to back. A build is mostly waiting on Docker, so
+        // overlapping them is nearly free.
+        //
+        // Order is still respected between waves, and a wave stops the drain
+        // the moment one of its entries reports it does not fit — a big
+        // deploy is never starved by a stream of small ones behind it.
+        loop {
+            let wave: Vec<_> = queue.by_ref().take(self.deploy_concurrency).collect();
+            if wave.is_empty() {
+                break;
+            }
+            let mut running = Vec::new();
+            for queued in wave {
+                seen.insert(queued.id);
+                let branch = match BranchName::parse(&queued.branch) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // An unparseable branch will never become parseable.
+                        let _ = self.store.remove_from_deploy_queue(queued.id).await;
+                        failures.push((queued.id, e.into()));
+                        continue;
+                    }
+                };
+                // The entry is held until the deploy resolves, rather than
+                // removed up front. A drain that crashed — or a daemon
+                // restarted mid-deploy — used to lose the push outright.
+                running.push(async move {
+                    let outcome = self
+                        .deploy_at(
+                            queued.project_id,
+                            branch,
+                            None,
+                            queued.operator.clone(),
+                            AdmissionMode::AlreadyQueued,
+                        )
+                        .await;
+                    (queued, outcome)
+                });
+            }
+
+            let mut full = false;
+            for (queued, outcome) in futures_util::future::join_all(running).await {
+                match outcome {
+                    Ok(DeployOutcome::Deployed(_, _)) => {
                         self.store.remove_from_deploy_queue(queued.id).await?;
-                        failures.push((queued.id, e));
+                    }
+                    Ok(DeployOutcome::Queued { .. }) => full = true,
+                    Err(e) => {
+                        let attempts = queued.attempts + 1;
+                        if is_retryable(&e) && attempts < MAX_DEPLOY_ATTEMPTS {
+                            tracing::warn!(
+                                queue_id = queued.id,
+                                attempts,
+                                error = %e,
+                                "queued deploy failed transiently; keeping it queued"
+                            );
+                            self.store.bump_deploy_attempts(queued.id).await?;
+                        } else {
+                            self.store.remove_from_deploy_queue(queued.id).await?;
+                            failures.push((queued.id, e));
+                        }
                     }
                 }
+            }
+            if full {
+                break;
+            }
+
+            // A burst of pushes arrives faster than the first drain can read
+            // the queue, so most of them land *after* the snapshot above and
+            // are answered "a drain is already running" — correctly, but the
+            // drain they were counting on had already read past them. They
+            // used to wait out a whole scheduler tick before anyone looked
+            // again: measured on fifteen simultaneous pushes, sixteen of the
+            // twenty-eight seconds were that wait, with the node idle.
+            if queue.len() == 0 {
+                let fresh: Vec<_> = self
+                    .store
+                    .list_deploy_queue()
+                    .await?
+                    .into_iter()
+                    .filter(|q| !seen.contains(&q.id))
+                    .collect();
+                if fresh.is_empty() {
+                    break;
+                }
+                queue = fresh.into_iter();
             }
         }
         Ok(failures)
@@ -284,6 +334,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// a normal thing to do on a branch, and `parse_project` already falls
     /// back to a `docker-compose.yml`/`Dockerfile` when one is present.
     fn branch_config(&self, project: &Project, repo_dir: &Path) -> Result<Project, CpError> {
+        // Only an `oxid.toml` on the commit overrides anything.
+        //
+        // `parse_project` also succeeds by *inferring* a config from a
+        // `docker-compose.yml` or a bare `Dockerfile`, which is the right
+        // behaviour when registering a project that has never been
+        // configured — but the wrong one here: a branch that simply has no
+        // `oxid.toml` would have the project's registered build settings,
+        // port and dependencies silently replaced by zero-config defaults.
+        // Keeping the project's config is what the branch asked for by not
+        // saying anything.
+        if !repo_dir.join("oxid.toml").exists() {
+            return Ok(project.clone());
+        }
         let parsed = match config::parse_project(repo_dir) {
             Ok(parsed) => parsed,
             Err(err @ (config::ConfigError::Parse(_) | config::ConfigError::Validation(_))) => {
@@ -322,6 +385,42 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         effective.config.port = parsed.config.port;
         effective.config.dependencies = parsed.config.dependencies;
         Ok(effective)
+    }
+
+    /// Copies the build context out of the shared checkout into a private
+    /// directory, so the build can run while another branch of the same
+    /// project checks out over the original.
+    ///
+    /// Symlinks are recreated as symlinks rather than followed, matching
+    /// what the build context tar does: a dangling one somewhere in a repo
+    /// is not a reason to fail a deploy, and dereferencing it would be.
+    async fn capture_build_context(
+        &self,
+        repo_dir: &Path,
+        context: &str,
+        environment_id: EnvironmentId,
+    ) -> Result<BuildContext, CpError> {
+        let source = repo_dir.join(context);
+        let target = self
+            .cache_dir
+            .join("contexts")
+            .join(environment_id.0.to_string());
+        let cleanup = target.clone();
+        tokio::task::spawn_blocking(move || {
+            // A copy is normally removed when its deploy ends, but a daemon
+            // killed mid-build leaves one behind, and merging a new commit
+            // into it would resurrect files that commit deleted.
+            match std::fs::remove_dir_all(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            copy_tree(&source, &target)
+        })
+        .await
+        .map_err(|e| CpError::Validation(format!("capturing the build context panicked: {e}")))?
+        .map_err(|e| CpError::Validation(format!("cannot capture the build context: {e}")))?;
+        Ok(BuildContext { path: cleanup })
     }
 
     /// Records a failed deploy everywhere an operator might look for it:
@@ -395,11 +494,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         admission: AdmissionMode,
     ) -> Result<DeployOutcome, CpError> {
         tracing::info!(%project_id, %branch, "deploy started");
-        // Serializes the whole pipeline below (see `lifecycle_lock`'s doc
-        // comment for the two race conditions this closes) — admission
-        // control is decided under the same lock as the deploy it gates,
-        // so two concurrent requests can't both see room and both proceed.
-        let _guard = self.lifecycle_lock.lock().await;
+        // Exclusive against this *branch* only. Two deploys of the same
+        // branch still race on its environment rows, its container name and
+        // its cutover, so they serialize; two different branches share none
+        // of that and no longer wait on each other.
+        let _branch_guard = self
+            .lifecycle_lock
+            .acquire(LockKey::Branch(project_id, branch.to_string()))
+            .await;
 
         let project = self.ensure_project(project_id).await?;
 
@@ -431,6 +533,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `Self::set_project_git_token`) — this daemon-side cache is cloned
         // independently of whatever git credential helper an operator's own
         // shell has configured, so a private repo needs its own credential.
+        // Everything from here to the build context being captured touches
+        // the one working directory every branch of this project shares.
+        // Held per project rather than globally, and released before the
+        // build — the build is the long pole and the part worth overlapping.
+        let git_guard = self
+            .lifecycle_lock
+            .acquire(LockKey::GitCache(project_id))
+            .await;
         let git_token = self.store.get_git_token(project.id).await?;
         let repo_dir = self
             .git
@@ -550,7 +660,11 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let admitted = if admission == AdmissionMode::Bypass {
             Ok(Admission::Fits)
         } else {
-            self.check_admission(&project).await
+            // Serialized node-wide, but only around the check itself — it is
+            // one query, and two concurrent deploys must not each see the
+            // same free memory and both take it.
+            let _admission_guard = self.lifecycle_lock.acquire(LockKey::Admission).await;
+            self.check_admission(&project, Some(env.id)).await
         };
         match admitted {
             Ok(Admission::Fits) => {}
@@ -588,8 +702,29 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // support, whose `build.context`/`build.dockerfile` pair only makes
         // sense if `dockerfile` really is resolved relative to `context`.
         let image = image_name(&project, &branch);
+
+        // Copy the checked-out context aside before letting go of the git
+        // lock. The tar Docker receives is read *inside* `build`, long after
+        // this point, and the next deploy of a sibling branch force-rewrites
+        // that same working directory — without a private copy one branch
+        // would build another branch's tree, silently and wrongly. The copy
+        // costs about what tarring it costs, which the build pays anyway.
+        let context = match self
+            .capture_build_context(&repo_dir, &project.config.build.context, env.id)
+            .await
+        {
+            Ok(context) => context,
+            Err(err) => {
+                drop(git_guard);
+                self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                    .await;
+                return Err(err);
+            }
+        };
+        drop(git_guard);
+
         let build = BuildSpec {
-            context: repo_dir.join(&project.config.build.context),
+            context: context.path().to_owned(),
             dockerfile: project
                 .config
                 .build
@@ -744,4 +879,53 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
     }
+}
+
+/// A private copy of a build context, removed when the deploy is done with
+/// it. Cleanup is best-effort in `Drop`: a leftover directory under the
+/// cache costs disk, while failing a deploy that already succeeded over a
+/// failed `remove_dir_all` would cost the deploy.
+struct BuildContext {
+    path: PathBuf,
+}
+
+impl BuildContext {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BuildContext {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), error = %e, "could not remove build context copy");
+        }
+    }
+}
+
+/// Recursive copy that preserves symlinks as symlinks.
+fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        // `symlink_metadata` does not dereference, so a dangling link is
+        // just an entry to recreate rather than an error.
+        let meta = std::fs::symlink_metadata(&from)?;
+        if meta.is_symlink() {
+            let dest = std::fs::read_link(&from)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(dest, &to)?;
+            #[cfg(not(unix))]
+            let _ = dest;
+        } else if meta.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }

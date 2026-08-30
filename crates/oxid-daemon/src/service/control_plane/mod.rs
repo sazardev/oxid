@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapter::store::SqliteStore;
-use oxid_core::{ContainerPort, GitPort};
+use oxid_core::{ContainerPort, GitPort, PoolKind, ProjectId};
 
 pub mod admission;
 pub mod auth;
@@ -26,6 +26,36 @@ pub mod types;
 
 pub use error::CpError;
 pub use types::{DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
+
+/// What a lifecycle operation is exclusive *against*.
+///
+/// One process-wide mutex used to serialize all of them. That closed real
+/// races — see `lifecycle_lock` — but two branches of two different projects
+/// share no checkout, no container name and no environment row, so making
+/// them queue only cost throughput. These variants name the things that
+/// genuinely cannot overlap; everything else is free to run at once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum LockKey {
+    /// One branch of one project: its environment rows, its container name,
+    /// its cutover. Held for a whole deploy, pause, wake or destroy.
+    Branch(ProjectId, String),
+    /// One project's git cache. `checkout_commit` force-rewrites a single
+    /// on-disk working directory that every branch of that project shares,
+    /// so two of them checking out at once would have one build the other's
+    /// tree. Held only until the build context has been captured, never
+    /// across the build itself — that is the part worth overlapping.
+    GitCache(ProjectId),
+    /// Host capacity. One query, serialized node-wide so two concurrent
+    /// deploys cannot both see the same free memory and both claim it.
+    Admission,
+    /// One shared resource pool, by kind and instance name. Slots are handed
+    /// out by reading which are taken and picking the lowest free one, so
+    /// two branches provisioning at once would otherwise both read the same
+    /// set and both take the same slot — two branches sharing one Redis
+    /// database, which no uniqueness constraint would catch, since a lease
+    /// is unique per branch rather than per slot.
+    ResourcePool(PoolKind, String),
+}
 
 /// Orchestrates registration, deployment and lifecycle of environments.
 #[derive(Clone)]
@@ -74,7 +104,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// (fetch, apply a `StateTransition`, persist) with no atomicity between
     /// the read and the write, so they could interleave and have one
     /// overwrite the other's transition with stale data.
-    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    ///
+    /// Keyed rather than global: see [`LockKey`] for what each key protects.
+    /// A single mutex gave the same guarantees but also made every deploy on
+    /// the node wait for every other one.
+    lifecycle_lock: Arc<crate::service::keyed_lock::KeyedLocks<LockKey>>,
     /// Ensures only one deploy-queue drain runs at a time. The scheduler
     /// drains on every tick and each accepted webhook kicks off a drain of
     /// its own, so without this two drains could read the same pending row
@@ -82,6 +116,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// `try_lock`-ed, never awaited: if a drain is already in flight it will
     /// pick up the row that was just enqueued anyway.
     deploy_drain_lock: Arc<tokio::sync::Mutex<()>>,
+    /// How many queued deploys a single drain runs at once. Builds are
+    /// mostly waiting on Docker, so overlapping them is nearly free; the cap
+    /// exists so a large backlog cannot ask the host to build everything
+    /// simultaneously.
+    deploy_concurrency: usize,
     /// Admin connection string for the shared Postgres instance
     /// (`OXID_POSTGRES_URL`). `None` means projects declaring a `postgres`
     /// dependency will fail to deploy with a clear error instead of
@@ -127,6 +166,17 @@ const DEFAULT_DAEMON_URL: &str = "http://oxid-daemon:8080";
 /// one every wildcard-DNS setup expects to reach a branch on without a
 /// port suffix.
 const DEFAULT_TRAEFIK_HTTP_PORT: u16 = 80;
+
+/// Queued deploys run per drain, from `OXID_DEPLOY_CONCURRENCY`. Four by
+/// default: enough to hide the wait on Docker, low enough that a backlog
+/// cannot ask one host to build everything at once.
+fn default_deploy_concurrency() -> usize {
+    std::env::var("OXID_DEPLOY_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
 const DEFAULT_REDIS_POOL_SIZE: u32 = 16;
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
@@ -144,8 +194,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             docker_network: None,
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
             traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
-            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
             deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
+            deploy_concurrency: default_deploy_concurrency(),
             postgres_url: None,
             redis_url: None,
             redis_pool_size: DEFAULT_REDIS_POOL_SIZE,

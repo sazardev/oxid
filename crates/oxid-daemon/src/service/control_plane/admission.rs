@@ -33,7 +33,11 @@ use oxid_core::{
 };
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
-    pub(crate) async fn check_admission(&self, project: &Project) -> Result<Admission, CpError> {
+    pub(crate) async fn check_admission(
+        &self,
+        project: &Project,
+        exclude: Option<EnvironmentId>,
+    ) -> Result<Admission, CpError> {
         let Some(reserved_mb) = self.reserved_memory_mb else {
             return Ok(Admission::Fits);
         };
@@ -75,13 +79,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // Over-committing against sleeping branches is the point of
         // scale-to-zero, not a hazard it introduces: a node hosts far more
         // environments than could ever run at once precisely because most
-        // are asleep. `Building` is excluded because the deploy asking this
-        // question has already persisted its own row in that state, and
-        // deploys are serialized, so counting it would double-count the
-        // request against itself.
+        // are asleep. `Building` *is* counted, because sibling branches now
+        // deploy concurrently: a deploy that has passed admission but not
+        // yet started its container is memory this host has already
+        // promised, and ignoring it would let several deploys each see the
+        // same free budget and all take it. The asking deploy excludes its
+        // own row, which is `building` by the time it gets here.
         let committed_mb = self
             .store
-            .committed_memory_mb(self.default_memory_limit_mb.unwrap_or(0))
+            .committed_memory_mb(self.default_memory_limit_mb.unwrap_or(0), exclude)
             .await?;
 
         if committed_mb + request_mb > usable_mb {
