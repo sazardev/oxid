@@ -52,8 +52,43 @@ is the breaking position.
   design — one of which hands over a credential — as the only ones on the
   daemon nothing throttled.
 
+### Added
+
+- **The dashboard can register a project.** It could only ever be done
+  inside the onboarding wizard, which runs once and then gets out of the
+  way — so a team's second repository had no route into the dashboard at
+  all and had to go through the CLI.
+- **An infrastructure panel**, showing the Docker network, Traefik and the
+  wake-on-request wiring, with the repair button and the exact next steps
+  for whatever cannot be automated. Also wizard-only until now, though "is
+  Traefik still wired?" is a daily question, not a first-run one.
+- **Restore from the dashboard.** Downloading a snapshot was already there;
+  putting one back meant the CLI. The confirmation says what an operator
+  most often misses — that it replaces every secret, and that nothing
+  happens until the daemon restarts.
+- **Bulk actions on environments**, with a select-all and a selection that
+  follows the filter, so what a bulk button acts on is always what the table
+  shows as ticked. Single-environment buttons stop scaling at about the size
+  this product is for: fifteen branches rendered thirty-two loose
+  `wake`/`destroy` buttons, and putting the fleet to sleep was fifteen
+  clicks and fifteen confirmations.
+
 ### Fixed
 
+- **The onboarding wizard always said wake-on-request was unwired.** It read
+  `self_wiring_ok`, a field no version of `GET /api/v1/infra/status` ever
+  sent, so the indicator was `undefined` — permanently red on daemons that
+  were perfectly wired. The verdict the domain already computes
+  (`SelfWiringStatus::is_fully_wired`) is now serialized alongside the
+  evidence.
+- **Wide tables scrolled the whole page sideways.** An eight-column table
+  does not fit a tablet, and letting it widen the document put a horizontal
+  scrollbar under the nav and the stat strip too. Each table now scrolls
+  inside its own box; verified at 1440, 1024, 768 and 480 px.
+- **Counted messages read wrong in the singular** — "1 environments", "1
+  entornos". Both languages inflect the noun, so the counted strings carry
+  a `.one` and an `.other` form, with a test for the keys that are built at
+  runtime and therefore invisible to the existing catalog check.
 - **A restore could destroy the database it was meant to rescue.**
   `apply_staged_restore` wrote whatever bytes the uploaded archive held over
   the live `audit.sqlite` and deleted the marker before finding out whether

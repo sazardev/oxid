@@ -145,55 +145,81 @@
         <template x-if="filteredEnvironments().length === 0">
           <p class="muted" x-text="t('env.empty', { cmd: 'oxid up <branch>' })"></p>
         </template>
-        <table class="env-table" x-show="filteredEnvironments().length > 0">
-          <thead>
-            <tr>
-              <th x-text="t('env.col.project')"></th>
-              <th x-text="t('env.col.branch')"></th>
-              <th x-text="t('env.col.state')"></th>
-              <th x-text="t('env.col.url')"></th>
-              <th x-text="t('env.col.created')"></th>
-              <th x-text="t('env.col.lastSeen')"></th>
-              <th x-text="t('env.col.updated')"></th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            <template x-for="env in filteredEnvironments()" :key="env.id">
-              <tr :class="'row-' + env.state">
-                <td>
-                  <a class="link" href="#" @click.prevent="go('/ui/projects/' + env.projectId)" x-text="env.projectName"></a>
-                </td>
-                <td class="mono">
-                  <a class="link" href="#" @click.prevent="go('/ui/environments/' + env.id)" x-text="env.branch.name"></a>
-                </td>
-                <td>
-                  <span class="badge" :class="'badge-' + env.state">
-                    <span x-show="env.state === 'building'" class="spinner"></span>
-                    <span x-text="stateLabel(env.state)"></span>
-                  </span>
-                </td>
-                <td>
-                  <a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a>
-                </td>
-                <td class="mono muted" x-text="formatTime(env.created_at)"></td>
-                <td class="mono muted" x-text="formatTime(env.last_accessed_at)"></td>
-                <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
-                <td class="actions">
-                  <button class="btn btn-sm" x-show="env.state === 'running'" @click="pause(env)" x-text="t('action.pause')"></button>
-                  <button
-                    class="btn btn-sm"
-                    x-show="env.state === 'paused' || env.state === 'hibernating'"
-                    @click="wake(env)"
-                    x-text="t('action.wake')"
-                  ></button>
-                  <button class="btn btn-sm btn-danger" x-show="env.state !== 'destroyed'" @click="destroy(env)"
-                          x-text="t('action.destroy')"></button>
-                </td>
+        <div class="bulk-bar" x-show="selectedEnvironments().length > 0" x-cloak>
+          <span class="mono" x-text="tn('env.selected', selectedEnvironments().length)"></span>
+          <button class="btn btn-sm" :disabled="bulkBusy" @click="bulk('pause')" x-text="t('action.pause')"></button>
+          <button class="btn btn-sm" :disabled="bulkBusy" @click="bulk('wake')" x-text="t('action.wake')"></button>
+          <button class="btn btn-sm btn-danger" :disabled="bulkBusy" @click="bulk('destroy')" x-text="t('action.destroy')"></button>
+          <button class="btn btn-sm btn-ghost" @click="selection = []" x-text="t('env.clearSelection')"></button>
+        </div>
+        <div class="table-scroll">
+          <table class="env-table" x-show="filteredEnvironments().length > 0">
+            <thead>
+              <tr>
+                <th class="col-select">
+                  <input
+                    type="checkbox"
+                    :aria-label="t('env.selectAll')"
+                    :title="t('env.selectAll')"
+                    :checked="allVisibleSelected()"
+                    @change="toggleSelectAll()"
+                  />
+                </th>
+                <th x-text="t('env.col.project')"></th>
+                <th x-text="t('env.col.branch')"></th>
+                <th x-text="t('env.col.state')"></th>
+                <th x-text="t('env.col.url')"></th>
+                <th x-text="t('env.col.created')"></th>
+                <th x-text="t('env.col.lastSeen')"></th>
+                <th x-text="t('env.col.updated')"></th>
+                <th></th>
               </tr>
-            </template>
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              <template x-for="env in filteredEnvironments()" :key="env.id">
+                <tr :class="'row-' + env.state">
+                  <td class="col-select">
+                    <input
+                      type="checkbox"
+                      :aria-label="t('env.selectOne', { branch: env.branch.name })"
+                      :checked="isSelected(env)"
+                      @change="toggleSelected(env)"
+                    />
+                  </td>
+                  <td>
+                    <a class="link" href="#" @click.prevent="go('/ui/projects/' + env.projectId)" x-text="env.projectName"></a>
+                  </td>
+                  <td class="mono">
+                    <a class="link" href="#" @click.prevent="go('/ui/environments/' + env.id)" x-text="env.branch.name"></a>
+                  </td>
+                  <td>
+                    <span class="badge" :class="'badge-' + env.state">
+                      <span x-show="env.state === 'building'" class="spinner"></span>
+                      <span x-text="stateLabel(env.state)"></span>
+                    </span>
+                  </td>
+                  <td>
+                    <a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a>
+                  </td>
+                  <td class="mono muted" x-text="formatTime(env.created_at)"></td>
+                  <td class="mono muted" x-text="formatTime(env.last_accessed_at)"></td>
+                  <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
+                  <td class="actions">
+                    <button class="btn btn-sm" x-show="env.state === 'running'" @click="pause(env)" x-text="t('action.pause')"></button>
+                    <button
+                      class="btn btn-sm"
+                      x-show="env.state === 'paused' || env.state === 'hibernating'"
+                      @click="wake(env)"
+                      x-text="t('action.wake')"
+                    ></button>
+                    <button class="btn btn-sm btn-danger" x-show="env.state !== 'destroyed'" @click="destroy(env)"
+                            x-text="t('action.destroy')"></button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- ================= ENVIRONMENT DETAIL ================= -->
@@ -273,31 +299,71 @@
 
       <!-- ================= PROJECTS ================= -->
       <section class="page" x-show="route.name === 'projects'" x-cloak>
-        <h1 x-text="t('project.title')"></h1>
-        <table class="env-table">
-          <thead>
-            <tr>
-              <th x-text="t('project.col.name')"></th>
-              <th x-text="t('project.col.repo')"></th>
-              <th x-text="t('project.col.port')"></th>
-              <th x-text="t('project.col.environments')"></th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            <template x-for="p in projects" :key="p.id">
+        <div class="page-head">
+          <h1 x-text="t('project.title')"></h1>
+        </div>
+        <div class="card">
+          <h2 x-text="t('project.registerTitle')"></h2>
+          <p class="muted" x-text="t('project.registerHint')"></p>
+          <div class="form-row">
+            <select class="token-input mono" x-model="newProject.mode">
+              <option value="url" x-text="t('project.registerModeUrl')"></option>
+              <option value="dir" x-text="t('project.registerModeDir')"></option>
+            </select>
+            <input
+              class="token-input mono grow"
+              type="text"
+              x-show="newProject.mode === 'url'"
+              :placeholder="t('project.registerUrlPlaceholder')"
+              x-model="newProject.repoUrl"
+              @keydown.enter="registerProject()"
+            />
+            <input
+              class="token-input mono grow"
+              type="text"
+              x-show="newProject.mode === 'dir'"
+              :placeholder="t('project.registerDirPlaceholder')"
+              x-model="newProject.repoDir"
+              @keydown.enter="registerProject()"
+            />
+            <input
+              class="token-input mono"
+              type="password"
+              x-show="newProject.mode === 'url'"
+              :placeholder="t('project.registerTokenPlaceholder')"
+              x-model="newProject.gitToken"
+            />
+            <button class="btn" :disabled="newProject.busy" @click="registerProject()"
+                    x-text="newProject.busy ? t('action.working') : t('action.register')"></button>
+          </div>
+          <p class="error-text" x-show="newProject.error" x-text="newProject.error"></p>
+        </div>
+        <div class="table-scroll">
+          <table class="env-table">
+            <thead>
               <tr>
-                <td><a class="link" href="#" @click.prevent="go('/ui/projects/' + p.id)" x-text="p.name"></a></td>
-                <td class="mono muted" x-text="p.repo_url"></td>
-                <td class="mono" x-text="p.config.port"></td>
-                <td class="mono" x-text="p.environments.length"></td>
-                <td class="actions">
-                  <button class="btn btn-sm" @click="go('/ui/projects/' + p.id)" x-text="t('action.open')"></button>
-                </td>
+                <th x-text="t('project.col.name')"></th>
+                <th x-text="t('project.col.repo')"></th>
+                <th x-text="t('project.col.port')"></th>
+                <th x-text="t('project.col.environments')"></th>
+                <th></th>
               </tr>
-            </template>
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              <template x-for="p in projects" :key="p.id">
+                <tr>
+                  <td><a class="link" href="#" @click.prevent="go('/ui/projects/' + p.id)" x-text="p.name"></a></td>
+                  <td class="mono muted" x-text="p.repo_url"></td>
+                  <td class="mono" x-text="p.config.port"></td>
+                  <td class="mono" x-text="p.environments.length"></td>
+                  <td class="actions">
+                    <button class="btn btn-sm" @click="go('/ui/projects/' + p.id)" x-text="t('action.open')"></button>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- ================= PROJECT DETAIL ================= -->
@@ -377,34 +443,36 @@
             <template x-if="currentProject().environments.length === 0">
               <p class="muted" x-text="t('project.noBranches')"></p>
             </template>
-            <table class="env-table" x-show="currentProject().environments.length > 0">
-              <thead>
-                <tr>
-                  <th x-text="t('env.col.branch')"></th>
-                  <th x-text="t('env.col.state')"></th>
-                  <th x-text="t('env.col.url')"></th>
-                  <th x-text="t('env.col.updated')"></th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                <template x-for="env in currentProject().environments" :key="env.id">
-                  <tr :class="'row-' + env.state">
-                    <td class="mono">
-                      <a class="link" href="#" @click.prevent="go('/ui/environments/' + env.id)" x-text="env.branch.name"></a>
-                    </td>
-                    <td>
-                      <span class="badge" :class="'badge-' + env.state" x-text="stateLabel(env.state)"></span>
-                    </td>
-                    <td><a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a></td>
-                    <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
-                    <td class="actions">
-                      <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)" x-text="t('action.open')"></button>
-                    </td>
+            <div class="table-scroll">
+              <table class="env-table" x-show="currentProject().environments.length > 0">
+                <thead>
+                  <tr>
+                    <th x-text="t('env.col.branch')"></th>
+                    <th x-text="t('env.col.state')"></th>
+                    <th x-text="t('env.col.url')"></th>
+                    <th x-text="t('env.col.updated')"></th>
+                    <th></th>
                   </tr>
-                </template>
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  <template x-for="env in currentProject().environments" :key="env.id">
+                    <tr :class="'row-' + env.state">
+                      <td class="mono">
+                        <a class="link" href="#" @click.prevent="go('/ui/environments/' + env.id)" x-text="env.branch.name"></a>
+                      </td>
+                      <td>
+                        <span class="badge" :class="'badge-' + env.state" x-text="stateLabel(env.state)"></span>
+                      </td>
+                      <td><a class="mono link" :href="envLink(env)" target="_blank" rel="noopener" x-text="envLinkLabel(env)"></a></td>
+                      <td class="mono muted" x-text="formatTime(env.updated_at)"></td>
+                      <td class="actions">
+                        <button class="btn btn-sm" @click="go('/ui/environments/' + env.id)" x-text="t('action.open')"></button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
           </div>
         </template>
         <template x-if="!currentProject()">
@@ -451,28 +519,30 @@
         <template x-if="queue.length === 0">
           <p class="muted" x-text="t('queue.empty')"></p>
         </template>
-        <table class="env-table" x-show="queue.length > 0">
-          <thead>
-            <tr>
-              <th x-text="t('queue.col.position')"></th>
-              <th x-text="t('queue.col.project')"></th>
-              <th x-text="t('queue.col.branch')"></th>
-              <th x-text="t('queue.col.operator')"></th>
-              <th x-text="t('queue.col.requested')"></th>
-            </tr>
-          </thead>
-          <tbody>
-            <template x-for="(item, i) in queue" :key="item.id">
+        <div class="table-scroll">
+          <table class="env-table" x-show="queue.length > 0">
+            <thead>
               <tr>
-                <td class="mono" x-text="i + 1"></td>
-                <td><a class="link" href="#" @click.prevent="go('/ui/projects/' + item.project_id)" x-text="projectName(item.project_id)"></a></td>
-                <td class="mono" x-text="item.branch"></td>
-                <td class="muted" x-text="item.operator ?? t('audit.anonymous')"></td>
-                <td class="mono muted" x-text="formatTime(item.requested_at)"></td>
+                <th x-text="t('queue.col.position')"></th>
+                <th x-text="t('queue.col.project')"></th>
+                <th x-text="t('queue.col.branch')"></th>
+                <th x-text="t('queue.col.operator')"></th>
+                <th x-text="t('queue.col.requested')"></th>
               </tr>
-            </template>
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              <template x-for="(item, i) in queue" :key="item.id">
+                <tr>
+                  <td class="mono" x-text="i + 1"></td>
+                  <td><a class="link" href="#" @click.prevent="go('/ui/projects/' + item.project_id)" x-text="projectName(item.project_id)"></a></td>
+                  <td class="mono" x-text="item.branch"></td>
+                  <td class="muted" x-text="item.operator ?? t('audit.anonymous')"></td>
+                  <td class="mono muted" x-text="formatTime(item.requested_at)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- ================= AUDIT ================= -->
@@ -497,38 +567,40 @@
             />
           </div>
         </div>
-        <table class="env-table">
-          <thead>
-            <tr>
-              <th x-text="t('audit.col.when')"></th>
-              <th x-text="t('audit.col.kind')"></th>
-              <th x-text="t('audit.col.branch')"></th>
-              <th :title="t('audit.col.deployTimeTitle')" x-text="t('audit.col.deployTime')"></th>
-              <th x-text="t('audit.col.operator')"></th>
-              <th x-text="t('audit.col.detail')"></th>
-            </tr>
-          </thead>
-          <tbody>
-            <template x-for="event in filteredAudit()" :key="event.id">
-              <tr :class="event.kind.toLowerCase().includes('failed') && 'row-failed'">
-                <td class="mono muted" x-text="formatTime(event.occurred_at)"></td>
-                <td><span class="badge badge-audit" x-text="event.kind"></span></td>
-                <td>
-                  <a
-                    class="mono link"
-                    href="#"
-                    @click.prevent="go('/ui/environments/' + event.environment_id)"
-                    :title="t('audit.envTitle', { id: event.environment_id })"
-                    x-text="envRef(event.environment_id)"
-                  ></a>
-                </td>
-                <td class="mono" x-text="formatDuration(auditDuration(event))"></td>
-                <td class="muted" x-text="event.operator ?? t('audit.anonymous')"></td>
-                <td class="mono detail-cell" x-text="event.detail ?? ''"></td>
+        <div class="table-scroll">
+          <table class="env-table">
+            <thead>
+              <tr>
+                <th x-text="t('audit.col.when')"></th>
+                <th x-text="t('audit.col.kind')"></th>
+                <th x-text="t('audit.col.branch')"></th>
+                <th :title="t('audit.col.deployTimeTitle')" x-text="t('audit.col.deployTime')"></th>
+                <th x-text="t('audit.col.operator')"></th>
+                <th x-text="t('audit.col.detail')"></th>
               </tr>
-            </template>
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              <template x-for="event in filteredAudit()" :key="event.id">
+                <tr :class="event.kind.toLowerCase().includes('failed') && 'row-failed'">
+                  <td class="mono muted" x-text="formatTime(event.occurred_at)"></td>
+                  <td><span class="badge badge-audit" x-text="event.kind"></span></td>
+                  <td>
+                    <a
+                      class="mono link"
+                      href="#"
+                      @click.prevent="go('/ui/environments/' + event.environment_id)"
+                      :title="t('audit.envTitle', { id: event.environment_id })"
+                      x-text="envRef(event.environment_id)"
+                    ></a>
+                  </td>
+                  <td class="mono" x-text="formatDuration(auditDuration(event))"></td>
+                  <td class="muted" x-text="event.operator ?? t('audit.anonymous')"></td>
+                  <td class="mono detail-cell" x-text="event.detail ?? ''"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <!-- ================= ONBOARDING WIZARD ================= -->
@@ -794,8 +866,61 @@
         <h1 x-text="t('admin.title')"></h1>
         <div class="project-actions">
           <button class="btn btn-sm" @click="go('/ui/onboarding')" x-text="t('admin.rerunWizard')"></button>
-          <button class="btn btn-sm" @click="downloadBackup()" x-text="t('admin.downloadBackup')"></button>
           <button class="btn btn-sm btn-danger" @click="rotateKey()" x-text="t('admin.rotateKey')"></button>
+        </div>
+
+        <h2 x-text="t('admin.infraTitle')"></h2>
+        <p class="muted" x-text="t('admin.infraHint')"></p>
+        <div class="card">
+          <p class="muted" x-show="infra.loading" x-text="t('admin.infraLoading')"></p>
+          <p class="error-text" x-show="infra.error" x-text="infra.error"></p>
+          <template x-if="infra.status">
+            <div>
+              <dl class="data-grid mono">
+                <dt x-text="t('admin.infraNetwork')"></dt>
+                <dd>
+                  <span class="badge" :class="infra.status.network_exists ? 'badge-running' : 'badge-build_failed'"
+                        x-text="infra.status.network_exists ? t('admin.infraOk') : t('admin.infraMissing')"></span>
+                  <span class="muted" x-text="infra.status.network"></span>
+                </dd>
+                <dt x-text="t('admin.infraTraefik')"></dt>
+                <dd>
+                  <span class="badge" :class="infra.status.traefik_status === 'running' ? 'badge-running' : 'badge-build_failed'"
+                        x-text="infra.status.traefik_status"></span>
+                  <span class="muted" x-text="t('admin.infraPort', { port: infra.status.traefik_http_port })"></span>
+                </dd>
+                <dt x-text="t('admin.infraWake')"></dt>
+                <dd>
+                  <span class="badge" :class="infra.status.self_wiring_ok ? 'badge-running' : 'badge-build_failed'"
+                        x-text="infra.status.self_wiring_ok ? t('admin.infraOk') : t('admin.infraMissing')"></span>
+                  <span class="muted" x-text="t('admin.infraWakeHint')"></span>
+                </dd>
+              </dl>
+              <template x-for="step in infra.status.next_steps ?? []" :key="step">
+                <pre class="mono muted next-step" x-text="step"></pre>
+              </template>
+              <p class="muted" x-show="(infra.status.next_steps ?? []).length === 0"
+                 x-text="t('admin.infraAllGood')"></p>
+              <div class="project-actions">
+                <button class="btn btn-sm" :disabled="infra.loading" @click="loadInfra()" x-text="t('action.recheck')"></button>
+                <button class="btn btn-sm" :disabled="infra.fixing" @click="repairInfra()"
+                        x-text="infra.fixing ? t('action.working') : t('admin.infraRepair')"></button>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <h2 x-text="t('admin.backupTitle')"></h2>
+        <p class="muted" x-text="t('admin.backupHint')"></p>
+        <div class="card">
+          <div class="form-row">
+            <button class="btn btn-sm" @click="downloadBackup()" x-text="t('admin.downloadBackup')"></button>
+            <label class="btn btn-sm btn-danger file-btn">
+              <span x-text="restore.busy ? t('action.working') : t('admin.restoreBackup')"></span>
+              <input type="file" accept=".tar,application/x-tar" :disabled="restore.busy" @change="uploadRestore($event)" />
+            </label>
+          </div>
+          <p class="muted" x-text="t('admin.restoreHint')"></p>
         </div>
 
         <h2 x-text="t('admin.tokensTitle')"></h2>

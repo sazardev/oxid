@@ -88,6 +88,15 @@ pub struct InfraStatus {
     /// labeled for wake-on-request — detection only, see
     /// [`SelfWiringStatus`].
     pub self_wiring: SelfWiringStatus,
+    /// [`SelfWiringStatus::is_fully_wired`], flattened for consumers that
+    /// want the verdict rather than the evidence.
+    ///
+    /// Serialized rather than left to the client to derive because the
+    /// dashboard was already reading a `self_wiring_ok` that no version of
+    /// this struct ever sent: the onboarding wizard's "wired for
+    /// wake-on-request" indicator read `undefined` and therefore showed red
+    /// on daemons that were perfectly wired.
+    pub self_wiring_ok: bool,
     /// Human-readable, actionable instructions for whatever's missing.
     /// Empty when everything is fully wired.
     pub next_steps: Vec<String>,
@@ -142,6 +151,7 @@ impl InfraStatus {
             network_exists,
             traefik_status,
             traefik_http_port,
+            self_wiring_ok: self_wiring.is_fully_wired(),
             self_wiring,
             next_steps,
         }

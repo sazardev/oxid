@@ -3524,6 +3524,57 @@ fn every_dashboard_string_exists_in_every_language() {
     }
 }
 
+/// Keys the UI builds at runtime still have to exist.
+///
+/// `every_dashboard_string_exists_in_every_language` can only see literal
+/// `t('...')` calls. Two constructions escape it: `tn('key', n)`, which
+/// resolves to `key.one`/`key.other` depending on the count, and the bulk
+/// confirmations, which append the action name. Both would fail as a
+/// missing translation in front of a user rather than in CI — the plural
+/// one only when someone happens to select exactly one row.
+#[test]
+fn every_runtime_built_dashboard_key_exists() {
+    let catalog = include_str!("../../web/i18n.js");
+    let markup = include_str!("../../web/index.html");
+    let script = include_str!("../../web/app.js");
+
+    let defined = |key: &str| catalog.contains(&format!("\"{key}\":"));
+
+    let mut checked = 0;
+    for source in [markup, script] {
+        for fragment in source.split("tn('").skip(1) {
+            let Some((key, _)) = fragment.split_once('\'') else {
+                continue;
+            };
+            for form in ["one", "other"] {
+                assert!(
+                    defined(&format!("{key}.{form}")),
+                    "UI builds `{key}.{form}` at runtime but no catalog defines it"
+                );
+            }
+            checked += 1;
+        }
+    }
+    // The bulk confirmations append the action, then a plural form.
+    for action in ["pause", "wake", "destroy"] {
+        for form in ["one", "other"] {
+            assert!(
+                defined(&format!("confirm.bulk.{action}.{form}")),
+                "bulk confirmation `confirm.bulk.{action}.{form}` is undefined"
+            );
+        }
+        assert!(
+            defined(&format!("action.{action}")),
+            "bulk notices name the action with `action.{action}`"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 4,
+        "found only {checked} runtime-built keys to check"
+    );
+}
+
 /// The API answers in the caller's language.
 ///
 /// The dashboard sends `Accept-Language` with whatever its switcher is set

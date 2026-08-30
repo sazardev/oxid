@@ -354,6 +354,88 @@ h2 {
   min-width: 120px;
 }
 
+/* A bordered block for a self-contained control (register a project,
+   infrastructure status, backup/restore) — these are forms and readouts
+   that need to read as one unit rather than float in the page. */
+.card {
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  margin: 10px 0 18px;
+}
+
+.card h2 {
+  margin-top: 0;
+}
+
+.form-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.form-row .token-input {
+  width: auto;
+}
+
+.form-row .grow {
+  flex: 1;
+  min-width: 220px;
+}
+
+.error-text {
+  color: var(--oxid-orange);
+}
+
+/* `next_steps` are multi-line shell/compose snippets — they must keep
+   their newlines and scroll on their own rather than widening the page. */
+.next-step {
+  white-space: pre-wrap;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+
+/* A file input styled as a button: the native control cannot be, so the
+   real input is hidden inside a label that looks like one. */
+.file-btn {
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.file-btn input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* Only appears once something is ticked, so it never takes space from the
+   table it acts on. */
+.bulk-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--oxid-orange);
+}
+
+.col-select {
+  width: 1%;
+  white-space: nowrap;
+}
+
+/* A table with eight columns does not fit a tablet, and letting it widen
+   the document put a horizontal scrollbar under the whole page — including
+   the nav and the stat strip, which are not what anyone was trying to
+   scroll. Confined here instead: the page never scrolls sideways, the
+   table does. */
+.table-scroll {
+  overflow-x: auto;
+}
+
 .env-table {
   width: 100%;
   border-collapse: collapse;

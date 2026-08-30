@@ -66,6 +66,17 @@ function dashboard() {
     historyEvents: [],
     secretsList: [],
     secretForm: { name: "", scope: "global", value: "", branch: "" },
+    // Registering a project from the projects page. The onboarding wizard
+    // has always been able to do this, but it runs once — a team's second
+    // repository had to go through the CLI.
+    newProject: { mode: "url", repoUrl: "", repoDir: "", gitToken: "", busy: false, error: "" },
+    // Infrastructure panel (`GET /api/v1/infra/status`). Also wizard-only
+    // until now, though "is Traefik still wired?" is a daily question.
+    infra: { status: null, loading: false, fixing: false, error: "" },
+    // Bulk selection on the environments table, by environment id.
+    selection: [],
+    bulkBusy: false,
+    restore: { busy: false, fileName: "" },
     filterProject: "",
     filterState: "",
     filterQuery: "",
@@ -132,6 +143,18 @@ function dashboard() {
      */
     t(key, params) {
       return window.OxidI18n.translate(this.locale, key, params);
+    },
+
+    /**
+     * Translates a message whose wording depends on a count.
+     *
+     * Spanish and English both inflect the noun, so "1 environments" and
+     * "1 entornos" are what a single `{count}` string produces — visible in
+     * the bulk-action notice the moment someone selects exactly one row.
+     * Each such key carries a `.one` and an `.other` form.
+     */
+    tn(key, count, params) {
+      return this.t(`${key}.${count === 1 ? "one" : "other"}`, { ...params, count });
     },
 
     /** Switches language and remembers the choice. */
@@ -254,6 +277,7 @@ function dashboard() {
             await this.loadAudit();
             break;
           case "admin":
+            await this.loadInfra();
             break;
           case "onboarding":
             await this.loadSetupStatus();
@@ -853,6 +877,96 @@ function dashboard() {
     // actions
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // bulk actions
+    // ------------------------------------------------------------------
+
+    /**
+     * Bulk actions exist because the single-environment buttons stop
+     * scaling at about the size this product is for: a fifteen-branch team
+     * rendered thirty-two loose `wake`/`destroy` buttons, and "put the
+     * whole preview fleet to sleep for the weekend" was fifteen clicks and
+     * fifteen confirmations.
+     *
+     * Selection follows the filter: what you selected and then filtered
+     * away is dropped rather than silently acted on, so what a bulk button
+     * does is always what the table in front of you shows as ticked.
+     */
+    selectedEnvironments() {
+      const visible = new Set(this.filteredEnvironments().map((env) => env.id));
+      return this.filteredEnvironments().filter(
+        (env) => this.selection.includes(env.id) && visible.has(env.id),
+      );
+    },
+
+    isSelected(env) {
+      return this.selection.includes(env.id);
+    },
+
+    toggleSelected(env) {
+      this.selection = this.isSelected(env)
+        ? this.selection.filter((id) => id !== env.id)
+        : [...this.selection, env.id];
+    },
+
+    allVisibleSelected() {
+      const visible = this.filteredEnvironments();
+      return visible.length > 0 && visible.every((env) => this.isSelected(env));
+    },
+
+    toggleSelectAll() {
+      this.selection = this.allVisibleSelected()
+        ? []
+        : this.filteredEnvironments().map((env) => env.id);
+    },
+
+    /**
+     * Runs `action` over the selection, one at a time.
+     *
+     * Sequential on purpose: each of these is a Docker operation on the
+     * same daemon, and firing fifteen at once buys nothing while making a
+     * partial failure much harder to report. Failures are collected rather
+     * than aborting — stopping halfway through would leave the fleet in a
+     * state nobody asked for.
+     */
+    async bulk(action) {
+      const targets = this.selectedEnvironments();
+      if (targets.length === 0) {
+        return;
+      }
+      if (!(await this.confirmDialog(this.tn(`confirm.bulk.${action}`, targets.length)))) {
+        return;
+      }
+      this.bulkBusy = true;
+      const failed = [];
+      try {
+        for (const env of targets) {
+          try {
+            if (action === "destroy") {
+              await this.apiSend("DELETE", `/api/v1/environments/${env.id}`);
+            } else {
+              await this.apiSend("POST", `/api/v1/environments/${env.id}/${action}`);
+            }
+          } catch (err) {
+            failed.push(`${env.branch.name} (${err.message})`);
+          }
+        }
+      } finally {
+        this.bulkBusy = false;
+        this.selection = [];
+        await this.loadForRoute();
+      }
+      this.showNotice(
+        failed.length === 0
+          ? this.tn("notice.bulkDone", targets.length, { action: this.t(`action.${action}`) })
+          : this.t("notice.bulkPartial", {
+              done: targets.length - failed.length,
+              count: targets.length,
+              failed: failed.join(", "),
+            }),
+      );
+    },
+
     async pause(env) {
       await this.apiSend("POST", `/api/v1/environments/${env.id}/pause`);
       this.showNotice(this.t("notice.paused", { branch: env.branch.name }));
@@ -1113,6 +1227,112 @@ function dashboard() {
         this.showNotice(body.note ?? this.t("notice.keyRotated"));
       } catch (err) {
         this.showNotice(this.t("notice.keyRotationFailed", { error: err.message }));
+      }
+    },
+
+    /**
+     * Registers a project from the projects page.
+     *
+     * The onboarding wizard could always do this, but it runs once and then
+     * gets out of the way — so a team's second repository had no route into
+     * the dashboard at all and had to go through the CLI. Same request body
+     * as the wizard's, deliberately: one way to register a project.
+     */
+    async registerProject() {
+      const mode = this.newProject.mode;
+      const value = (mode === "url" ? this.newProject.repoUrl : this.newProject.repoDir).trim();
+      if (!value) {
+        return;
+      }
+      this.newProject.busy = true;
+      this.newProject.error = "";
+      try {
+        const token = this.newProject.gitToken.trim();
+        const body =
+          mode === "url"
+            ? { repo_url: value, ...(token ? { git_token: token } : {}) }
+            : { repo_dir: value };
+        const project = await (await this.apiSend("POST", "/api/v1/projects", body)).json();
+        this.newProject.repoUrl = "";
+        this.newProject.repoDir = "";
+        this.newProject.gitToken = "";
+        this.showNotice(this.t("notice.registered", { name: project.name }));
+        await this.loadProjectsWithEnvironments();
+      } catch (err) {
+        this.newProject.error =
+          err.message === "unauthorized" ? this.t("notice.masterOnly") : err.message;
+      } finally {
+        this.newProject.busy = false;
+      }
+    },
+
+    /** Reads the Docker network + Traefik wiring scale-to-zero depends on. */
+    async loadInfra() {
+      this.infra.loading = true;
+      this.infra.error = "";
+      try {
+        this.infra.status = await this.apiGet("/api/v1/infra/status");
+      } catch (err) {
+        this.infra.error =
+          err.message === "unauthorized" ? this.t("notice.masterOnly") : err.message;
+      } finally {
+        this.infra.loading = false;
+      }
+    },
+
+    /** Creates whatever `loadInfra` reported missing. */
+    async repairInfra() {
+      this.infra.fixing = true;
+      this.infra.error = "";
+      try {
+        this.infra.status = await (await this.apiSend("POST", "/api/v1/infra/bootstrap", {})).json();
+        this.showNotice(this.t("notice.infraRepaired"));
+      } catch (err) {
+        this.infra.error =
+          err.message === "unauthorized" ? this.t("notice.masterOnly") : err.message;
+      } finally {
+        this.infra.fixing = false;
+      }
+    },
+
+    /**
+     * Uploads a `.tar` from `downloadBackup` for the daemon to apply on its
+     * next restart. Deliberately spelled out in the confirmation: this
+     * replaces the database and every secret, and nothing happens until the
+     * daemon is restarted, which is the part an operator most often misses.
+     */
+    async uploadRestore(event) {
+      const file = event.target.files && event.target.files[0];
+      event.target.value = "";
+      if (!file) {
+        return;
+      }
+      if (!(await this.confirmDialog(this.t("admin.restoreConfirm", { name: file.name })))) {
+        return;
+      }
+      this.restore.busy = true;
+      this.restore.fileName = file.name;
+      try {
+        const res = await fetch(this.apiBase + "/api/v1/backup/restore", {
+          method: "POST",
+          headers: { ...this.authHeaders(), "Content-Type": "application/x-tar" },
+          body: file,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          let message = text || `${res.status}`;
+          try {
+            message = JSON.parse(text).error ?? message;
+          } catch {
+            // not JSON — use the raw text as-is
+          }
+          throw new Error(message);
+        }
+        this.showNotice(this.t("notice.restoreStaged"));
+      } catch (err) {
+        this.showNotice(this.t("notice.restoreFailed", { error: err.message }));
+      } finally {
+        this.restore.busy = false;
       }
     },
 
