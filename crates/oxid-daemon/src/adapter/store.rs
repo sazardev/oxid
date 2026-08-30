@@ -291,6 +291,13 @@ impl SqliteStore {
             // still holding their sockets long after the caller gave up;
             // answering "busy" in 5 lets the load shed instead.
             .acquire_timeout(BUSY_TIMEOUT)
+            // No liveness ping before handing a connection out. That check
+            // earns its keep against a network database whose connections
+            // can be dropped by a peer or a firewall; this one is a local
+            // file that cannot go stale, so the round trip is pure overhead
+            // on every single query — measured at ~17% of single-caller read
+            // throughput.
+            .test_before_acquire(false)
             .connect_with(opts)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;

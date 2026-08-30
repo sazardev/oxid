@@ -35,6 +35,7 @@
         <a href="#why">Why</a>
         <a href="#features">Features</a>
         <a href="#how">How it works</a>
+        <a href="#benchmarks">Benchmarks</a>
         <a href="docs/">Docs</a>
         <a href="#status">Status</a>
         <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
@@ -315,6 +316,120 @@
         <p class="cli-note">
           Every command speaks <code>--json</code> with distinct exit codes for CI pipelines, and
           your shell gets tab completion via <code>oxid completions zsh</code>.
+        </p>
+      </div>
+    </section>
+
+    <section class="section" id="benchmarks">
+      <div class="wrap">
+        <p class="eyebrow">// benchmarks</p>
+        <h2>Measured on real hardware, not asserted.</h2>
+        <p class="bench-lead">
+          Every number below comes from the same box running the same load, once against the
+          commit before the work and once against the commit after — two real binaries, not a
+          flag. Medians of five runs after a warmup, each daemon measured alone so they never
+          competed for CPU.
+        </p>
+
+        <div class="grid-2 bench-grid">
+          <div class="card">
+            <h3><span class="tag tag-muted">The rig</span></h3>
+            <dl class="bench-spec">
+              <dt>CPU</dt><dd>AMD Ryzen 5 3600 — 6 cores / 12 threads, 4.2&nbsp;GHz boost</dd>
+              <dt>Memory</dt><dd>16&nbsp;GB</dd>
+              <dt>Storage</dt><dd>NVMe SSD, btrfs — <em>not</em> a RAM disk</dd>
+              <dt>OS</dt><dd>Linux 7.2, Docker Engine 29.7.2</dd>
+              <dt>Build</dt><dd>Rust 1.98, debug profile</dd>
+            </dl>
+          </div>
+          <div class="card">
+            <h3><span class="tag tag-muted">The database</span></h3>
+            <dl class="bench-spec">
+              <dt>Rows</dt><dd>6,000 environments · 30,000 audit events · 40 projects</dd>
+              <dt>Why that size</dt><dd>A node keeps one row per deploy as history, so this is a team a few months in — not an empty install</dd>
+              <dt>Engine</dt><dd>Embedded SQLite, WAL, pool of 8</dd>
+              <dt>Load</dt><dd>Keep-alive HTTP, so the numbers measure the daemon and not connection setup</dd>
+            </dl>
+          </div>
+        </div>
+
+        <h3 class="bench-subhead">Heartbeat — the busiest path in the system</h3>
+        <p class="bench-note">
+          The proxy calls it on every HTTP request to every environment to keep idle detection
+          honest. It resolves a hostname to its environment and records the visit.
+        </p>
+        <div class="bench-scroll">
+          <table class="bench-table">
+            <thead>
+              <tr><th>Concurrent callers</th><th>Before</th><th>After</th><th>p50 latency</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td>242 req/s</td><td>848 req/s</td><td>3.9ms → 0.9ms</td><td><span class="bench-gain">3.5×</span></td></tr>
+              <tr><td>8</td><td>288 req/s</td><td>3,382 req/s</td><td>26.8ms → 2.0ms</td><td><span class="bench-gain">11.7×</span></td></tr>
+              <tr><td>32</td><td>236 req/s</td><td>4,763 req/s</td><td>125.5ms → 5.7ms</td><td><span class="bench-gain">20.2×</span></td></tr>
+              <tr><td>64</td><td>262 req/s</td><td>4,592 req/s</td><td>233.7ms → 11.7ms</td><td><span class="bench-gain">17.5×</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="bench-note">
+          Throughput used to be flat from 1 to 64 callers while latency climbed in lockstep —
+          the shape of one serialized resource rather than a busy one. It now scales.
+        </p>
+
+        <h3 class="bench-subhead">Authenticated read — the dashboard and <code>oxid status</code></h3>
+        <div class="bench-scroll">
+          <table class="bench-table">
+            <thead>
+              <tr><th>Concurrent callers</th><th>Before</th><th>After</th><th>p50 latency</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td>283 req/s</td><td>270 req/s</td><td>3.2ms → 3.4ms</td><td><span class="bench-flat">unchanged</span></td></tr>
+              <tr><td>8</td><td>356 req/s</td><td>1,044 req/s</td><td>22.0ms → 7.1ms</td><td><span class="bench-gain">2.9×</span></td></tr>
+              <tr><td>32</td><td>366 req/s</td><td>1,267 req/s</td><td>85.9ms → 24.2ms</td><td><span class="bench-gain">3.5×</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="bench-note">
+          A single caller has nothing to overlap with, so it gains nothing — and that row is left
+          in rather than dropped.
+        </p>
+
+        <h3 class="bench-subhead">Where the speed came from</h3>
+        <p class="bench-note">
+          Three changes, separated by re-running the new build with the pool forced back to one
+          connection. At 32 concurrent callers:
+        </p>
+        <div class="grid-2 bench-attribution">
+          <div class="card">
+            <h4>Index the hot column, and stop writing on every request</h4>
+            <p>
+              The hostname lookup was scanning a table that only grows, and the visit timestamp —
+              which feeds a decision measured in minutes — was persisted on every single request.
+              These two ship together and were measured together; the split between them is not
+              something this experiment can tell you.
+            </p>
+            <p class="bench-figure">236 → 1,651 req/s · <span class="bench-gain">7.0×</span></p>
+          </div>
+          <div class="card card-accent">
+            <h4>Open the database as a pool</h4>
+            <p>
+              WAL lets readers and the writer proceed at once, so queries overlap instead of
+              queueing behind one connection. Measured by re-running the same build with the pool
+              forced back to a single connection.
+            </p>
+            <p class="bench-figure">1,651 → 4,763 req/s · <span class="bench-gain">2.9×</span></p>
+          </div>
+        </div>
+        <p class="bench-note">
+          Reads tell the mirror-image story: the index and the write change do nothing for them
+          (366 → 387 req/s), and the entire 3.5× is the pool.
+        </p>
+
+        <p class="bench-footnote">
+          Under the same load, 64 concurrent writers completed 4,800 writes with no lock
+          contention errors. The box was not idle — it was running its owner's usual containers
+          throughout, for both halves of every comparison. Full method and fixture in
+          <a href="https://github.com/sazardev/oxid/blob/main/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a>.
         </p>
       </div>
     </section>

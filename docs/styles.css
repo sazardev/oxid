@@ -1071,3 +1071,138 @@ html, body {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Benchmarks
+   Numbers are the point of this section, so they get the monospace face and
+   tabular figures — columns of digits have to line up to be comparable at a
+   glance, which is the whole reason for showing them as a table.
+   --------------------------------------------------------------------------- */
+
+.bench-lead {
+  max-width: 62ch;
+  color: var(--ash);
+  margin-bottom: 2rem;
+}
+
+.bench-grid {
+  margin-bottom: 3rem;
+}
+
+.bench-spec {
+  display: grid;
+  grid-template-columns: minmax(6.5rem, auto) 1fr;
+  gap: 0.5rem 1rem;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.bench-spec dt {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ash);
+  padding-top: 0.15rem;
+}
+
+.bench-spec dd {
+  margin: 0;
+  color: var(--steel);
+}
+
+.bench-subhead {
+  margin: 2.5rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.bench-note {
+  max-width: 62ch;
+  color: var(--ash);
+  font-size: 0.92rem;
+  margin: 0 0 1.25rem;
+}
+
+/* Wide tables scroll inside their own box rather than pushing the page
+   sideways on a phone. */
+.bench-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  background: var(--iron);
+  margin-bottom: 1rem;
+}
+
+.bench-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.86rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bench-table th {
+  text-align: left;
+  padding: 0.7rem 1rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--ash);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.bench-table td {
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--steel);
+}
+
+.bench-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.bench-table td:nth-child(2) {
+  color: var(--ash);
+}
+
+.bench-gain {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.bench-flat {
+  color: var(--ash);
+}
+
+.bench-attribution {
+  margin-bottom: 1.25rem;
+}
+
+.bench-attribution h4 {
+  margin: 0 0 0.5rem;
+  font-size: 0.98rem;
+}
+
+.bench-attribution p {
+  color: var(--ash);
+  font-size: 0.88rem;
+  margin: 0 0 0.5rem;
+}
+
+.bench-figure {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--steel) !important;
+  margin-top: 0.75rem !important;
+}
+
+.bench-footnote {
+  max-width: 68ch;
+  color: var(--ash);
+  font-size: 0.85rem;
+  border-left: 2px solid var(--border);
+  padding-left: 1rem;
+  margin-top: 2rem;
+}
