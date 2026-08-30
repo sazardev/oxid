@@ -1796,6 +1796,10 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
 /// comment) and persists it as a context, so a fresh zero-config install
 /// goes from "daemon is up" to "CLI works" in one command instead of a
 /// `docker compose logs`/`docker compose cp` hunt.
+///
+/// Only works when run *on the daemon's host*: the endpoint hands over a
+/// credential with no authentication, so it answers nobody else. Run this
+/// there, or read the token out of the daemon's startup log.
 async fn cmd_token_generate(
     client: &Client,
     base: &str,

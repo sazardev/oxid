@@ -1889,6 +1889,50 @@ async fn reconcile_re_suspends_a_container_a_reboot_brought_back_running() {
 }
 
 #[tokio::test]
+async fn reconcile_closes_out_a_deploy_a_restart_interrupted() {
+    // A `Building` row cannot still be building once the daemon has
+    // restarted. Leaving it alone kept it `Building` forever, and since
+    // admission counts `building` as memory already promised, every daemon
+    // killed mid-deploy leaked a reservation nothing was using.
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci).await;
+    let project = cp.register_project(repo.path()).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    // Put it back the way a deploy killed between "row created" and
+    // "container running" would have left it.
+    let mut stuck = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    stuck.state = EnvironmentState::Building;
+    EnvironmentStore::update(&cp.store, &stuck).await.unwrap();
+
+    let errors = cp.reconcile_startup_state().await.unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let after = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.state,
+        EnvironmentState::BuildFailed,
+        "an interrupted deploy must not stay `building`"
+    );
+    // Which is the point: it no longer counts against the node's budget.
+    assert_eq!(
+        cp.store.committed_memory_mb(128, None).await.unwrap(),
+        0,
+        "the interrupted deploy is still reserving memory"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_restarts_a_running_environment_whose_container_stopped() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();

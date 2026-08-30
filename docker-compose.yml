@@ -99,6 +99,22 @@ services:
       #   OXID_API_TOKEN: <openssl rand -hex 32>
       #   OXID_WEBHOOK_SECRET: <openssl rand -hex 32>
       OXID_AUTO_TOKEN: "1"
+      # Lets `oxid token generate` and the dashboard's "generate for me"
+      # button retrieve that generated token over the published port.
+      #
+      # Tied to the `127.0.0.1:8080:8080` publish below, and only safe
+      # because of it: this daemon cannot see which address its port was
+      # published on — inside the container it is always `0.0.0.0`, and
+      # Docker's forwarding makes the operator on this host and a stranger
+      # on the network arrive from the same bridge address. The default
+      # (`loopback`) therefore withholds the token from both, which for a
+      # containerized daemon means everyone. **If you widen the publish
+      # below to all interfaces, remove this line** — otherwise anyone who
+      # can reach the port can ask for the master token, and with it the
+      # database, the AES key that encrypts every secret, and the ability to
+      # deploy. Set it to `off` to disable the endpoint outright and read
+      # the token from `docker compose logs oxid-daemon` instead.
+      OXID_BOOTSTRAP_TOKEN_ACCESS: any
       # Joining Traefik's network switches deployed containers from
       # publishing a host port to being routed by Traefik labels instead
       # (see ControlPlane::with_traefik / SPEC.md §3.2).
@@ -106,10 +122,12 @@ services:
       OXID_DAEMON_URL: http://oxid-daemon:8080
     ports:
       # Direct access for the CLI/dashboard (`OXID_API=http://localhost:8080`).
-      # Bound to loopback deliberately: `GET /api/v1/setup/token` (used by
-      # `oxid token generate` and the onboarding wizard's "generate for me"
-      # button) hands over the auto-generated master token pre-auth — that's
-      # only safe because nothing off this host can reach the port at all.
+      # Bound to loopback deliberately: everything on this port is the
+      # control plane — deploying, destroying, reading secret names. The
+      # daemon no longer *depends* on this binding for the one pre-auth
+      # endpoint that hands over a credential (`GET /api/v1/setup/token`
+      # now answers only callers on the daemon's own host, whatever the
+      # bind), but keeping the port local is still the right default.
       # Widen to `"8080:8080"` (all interfaces) only over a private/trusted
       # network, and prefer setting an explicit OXID_API_TOKEN first if you
       # do. Traefik only routes *deployed environments*, not this control

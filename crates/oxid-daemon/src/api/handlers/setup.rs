@@ -87,7 +87,39 @@ pub async fn bootstrap_token<
     O: ContainerPort + Clone + Send + Sync + 'static,
 >(
     State(state): State<ApiState<G, O>>,
+    peer: Option<Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
 ) -> ApiResult<Json<Value>> {
+    // Handing over the master credential pre-auth is only defensible for a
+    // caller already *on* the host, which is the argument the rest of this
+    // doc comment makes. That argument used to be enforced by the shipped
+    // compose publishing the port on 127.0.0.1 — but `OXID_ADDR` defaults
+    // to `0.0.0.0`, and the startup guard only refuses an open API when no
+    // token exists at all, so `OXID_AUTO_TOKEN=1` on a default bind started
+    // a daemon that answered this to the whole network. Confirmed against a
+    // LAN address: the token came back, and with it `GET /api/v1/backup`
+    // (the database plus the AES master key) and the webhook secret, which
+    // is enough to deploy arbitrary code.
+    //
+    // Enforced here rather than trusted to deployment config, and on the
+    // real peer address rather than `X-Forwarded-For`, which any client can
+    // set.
+    //
+    // Who counts as local is `OXID_BOOTSTRAP_TOKEN_ACCESS`, and it has to be
+    // the operator's answer: a containerized daemon is always bound to
+    // `0.0.0.0`, and Docker's port forwarding makes every caller arrive from
+    // the bridge gateway — the operator on the host and a stranger on the
+    // network are the same address seen from in here. What separates them is
+    // whether the port was published on `127.0.0.1`, which only the operator
+    // knows. The default withholds; the shipped compose, which publishes on
+    // loopback, opts in.
+    let peer_ip = peer.as_ref().map(|Extension(peer)| peer.ip());
+    if !state.bootstrap_access.permits(peer_ip) {
+        return Err(ApiError::not_found(concat!(
+            "the bootstrap token is not served to this caller (see ",
+            "OXID_BOOTSTRAP_TOKEN_ACCESS); read it from the daemon's startup logs ",
+            "or its data directory instead"
+        )));
+    }
     if state.auto_token
         && let Some(token) = state.api_token.clone()
     {

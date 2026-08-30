@@ -250,21 +250,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(oxid_daemon::service::backup::run(cp.clone(), backup_config));
     }
 
-    let (webhook_secret, api_token, auto_token) = resolve_bootstrap_credentials(&data_dir_path)?;
-    enforce_startup_security_posture(&addr, api_token.as_ref());
-    let allow_restore = std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1");
-    let rate_limit = rate_limit_from_env();
-    let app = router(ApiState {
+    let app = router(api_state_from_env(cp, data_dir_path, &addr)?);
+    lower_oom_score();
+    serve(app, &addr, &data_dir, gc_interval_secs).await
+}
+
+/// Gathers the API's environment-driven configuration in one place, and
+/// enforces the startup security posture while it has the credentials in
+/// hand (see [`enforce_startup_security_posture`]).
+///
+/// # Errors
+/// Propagates a failure to resolve or persist the bootstrap credentials.
+fn api_state_from_env<G, O>(
+    cp: oxid_daemon::ControlPlane<G, O>,
+    data_dir: std::path::PathBuf,
+    addr: &str,
+) -> Result<ApiState<G, O>, Box<dyn std::error::Error>>
+where
+    G: oxid_core::GitPort + Clone + Send + Sync + 'static,
+    O: oxid_core::ContainerPort + Clone + Send + Sync + 'static,
+{
+    let (webhook_secret, api_token, auto_token) = resolve_bootstrap_credentials(&data_dir)?;
+    enforce_startup_security_posture(addr, api_token.as_ref());
+    Ok(ApiState {
         cp,
         webhook_secret,
         api_token,
-        data_dir: data_dir_path,
-        allow_restore,
-        rate_limit,
+        data_dir,
+        allow_restore: std::env::var("OXID_ALLOW_RESTORE").as_deref() == Ok("1"),
+        rate_limit: rate_limit_from_env(),
         auto_token,
-    });
-    lower_oom_score();
-    serve(app, &addr, &data_dir, gc_interval_secs).await
+        bootstrap_access: oxid_daemon::api::BootstrapAccess::from_env(),
+    })
 }
 
 /// Binds `addr` and serves `app` — plain HTTP, or HTTPS if
@@ -597,34 +614,305 @@ async fn load_tls_config()
     Ok(Some(config))
 }
 
+/// Every SQLite database file begins with this, NUL included. Enough to
+/// tell a database from a truncated upload, an HTML error page a proxy
+/// substituted, or a tar of the wrong thing entirely.
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
 /// If `<data_dir>/.restore-pending.tar` exists (staged by a prior
-/// `POST /api/v1/backup/restore`), extracts `audit.sqlite`/`secret.key`
-/// from it over the real files and removes the marker — applied here,
-/// before `SqliteStore::open` runs, so the restore is never attempted
-/// against an already-open pool.
+/// `POST /api/v1/backup/restore`), replaces `audit.sqlite`/`secret.key`
+/// with the copies inside it — applied here, before `SqliteStore::open`
+/// runs, so the restore is never attempted against an already-open pool.
+///
+/// Nothing about the upload is trusted. It is unpacked beside the real
+/// files and checked first, and only then swapped in; the database it
+/// replaces is kept as `audit.sqlite.pre-restore`. This used to overwrite
+/// the live database with whatever bytes were in the archive and then
+/// delete the marker, so a truncated or wrong-format upload destroyed the
+/// only good copy *and* left a daemon that could no longer start — the
+/// failure mode of a disaster-recovery path that fires exactly when the
+/// operator has nothing else left.
+///
+/// A rejected archive is moved to `.restore-failed.tar` rather than
+/// deleted, so it can be looked at, and the daemon starts normally on the
+/// database it already had.
 fn apply_staged_restore(data_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let staged_path = data_dir.join(".restore-pending.tar");
     if !staged_path.exists() {
         return Ok(());
     }
     tracing::info!(path = %staged_path.display(), "applying staged restore");
-    let file = std::fs::File::open(&staged_path)?;
-    let mut archive = tar::Archive::new(file);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let name = entry.path()?.to_string_lossy().into_owned();
-        if name == "audit.sqlite" || name == "secret.key" {
-            entry.unpack(data_dir.join(&name))?;
+
+    match stage_restore_files(data_dir, &staged_path) {
+        Ok(staged) => {
+            swap_in_restored_files(data_dir, &staged)?;
+            std::fs::remove_file(&staged_path)?;
+            tracing::info!("restore applied; starting normally");
+        }
+        Err(reason) => {
+            let rejected = data_dir.join(".restore-failed.tar");
+            let _ = std::fs::rename(&staged_path, &rejected);
+            tracing::error!(
+                reason = %reason,
+                archive = %rejected.display(),
+                "staged restore rejected; keeping the existing database and starting normally"
+            );
         }
     }
-    std::fs::remove_file(&staged_path)?;
-    tracing::info!("restore applied; starting normally");
+    Ok(())
+}
+
+/// Files unpacked from a staged archive and verified, not yet swapped in.
+struct StagedRestore {
+    database: std::path::PathBuf,
+    secret_key: Option<std::path::PathBuf>,
+}
+
+/// Unpacks the archive next to the real files and checks what came out.
+/// Returns an error describing what was wrong rather than a panic or a
+/// half-applied restore.
+fn stage_restore_files(
+    data_dir: &std::path::Path,
+    staged_path: &std::path::Path,
+) -> Result<StagedRestore, String> {
+    let file = std::fs::File::open(staged_path).map_err(|e| format!("cannot read archive: {e}"))?;
+    let mut archive = tar::Archive::new(file);
+    let mut database = None;
+    let mut secret_key = None;
+
+    for entry in archive
+        .entries()
+        .map_err(|e| format!("not a readable tar archive: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| format!("unreadable entry in archive: {e}"))?;
+        let name = entry
+            .path()
+            .map_err(|e| format!("unreadable entry name: {e}"))?
+            .to_string_lossy()
+            .into_owned();
+        // Matched by exact name, never by suffix or by the path inside the
+        // archive: an entry called `../../etc/anything` must not be a way
+        // to write outside the data directory.
+        let target = match name.as_str() {
+            "audit.sqlite" => data_dir.join(".restore-staged-audit.sqlite"),
+            "secret.key" => data_dir.join(".restore-staged-secret.key"),
+            _ => continue,
+        };
+        entry
+            .unpack(&target)
+            .map_err(|e| format!("cannot unpack `{name}`: {e}"))?;
+        if name == "audit.sqlite" {
+            database = Some(target);
+        } else {
+            secret_key = Some(target);
+        }
+    }
+
+    let database = database.ok_or_else(|| "archive contains no `audit.sqlite`".to_owned())?;
+    let header = std::fs::read(&database)
+        .map_err(|e| format!("cannot read the unpacked database: {e}"))?
+        .into_iter()
+        .take(SQLITE_MAGIC.len())
+        .collect::<Vec<_>>();
+    if header != SQLITE_MAGIC {
+        return Err("`audit.sqlite` in the archive is not a SQLite database".to_owned());
+    }
+    Ok(StagedRestore {
+        database,
+        secret_key,
+    })
+}
+
+/// Swaps verified files in, keeping what they replace.
+fn swap_in_restored_files(
+    data_dir: &std::path::Path,
+    staged: &StagedRestore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live = data_dir.join("audit.sqlite");
+    if live.exists() {
+        std::fs::rename(&live, data_dir.join("audit.sqlite.pre-restore"))?;
+    }
+    std::fs::rename(&staged.database, &live)?;
+    // The write-ahead log and shared-memory file belong to the database
+    // being replaced. Left behind, SQLite would find them beside a
+    // database they were never written for.
+    for suffix in ["-wal", "-shm"] {
+        let path = data_dir.join(format!("audit.sqlite{suffix}"));
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    if let Some(key) = &staged.secret_key {
+        let live_key = data_dir.join("secret.key");
+        if live_key.exists() {
+            std::fs::rename(&live_key, data_dir.join("secret.key.pre-restore"))?;
+        }
+        std::fs::rename(key, &live_key)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_is_loopback, credential, generate_hex_secret};
+    use super::{apply_staged_restore, bind_is_loopback, credential, generate_hex_secret};
+
+    /// A data directory holding a database with `marker` in it, plus a
+    /// `secret.key`. The marker is how a test tells which database
+    /// survived a restore.
+    fn data_dir_with_database(marker: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit.sqlite"), sqlite_file(marker)).unwrap();
+        std::fs::write(dir.path().join("secret.key"), b"live-key").unwrap();
+        dir
+    }
+
+    /// Bytes that begin like a real SQLite database, carrying a marker.
+    fn sqlite_file(marker: &str) -> Vec<u8> {
+        let mut bytes = super::SQLITE_MAGIC.to_vec();
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes
+    }
+
+    /// Stages `entries` as `.restore-pending.tar` in `dir`.
+    fn stage(dir: &std::path::Path, entries: &[(&str, Vec<u8>)]) {
+        let file = std::fs::File::create(dir.join(".restore-pending.tar")).unwrap();
+        let mut builder = tar::Builder::new(file);
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, body.as_slice())
+                .unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn a_staged_restore_replaces_the_database_and_keeps_the_old_one() {
+        let dir = data_dir_with_database("live");
+        stage(
+            dir.path(),
+            &[
+                ("audit.sqlite", sqlite_file("restored")),
+                ("secret.key", b"restored-key".to_vec()),
+            ],
+        );
+
+        apply_staged_restore(dir.path()).unwrap();
+
+        let restored = std::fs::read(dir.path().join("audit.sqlite")).unwrap();
+        assert_eq!(restored, sqlite_file("restored"));
+        assert_eq!(
+            std::fs::read(dir.path().join("secret.key")).unwrap(),
+            b"restored-key"
+        );
+        // What it replaced is kept: a restore that turns out to be the
+        // wrong snapshot must not be the end of the story.
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.sqlite.pre-restore")).unwrap(),
+            sqlite_file("live")
+        );
+        assert!(!dir.path().join(".restore-pending.tar").exists());
+    }
+
+    #[test]
+    fn a_restore_that_is_not_a_database_leaves_the_live_one_alone() {
+        // The failure that matters: this path runs when the operator has
+        // already lost something. Overwriting the last good database with a
+        // truncated upload — and then failing to start on it — used to be
+        // the outcome.
+        let dir = data_dir_with_database("live");
+        stage(
+            dir.path(),
+            &[("audit.sqlite", b"<html>404 Not Found".to_vec())],
+        );
+
+        apply_staged_restore(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.sqlite")).unwrap(),
+            sqlite_file("live"),
+            "the live database was overwritten by an invalid upload"
+        );
+        assert!(!dir.path().join(".restore-pending.tar").exists());
+        // Kept rather than deleted, so it can be looked at.
+        assert!(dir.path().join(".restore-failed.tar").exists());
+    }
+
+    #[test]
+    fn a_restore_missing_a_database_is_rejected() {
+        let dir = data_dir_with_database("live");
+        stage(dir.path(), &[("secret.key", b"only-a-key".to_vec())]);
+
+        apply_staged_restore(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.sqlite")).unwrap(),
+            sqlite_file("live")
+        );
+        // The key must not be swapped in on its own: it would decrypt
+        // nothing in the database that is still there.
+        assert_eq!(
+            std::fs::read(dir.path().join("secret.key")).unwrap(),
+            b"live-key"
+        );
+    }
+
+    #[test]
+    fn only_the_two_expected_entries_are_ever_unpacked() {
+        // An uploaded archive decides its own entry names, so they are
+        // matched exactly and the destination path is built by the daemon
+        // rather than taken from the entry — which is what makes a name
+        // aimed somewhere else structurally unable to land there.
+        let dir = data_dir_with_database("live");
+        stage(
+            dir.path(),
+            &[
+                ("etc/passwd", b"root:x:0:0".to_vec()),
+                ("audit.sqlite.bak", sqlite_file("decoy")),
+                ("nested/audit.sqlite", sqlite_file("decoy")),
+                ("audit.sqlite", sqlite_file("restored")),
+            ],
+        );
+
+        apply_staged_restore(dir.path()).unwrap();
+
+        assert!(!dir.path().join("etc").exists());
+        assert!(!dir.path().join("nested").exists());
+        assert!(!dir.path().join("audit.sqlite.bak").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.sqlite")).unwrap(),
+            sqlite_file("restored")
+        );
+    }
+
+    #[test]
+    fn a_restore_clears_the_write_ahead_log_of_the_database_it_replaced() {
+        // The `-wal` beside the old database was written for that database,
+        // not the one arriving.
+        let dir = data_dir_with_database("live");
+        std::fs::write(dir.path().join("audit.sqlite-wal"), b"old wal").unwrap();
+        std::fs::write(dir.path().join("audit.sqlite-shm"), b"old shm").unwrap();
+        stage(dir.path(), &[("audit.sqlite", sqlite_file("restored"))]);
+
+        apply_staged_restore(dir.path()).unwrap();
+
+        assert!(!dir.path().join("audit.sqlite-wal").exists());
+        assert!(!dir.path().join("audit.sqlite-shm").exists());
+    }
+
+    #[test]
+    fn no_staged_archive_is_a_no_op() {
+        let dir = data_dir_with_database("live");
+        apply_staged_restore(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("audit.sqlite")).unwrap(),
+            sqlite_file("live")
+        );
+        assert!(!dir.path().join("audit.sqlite.pre-restore").exists());
+    }
 
     #[test]
     fn loopback_literals_are_loopback() {

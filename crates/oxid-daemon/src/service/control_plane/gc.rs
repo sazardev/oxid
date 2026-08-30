@@ -107,14 +107,38 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             std::collections::HashMap::new();
 
         for mut env in self.store.list_all_environments().await? {
+            // A `Building` row cannot still be building: nothing survived
+            // this process's restart, so the deploy that wrote it is gone.
+            // Left alone it stayed `Building` forever — and admission
+            // counts `building` as memory this host has promised, so every
+            // daemon killed mid-deploy leaked a reservation nothing was
+            // using, until enough of them accumulated to refuse deploys the
+            // node had room for. Exactly the failure `Paused` used to
+            // cause, in a state nobody thought to sweep.
+            //
+            // Recorded as failed rather than deleted: someone pushed, and
+            // the honest answer is that their deploy was interrupted, not
+            // that it never happened.
+            if env.state == EnvironmentState::Building {
+                let now = OffsetDateTime::now_utc();
+                if env.transition(StateTransition::BuildFailed, now).is_ok() {
+                    match EnvironmentStore::update(&self.store, &env).await {
+                        Ok(()) => tracing::warn!(
+                            environment_id = %env.id,
+                            branch = %env.branch.name,
+                            "environment was still `building` at startup;                              its deploy was interrupted by a restart"
+                        ),
+                        Err(e) => errors.push((env.id, e.to_string())),
+                    }
+                }
+                continue;
+            }
             // Nothing to reconcile for a row that never had a healthy
-            // container: `Building` is mid-flight, `Destroyed` is gone, and
-            // `BuildFailed` is a record of a deploy that never came up.
+            // container: `Destroyed` is gone, and `BuildFailed` is a record
+            // of a deploy that never came up.
             if matches!(
                 env.state,
-                EnvironmentState::Destroyed
-                    | EnvironmentState::Building
-                    | EnvironmentState::BuildFailed
+                EnvironmentState::Destroyed | EnvironmentState::BuildFailed
             ) {
                 continue;
             }

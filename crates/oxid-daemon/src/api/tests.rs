@@ -256,6 +256,7 @@ async fn test_app() -> (Router, FakeOci) {
             allow_restore: true,
             rate_limit: None,
             auto_token: false,
+            bootstrap_access: BootstrapAccess::Loopback,
         }),
         oci,
     )
@@ -282,6 +283,7 @@ async fn test_app_with_traefik() -> (Router, FakeOci) {
             allow_restore: true,
             rate_limit: None,
             auto_token: false,
+            bootstrap_access: BootstrapAccess::Loopback,
         }),
         oci,
     )
@@ -305,6 +307,7 @@ async fn test_app_with_token(token: &str) -> Router {
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     })
 }
 
@@ -338,6 +341,7 @@ async fn test_app_with_admission_control(
             allow_restore: true,
             rate_limit: None,
             auto_token: false,
+            bootstrap_access: BootstrapAccess::Loopback,
         }),
         oci,
     )
@@ -626,6 +630,7 @@ async fn test_app_auto_token(token: &str) -> Router {
         allow_restore: true,
         rate_limit: None,
         auto_token: true,
+        bootstrap_access: BootstrapAccess::Loopback,
     })
 }
 
@@ -720,6 +725,7 @@ async fn webhook_secret_reports_404_when_nothing_is_configured() {
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
     let (status, body) = json_request(&app, "GET", "/api/v1/setup/webhook-secret", json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -748,6 +754,7 @@ async fn test_app_with_git_and_token(git: FakeGit, api_token: Option<&str>) -> R
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     })
 }
 
@@ -1145,6 +1152,7 @@ async fn two_project_app() -> Router {
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     })
 }
 
@@ -1468,6 +1476,7 @@ async fn rotate_key_requires_master_and_keeps_secrets_readable() {
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
 
     json_request_with_auth(
@@ -1553,6 +1562,7 @@ async fn rate_limit_blocks_a_burst_past_its_configured_size() {
         // request must be rejected.
         rate_limit: Some((1, 2)),
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
 
     let mut statuses = Vec::new();
@@ -1599,6 +1609,178 @@ async fn json_request_from_ip(
     (status, bytes.to_vec())
 }
 
+/// Builds a router whose auto-generated master token the bootstrap
+/// endpoint would hand over, under a given access policy.
+async fn auto_token_router_with(access: BootstrapAccess) -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some("auto-generated-master".to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: false,
+        rate_limit: None,
+        auto_token: true,
+        bootstrap_access: access,
+    })
+}
+
+/// Builds a router whose auto-generated master token the bootstrap
+/// endpoint would hand over.
+async fn auto_token_router() -> Router {
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_readiness_check(false);
+    router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some("auto-generated-master".to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: false,
+        rate_limit: None,
+        auto_token: true,
+        bootstrap_access: BootstrapAccess::Loopback,
+    })
+}
+
+#[tokio::test]
+async fn the_bootstrap_token_is_served_to_a_caller_on_this_host() {
+    let app = auto_token_router().await;
+    let (status, body) = json_request_from_ip(
+        &app,
+        "GET",
+        "/api/v1/setup/token",
+        json!({}),
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["token"], "auto-generated-master");
+}
+
+#[tokio::test]
+async fn the_bootstrap_token_is_never_served_off_host() {
+    // This endpoint hands over the master credential with no authentication
+    // at all, which is only defensible for a caller already on the host.
+    // That used to be enforced only by the shipped compose publishing on
+    // 127.0.0.1, while `OXID_ADDR` defaults to `0.0.0.0` — so
+    // `OXID_AUTO_TOKEN=1` on a default bind answered this to the whole
+    // network, and the token it returns opens `GET /api/v1/backup` (the
+    // database and the AES master key) and the webhook secret.
+    let app = auto_token_router().await;
+    for peer in ["192.168.1.95", "10.0.0.4", "8.8.8.8"] {
+        let (status, body) = json_request_from_ip(
+            &app,
+            "GET",
+            "/api/v1/setup/token",
+            json!({}),
+            peer.parse().unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "peer {peer} was served");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("auto-generated-master"),
+            "peer {peer} was given the token in the error body"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_bootstrap_token_denies_a_caller_whose_address_is_unknown() {
+    // No `ConnectInfo` means nothing looked at where the request came from.
+    // The only safe reading of that is "not local".
+    let app = auto_token_router().await;
+    let (status, _) = json_request(&app, "GET", "/api/v1/setup/token", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_forwarded_for_header_cannot_fake_being_local() {
+    // Any client can set this header; only the peer address is evidence.
+    let app = auto_token_router().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/api/v1/setup/token")
+        .header("x-forwarded-for", "127.0.0.1")
+        .header("x-real-ip", "127.0.0.1")
+        .header("forwarded", "for=127.0.0.1")
+        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+            "192.168.1.95".parse().unwrap(),
+            0,
+        )))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_containerized_daemon_can_still_serve_its_operator() {
+    // Docker rewrites the peer address: with the port published on
+    // 127.0.0.1, the operator's own request still arrives from the bridge
+    // gateway, so a loopback-only rule refuses the very person it is for.
+    // Confirmed against a real container — `oxid token generate` and the
+    // dashboard's "generate for me" button both 404'd. The daemon cannot
+    // tell that case from a stranger's request forwarded in from a public
+    // publish, so the operator says which it is.
+    let app = auto_token_router_with(BootstrapAccess::Any).await;
+    let (status, body) = json_request_from_ip(
+        &app,
+        "GET",
+        "/api/v1/setup/token",
+        json!({}),
+        "172.17.0.1".parse().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["token"], "auto-generated-master");
+}
+
+#[tokio::test]
+async fn the_bootstrap_token_can_be_switched_off_entirely() {
+    let app = auto_token_router_with(BootstrapAccess::Off).await;
+    for peer in ["127.0.0.1", "172.17.0.1", "192.168.1.95"] {
+        let (status, _) = json_request_from_ip(
+            &app,
+            "GET",
+            "/api/v1/setup/token",
+            json!({}),
+            peer.parse().unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "peer {peer} was served");
+    }
+}
+
+#[test]
+fn the_access_policy_defaults_to_withholding() {
+    // Anything unrecognized must land on the safe side, not be treated as
+    // permission.
+    assert_eq!(BootstrapAccess::default(), BootstrapAccess::Loopback);
+    assert!(!BootstrapAccess::Loopback.permits(None));
+    assert!(!BootstrapAccess::Loopback.permits(Some("172.17.0.1".parse().unwrap())));
+    assert!(BootstrapAccess::Loopback.permits(Some("127.0.0.1".parse().unwrap())));
+    assert!(BootstrapAccess::Loopback.permits(Some("::1".parse().unwrap())));
+    assert!(!BootstrapAccess::Off.permits(Some("127.0.0.1".parse().unwrap())));
+    assert!(BootstrapAccess::Any.permits(Some("8.8.8.8".parse().unwrap())));
+}
+
 /// Two clients behind the same daemon get independent token buckets: IP A
 /// exhausting its burst must not consume any of IP B's allowance (the
 /// pre-per-IP global bucket failed exactly this — one noisy host throttled
@@ -1623,6 +1805,7 @@ async fn rate_limit_keys_per_client_ip_when_connect_info_present() {
         // 1 request/sec sustained, burst of 2 per IP.
         rate_limit: Some((1, 2)),
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
 
     let ip_a: std::net::IpAddr = "10.0.0.1".parse().unwrap();
@@ -1715,6 +1898,7 @@ async fn backup_produces_a_tar_with_a_valid_sqlite_snapshot_and_the_secret_key()
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
     // Give the backup something real to capture.
     json_request(
@@ -1763,6 +1947,7 @@ async fn restore_is_rejected_when_not_allowed() {
         allow_restore: false,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
 
     let (status, _) = raw_request(&app, "POST", "/api/v1/backup/restore", vec![1, 2, 3]).await;
@@ -1791,6 +1976,7 @@ async fn restore_stages_the_upload_without_touching_the_live_database() {
         allow_restore: true,
         rate_limit: None,
         auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
     });
 
     let (status, body) = raw_request(&app, "GET", "/api/v1/backup", Vec::new()).await;

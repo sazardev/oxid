@@ -25,8 +25,54 @@ is the breaking position.
   and a wave that reports the host is full still stops the drain, so a large
   deploy is not starved by a stream of small ones behind it.
 
+### Security
+
+- **The daemon handed its master token to anyone who asked.**
+  `GET /api/v1/setup/token` is pre-auth by design, and its safety rested on
+  the shipped compose publishing the port on `127.0.0.1` — but `OXID_ADDR`
+  defaults to `0.0.0.0`, and the startup guard only refuses an open API when
+  *no* token exists. `OXID_AUTO_TOKEN=1` therefore started a daemon that
+  answered this to the whole network. Verified against a LAN address: the
+  token came back, and with it `GET /api/v1/backup` (the database and the
+  AES master key used to encrypt every secret) and the webhook secret —
+  enough to deploy arbitrary code. Who the endpoint answers is now
+  `OXID_BOOTSTRAP_TOKEN_ACCESS`, and it defaults to withholding.
+
+  Making it a setting rather than a rule is the point: a containerized
+  daemon is always bound to `0.0.0.0`, and Docker's forwarding makes the
+  operator on the host and a stranger on the network arrive from the same
+  bridge address — what separates them is whether the port was published on
+  `127.0.0.1`, which only the operator knows. `loopback` (the default)
+  serves callers on the daemon's own host, judged on the real peer address
+  and never on `X-Forwarded-For`, denying when no peer address is available
+  at all; `any` serves anyone who can reach the port, which the shipped
+  compose sets because it publishes on loopback; `off` disables it.
+- **The pre-auth onboarding routes are rate-limited.** They sat outside the
+  limiter, leaving the two endpoints an unauthenticated caller can reach by
+  design — one of which hands over a credential — as the only ones on the
+  daemon nothing throttled.
+
 ### Fixed
 
+- **A restore could destroy the database it was meant to rescue.**
+  `apply_staged_restore` wrote whatever bytes the uploaded archive held over
+  the live `audit.sqlite` and deleted the marker before finding out whether
+  the result opened. A truncated or wrong-format upload took out the last
+  good copy and left a daemon that could no longer start — on the path that
+  runs precisely when the operator has nothing else left. The archive is now
+  unpacked beside the real files and checked before anything is swapped in,
+  what it replaces is kept as `audit.sqlite.pre-restore`, the write-ahead
+  log of the replaced database is cleared, and a rejected archive is set
+  aside as `.restore-failed.tar` while the daemon starts normally on the
+  database it already had. The startup half of restore had no test coverage
+  at all; it now has six.
+- **A deploy interrupted by a restart stayed `Building` forever.** Startup
+  reconciliation skipped those rows, and admission counts `building` as
+  memory the host has promised — so every daemon killed mid-deploy leaked a
+  reservation nothing was using, until enough accumulated to refuse deploys
+  the node had room for. The same failure `Paused` used to cause, in a state
+  nobody swept. They are now recorded as `BuildFailed`, which is what
+  actually happened to them.
 - **Every deploy did its own `git fetch`, one at a time.** A fetch brings
   down every branch of a repository, so the first of a burst had already
   retrieved what the rest were about to ask for — and they repeated it

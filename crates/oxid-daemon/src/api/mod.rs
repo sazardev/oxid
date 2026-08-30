@@ -114,6 +114,68 @@ pub struct ApiState<
     /// point at the exact retrieval command (`docker compose logs …`)
     /// instead of generic "ask your operator" advice.
     pub auto_token: bool,
+    /// Who `GET /api/v1/setup/token` will hand the auto-generated master
+    /// token to. See [`BootstrapAccess`].
+    pub bootstrap_access: BootstrapAccess,
+}
+
+/// Who may retrieve the auto-generated master token pre-auth.
+///
+/// The endpoint exists so a fresh install can self-serve instead of digging
+/// through `docker compose logs`, and it is safe exactly as long as only
+/// the operator can reach it. Whether that holds is a property of *how the
+/// port was published*, which the daemon cannot see: inside a container it
+/// is always bound to `0.0.0.0` and a connection forwarded in from anywhere
+/// arrives from the bridge gateway, indistinguishable from one the operator
+/// made on the host. So the answer is the operator's to give, and the
+/// default withholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BootstrapAccess {
+    /// Only callers connecting from the daemon's own host. Correct when the
+    /// daemon runs as a plain process; a containerized daemon will refuse
+    /// even the operator, because Docker's port forwarding rewrites the
+    /// peer address. The default: it withholds a credential rather than
+    /// assume a topology.
+    #[default]
+    Loopback,
+    /// Any caller that can reach the port. For a containerized daemon whose
+    /// port the operator has published privately — as the shipped
+    /// `docker-compose.yml` does, on `127.0.0.1` — where "can reach the
+    /// port" already means "is on this host".
+    Any,
+    /// Nobody. The token is retrieved from the daemon's logs or data
+    /// directory instead.
+    Off,
+}
+
+impl BootstrapAccess {
+    /// Reads `OXID_BOOTSTRAP_TOKEN_ACCESS`; anything unrecognized (or
+    /// unset) is the withholding default.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("OXID_BOOTSTRAP_TOKEN_ACCESS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "any" => Self::Any,
+            "off" => Self::Off,
+            _ => Self::Loopback,
+        }
+    }
+
+    /// Whether a caller connecting from `peer` may be served.
+    #[must_use]
+    pub fn permits(self, peer: Option<std::net::IpAddr>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Any => true,
+            // A missing peer address means nothing looked at where the
+            // request came from; the only safe reading is "not local".
+            Self::Loopback => peer.is_some_and(|ip| ip.is_loopback()),
+        }
+    }
 }
 
 /// Builds the API router. Every route except `/health`, `/webhooks/github`,
@@ -227,6 +289,21 @@ pub fn router<
             require_bearer_token::<G, O>,
         ));
 
+    // The two routes an unauthenticated caller may reach on purpose, kept
+    // together so the rate limiter below can cover them as a unit.
+    //
+    // `setup/status` is a non-sensitive onboarding probe (booleans only —
+    // see `handlers::setup::setup_status`), called before any token exists
+    // so the wizard knows what to ask for. `setup/token` hands over the
+    // auto-generated master token so the CLI (`oxid token generate`) and
+    // the wizard can self-serve instead of hunting through `docker compose
+    // logs`; it never reveals an explicitly-configured one, and it now
+    // answers only callers on the daemon's own host.
+    let mut public_setup = Router::new()
+        .route("/api/v1/setup/status", get(handlers::setup::setup_status))
+        .route("/api/v1/setup/token", get(handlers::setup::bootstrap_token))
+        .with_state(state.clone());
+
     if let Some((per_second, burst)) = rate_limit {
         // `tower_governor`'s `per_second(n)` is a false friend: despite the
         // name, it sets the replenish *period* to `n` seconds per token
@@ -237,29 +314,26 @@ pub fn router<
         // doctor` and the dashboard in 429s well after traffic stopped.
         // `.period()` takes the actual per-token interval, so invert here.
         let per_second = u32::try_from(per_second.max(1)).unwrap_or(u32::MAX);
-        let governor_conf = GovernorConfigBuilder::default()
-            .period(Duration::from_secs(1) / per_second)
-            .burst_size(burst.max(1))
-            .key_extractor(ClientIpKeyExtractor)
-            .finish()
-            .expect("valid rate limit config");
-        protected = protected.layer(GovernorLayer::new(governor_conf));
+        let bucket = || {
+            GovernorConfigBuilder::default()
+                .period(Duration::from_secs(1) / per_second)
+                .burst_size(burst.max(1))
+                .key_extractor(ClientIpKeyExtractor)
+                .finish()
+                .expect("valid rate limit config")
+        };
+        protected = protected.layer(GovernorLayer::new(bucket()));
+        // The pre-auth onboarding routes get a bucket of their own. They
+        // used to sit outside the limiter entirely, which left the two
+        // endpoints an unauthenticated caller can reach *by design* — one
+        // of which hands over a credential — as the only ones on the daemon
+        // nothing throttled.
+        public_setup = public_setup.layer(GovernorLayer::new(bucket()));
     }
 
     Router::new()
         .route("/api/v1/health", get(health))
-        // Public, pre-auth onboarding probe: non-sensitive booleans only
-        // (see `handlers::setup::setup_status`). The wizard calls this
-        // before any token exists to decide what to ask for.
-        .route("/api/v1/setup/status", get(handlers::setup::setup_status))
-        // Public, pre-auth: hands over the auto-generated master token so
-        // the CLI (`oxid token generate`) and the onboarding wizard can
-        // self-serve instead of hunting through `docker compose logs`/the
-        // data volume (see `handlers::setup::bootstrap_token` for the trust
-        // argument — safe specifically because it never reveals an
-        // explicitly-configured token, only the auto-generated one that's
-        // already retrievable via those other channels).
-        .route("/api/v1/setup/token", get(handlers::setup::bootstrap_token))
+        .merge(public_setup)
         .route("/", get(dashboard_index))
         .route("/index.html", get(dashboard_index))
         .route("/style.css", get(dashboard_style))
