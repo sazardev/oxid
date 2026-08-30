@@ -49,13 +49,17 @@ h2 {
   padding-bottom: 6px;
 }
 
+/* Wraps rather than overflowing. The bar holds a brand, seven nav links and
+   a connection strip; at tablet widths that no longer fits on one line, and
+   pushing past the viewport gives the whole page a horizontal scrollbar. */
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   padding: 12px 20px;
   border-bottom: 1px solid var(--border);
-  gap: 20px;
+  gap: 12px 20px;
 }
 
 .brand {
@@ -110,6 +114,11 @@ h2 {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* `min-width: 0` lets the token field actually shrink: without it a flex
+     item refuses to go below its content width and pushes the bar wider. */
+  min-width: 0;
+  flex: 1 1 auto;
+  justify-content: flex-end;
 }
 
 .dot {
@@ -138,6 +147,7 @@ h2 {
   font-family: "Fira Code", monospace;
   font-size: 12px;
   width: 220px;
+  min-width: 0;
 }
 
 .btn {
@@ -188,9 +198,14 @@ h2 {
   cursor: pointer;
 }
 
+/* Auto-fitting rather than a fixed column count: the strip gained a card
+   when `build_failed` became its own state, and a hardcoded `repeat(7, ...)`
+   silently dropped the last one onto a row of its own with a band of empty
+   space beside it. This adapts to however many cards there are, and wraps
+   sensibly on a narrow screen instead of squeezing them. */
 .stats {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 1px;
   background: var(--border);
   border-bottom: 1px solid var(--border);
@@ -205,6 +220,16 @@ h2 {
   font-family: "Fira Code", monospace;
   font-size: 22px;
   font-weight: 600;
+}
+
+/* The host-capacity card holds a phrase ("15.5G / 12 cpu"), not a count.
+   At the counters' size it wrapped to two lines and stretched the whole
+   strip; forcing it onto one line with `nowrap` was worse, because the grid
+   column then could not shrink and the page grew a horizontal scrollbar.
+   Sizing the text for what it is fixes both. */
+.stat-value-text {
+  font-size: 15px;
+  line-height: 1.5;
 }
 
 .stat-label {
