@@ -40,6 +40,8 @@
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
         <a href="install.html">Install</a>
+        <p class="side-group">Guide</p>
+        <a href="guide.html">How Oxid is used</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html" class="current">Daemon</a>
@@ -80,6 +82,9 @@
             <tr><td><code>OXID_BACKUP_INTERVAL_SECS</code></td><td>unset</td><td>When set (e.g. <code>300</code>), periodic <code>VACUUM INTO</code> snapshots to <code>{data}/backups/</code>.</td></tr>
             <tr><td><code>OXID_BACKUP_KEEP</code></td><td><code>7</code></td><td>Newest snapshots to keep when backups are enabled.</td></tr>
             <tr><td><code>OXID_RATE_LIMIT_PER_SECOND</code> / <code>_BURST</code></td><td>unset</td><td>When both are set, token-bucket rate limit on protected routes (per client IP).</td></tr>
+            <tr><td><code>OXID_DB_MAX_CONNECTIONS</code></td><td><code>8</code></td><td>SQLite pool size. WAL lets readers and the writer run at once, so the read-heavy paths overlap instead of queueing. Writes still serialize — that is SQLite. See the <a href="../#benchmarks">benchmarks</a>.</td></tr>
+            <tr><td><code>OXID_TRAEFIK_HTTP_PORT</code></td><td><code>80</code></td><td>Host port the built-in Traefik publishes on. The proxy always listens on 80 <em>inside</em> its container; this only moves where that surfaces, for a host whose 80 is taken.</td></tr>
+            <tr><td><code>OXID_LANG</code></td><td>system locale</td><td>Language for the <strong>CLI's</strong> own messages (<code>en</code>/<code>es</code>). The daemon answers API errors per-request from <code>Accept-Language</code> instead.</td></tr>
             <tr><td><code>RUST_LOG</code></td><td><code>info</code></td><td>Tracing filter, e.g. <code>oxid_daemon=debug,info</code>.</td></tr>
             <tr><td><code>OXID_LOG_FORMAT</code></td><td><code>pretty</code></td><td><code>pretty</code> or <code>json</code> (one object per line — use in production).</td></tr>
           </tbody>

@@ -41,6 +41,8 @@
         <a href="#overview" class="active">What is Oxid</a>
         <a href="#quickstart">Quickstart</a>
         <a href="install.html">Install — 60s guide</a>
+        <p class="side-group">Guide</p>
+        <a href="guide.html">How Oxid is used</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
@@ -147,7 +149,7 @@ docker compose logs oxid-daemon | grep -A2 Generated  <span class="tk-gray"># yo
 <span class="tk-gray">$</span> oxid up main --repo https://github.com/you/app.git  <span class="tk-gray"># same flow from the CLI</span>
 <span class="tk-gray">$</span> oxid status        <span class="tk-gray"># live URLs + ports</span>
 <span class="tk-gray">$</span> oxid logs -f feature-carrito</pre>
-        <p>Every push deploys its branch; deleting the branch destroys its environment. No traffic for a while? Oxid pauses it and gives the RAM back — next request wakes it in milliseconds.</p>
+        <p>Every push deploys its branch; deleting the branch destroys its environment. No traffic for a while? Oxid stops the container and gives the RAM back — the next request starts it again in well under a second.</p>
 
         <h3>Other ways to run</h3>
         <div class="terminal">

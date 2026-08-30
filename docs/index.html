@@ -36,6 +36,7 @@
         <a href="#features">Features</a>
         <a href="#how">How it works</a>
         <a href="#benchmarks">Benchmarks</a>
+        <a href="docs/guide.html">Guide</a>
         <a href="docs/">Docs</a>
         <a href="#status">Status</a>
         <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
@@ -179,7 +180,7 @@
           </div>
           <div class="card card-accent">
             <h3><span class="tag tag-good">The Oxid way</span></h3>
-            <p>Push → deployed → routed. Idle 30 min → paused in memory. Next visit → awake in milliseconds. Vercel-style URLs, calculator-sized bill.</p>
+            <p>Push → deployed → routed. Idle 30 min → stopped, RAM returned. Next visit → awake in under a second. Vercel-style URLs, calculator-sized bill.</p>
           </div>
         </div>
       </div>
@@ -202,7 +203,7 @@
               <svg viewBox="0 0 40 40"><circle cx="20" cy="20" r="14" fill="none" stroke="currentColor" stroke-width="3"/><path d="M20 12v8l6 4" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
             </div>
             <h3>Real scale-to-zero</h3>
-            <p>Idle branches pause in memory. First request wakes them like nothing happened.</p>
+            <p>Idle branches stop and hand their memory back. The first request starts them again — measured at 285–900&nbsp;ms.</p>
           </article>
           <article class="feature">
             <div class="feature-icon" aria-hidden="true">
@@ -266,7 +267,7 @@
             <span class="timeline-index">04</span>
             <div>
               <h3>Breathe</h3>
-              <p>Idle → paused, RAM back. Next visit → awake in milliseconds.</p>
+              <p>Idle → stopped, RAM back. Next visit → awake in under a second.</p>
             </div>
           </li>
         </ol>

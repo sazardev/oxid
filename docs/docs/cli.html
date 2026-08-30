@@ -48,6 +48,8 @@
         <a href="#cli-config" class="sub">Secrets &amp; configuration</a>
         <a href="#cli-ops" class="sub">Operations</a>
         <a href="#cli-exitcodes" class="sub">Exit codes</a>
+        <p class="side-group">Guide</p>
+        <a href="guide.html">How Oxid is used</a>
         <p class="side-group">Modules</p>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
@@ -84,6 +86,12 @@
               <td>—</td>
               <td>off</td>
               <td>Machine-readable JSON on stdout; errors stay as plain text on stderr. Pair with exit codes (below) for scripts and CI.</td>
+            </tr>
+            <tr>
+              <td><code>--lang &lt;en|es&gt;</code></td>
+              <td><code>OXID_LANG</code></td>
+              <td>shell locale, else <code>en</code></td>
+              <td>Language for the CLI's own messages. Falls back to <code>LC_ALL</code>/<code>LC_MESSAGES</code>/<code>LANG</code>. Never affects <code>--json</code>, which scripts parse.</td>
             </tr>
           </tbody>
         </table>
@@ -207,6 +215,14 @@ listening on 0.0.0.0:3000 ...</pre>
         <article class="doc-entry">
           <h3><code>oxid queue</code></h3>
           <p>Deploys waiting for host capacity, oldest first. Non-empty means admission control is doing its job, not that something is broken.</p>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid stats</code></h3>
+          <p>
+            What the node has and what it is using: CPUs and memory as Docker reports them, plus a
+            count per environment state. The same numbers the dashboard's top strip shows.
+          </p>
         </article>
       </section>
 

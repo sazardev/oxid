@@ -40,6 +40,8 @@
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
         <a href="install.html">Install</a>
+        <p class="side-group">Guide</p>
+        <a href="guide.html">How Oxid is used</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
@@ -60,7 +62,8 @@
           <code>OXID_API_TOKEN</code> set, all of them require
           <code>Authorization: Bearer &lt;token&gt;</code> — except the deliberately open ones:
           <code>/api/v1/health</code>, <code>/api/v1/setup/status</code> (public onboarding probe),
-          <code>/api/v1/webhooks/github</code> (HMAC-verified instead) and the Traefik-facing
+          the four <code>/api/v1/webhooks/*</code> endpoints (signature-verified instead),
+          <code>/api/v1/setup/token</code> (auto-generated token only) and the Traefik-facing
           <code>/api/v1/wake</code> + <code>/api/v1/heartbeat</code>.
         </p>
         <p class="note">
@@ -81,6 +84,7 @@
             <tr><td><code>POST /api/v1/projects/{id}/deploy</code></td><td>Deploy a branch. Returns the environment, or <code>{"status":"queued"}</code>.</td></tr>
             <tr><td><code>POST /api/v1/projects/{id}/rollback</code></td><td>Redeploy at a prior commit.</td></tr>
             <tr><td><code>GET /api/v1/projects/{id}/environments</code></td><td>Environments of a project (filterable by <code>?branch=</code>).</td></tr>
+            <tr><td><code>GET /api/v1/environments/{id}</code></td><td>One environment by id.</td></tr>
             <tr><td><code>DELETE /api/v1/environments/{id}</code></td><td>Destroy (<code>?purge_secrets=true</code> optional).</td></tr>
             <tr><td><code>POST /api/v1/environments/{id}/pause|wake</code></td><td>Scale-to-zero controls.</td></tr>
             <tr><td><code>GET /api/v1/environments/{id}/logs</code></td><td>Log snapshot; <code>/logs/stream</code> is the SSE live tail.</td></tr>
@@ -94,6 +98,9 @@
             <tr><td><code>GET /api/v1/infra/status</code>, <code>POST /api/v1/infra/bootstrap</code></td><td>Traefik/network wiring, inspect and idempotent setup.</td></tr>
             <tr><td><code>GET /api/v1/setup/status</code></td><td>Public onboarding probe — version, <code>auth_required</code>, <code>auto_token</code>, <code>webhook_secret_configured</code>. No auth needed.</td></tr>
             <tr><td><code>GET /api/v1/setup/webhook-secret</code></td><td>Reveal webhook secret (master token required) — same trust level as backup download.</td></tr>
+            <tr><td><code>GET /api/v1/setup/token</code></td><td>Hands over the <em>auto-generated</em> master token so a fresh install can self-serve. <code>404</code> when the token was set explicitly — it never reveals one you chose.</td></tr>
+            <tr><td><code>GET /api/v1/health</code></td><td>Liveness plus the daemon version. Always open.</td></tr>
+            <tr><td><code>POST /api/v1/webhooks/{github|gitlab|gitea|gogs}</code></td><td>Push webhooks, one per provider. Answered <code>202 {"status":"queued"}</code>; the deploy runs off the persisted queue. See the <a href="guide.html#deploy">guide</a> for each provider's verification header.</td></tr>
           </tbody>
         </table>
         <p class="note">

@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oxid — Guide</title>
+  <meta name="description" content="How Oxid is used end to end: topologies, registering projects, deploying, oxid.toml, secrets, the environment lifecycle, teams and day-2 operations." />
+  <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a href="../" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="28" height="28" />
+        <span>oxid</span><span class="brand-suffix">/ docs</span>
+      </a>
+      <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Toggle navigation">
+        <span></span><span></span><span></span>
+      </button>
+      <nav class="primary-nav" id="primaryNav">
+        <a href="../#why">Why</a>
+        <a href="../#features">Features</a>
+        <a href="../#how">How it works</a>
+        <a href="../#status">Status</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="wrap docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <nav>
+        <p class="side-group">Overview</p>
+        <a href="index.html">What is Oxid</a>
+        <a href="index.html#quickstart">Quickstart</a>
+        <a href="install.html">Install — 60s guide</a>
+        <p class="side-group">Guide</p>
+        <a href="#model" class="active">Mental model</a>
+        <a href="#topology">Choose a topology</a>
+        <a href="#register">Register a project</a>
+        <a href="#deploy">Deploy a branch</a>
+        <a href="#config">oxid.toml</a>
+        <a href="#secrets">Secrets &amp; variables</a>
+        <a href="#lifecycle">The lifecycle</a>
+        <a href="#team">Working as a team</a>
+        <a href="#day2">Day-2 operations</a>
+        <a href="#language">Language</a>
+        <p class="side-group">Modules</p>
+        <a href="cli.html">CLI reference</a>
+        <a href="daemon.html">Daemon</a>
+        <a href="api.html">HTTP API</a>
+        <a href="dashboard.html">Web dashboard</a>
+      </nav>
+    </aside>
+
+    <main class="docs-content" id="content">
+      <section class="doc-section" id="model">
+        <p class="eyebrow">// guide</p>
+        <h2>How Oxid is used</h2>
+        <p>
+          A walkthrough of the whole product, in the order you meet it. Every command and value
+          on this page exists in the shipped build — where behaviour depends on how you run it,
+          both variations are spelled out rather than one being assumed.
+        </p>
+
+        <h3>The three nouns</h3>
+        <table class="docs-table">
+          <thead><tr><th>Noun</th><th>What it is</th><th>Created by</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Project</strong></td>
+              <td>One repository. Holds the base domain, the idle/lifetime policy, and the git credential for a private repo.</td>
+              <td>The first <code>oxid up</code>, the wizard, or <code>POST /api/v1/projects</code>.</td>
+            </tr>
+            <tr>
+              <td><strong>Branch</strong></td>
+              <td>A git branch inside that project. Not stored on its own — it is the key an environment hangs off.</td>
+              <td>A push, or naming it in <code>oxid up</code>.</td>
+            </tr>
+            <tr>
+              <td><strong>Environment</strong></td>
+              <td>One deploy of one branch: a container, a URL, a state and an audit trail. A new row per deploy, so history survives.</td>
+              <td>Every deploy.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          One project, many branches, many environments per branch over time — but only ever one
+          <em>live</em> environment per branch. Older ones stay as <code>destroyed</code> rows so
+          <code>oxid rollback</code> has something to roll back to.
+        </p>
+      </section>
+
+      <section class="doc-section" id="topology">
+        <h2>Choose a topology first</h2>
+        <p>
+          This is the one decision everything else follows from, and it is a single environment
+          variable. Set <code>OXID_DOCKER_NETWORK</code> and you are in Traefik mode; leave it
+          unset and you are in direct-publish mode.
+        </p>
+        <table class="docs-table">
+          <thead><tr><th></th><th>Traefik mode</th><th>Direct-publish mode</th></tr></thead>
+          <tbody>
+            <tr><td>Trigger</td><td><code>OXID_DOCKER_NETWORK=oxid-net</code></td><td>variable unset</td></tr>
+            <tr><td>How a branch is reached</td><td><code>&lt;branch&gt;.&lt;base-domain&gt;</code> through the proxy</td><td>a host port Docker picks per deploy</td></tr>
+            <tr><td>Needs wildcard DNS</td><td>yes — <code>*.your-domain</code> → this host</td><td>no</td></tr>
+            <tr><td>Scale-to-zero</td><td><strong>active</strong></td><td><strong>disabled</strong> — the sweep is a deliberate no-op</td></tr>
+            <tr><td>Stable address across redeploys</td><td>yes, the subdomain</td><td>yes — Oxid's own proxy port, not the container's</td></tr>
+            <tr><td>Good for</td><td>a shared team node, the supported production topology</td><td>a laptop, a first look, a host whose ports you control</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Scale-to-zero is off in direct-publish mode <em>on purpose</em>. Idle detection is driven
+          by the proxy reporting real traffic; with no proxy nothing reports it, so pausing on that
+          silence would be pausing on data Oxid does not have. The daemon warns about this at
+          startup rather than pretending.
+        </p>
+
+        <h3>Bringing up Traefik</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid infra status   <span class="tk-gray"># read-only: network, proxy, this daemon's own wiring</span>
+<span class="tk-gray">$</span> oxid infra setup    <span class="tk-gray"># idempotent: creates whatever is missing</span></pre>
+        <p>
+          <code>infra setup</code> creates the Docker network and starts the proxy. It never
+          relabels the daemon's own container — Docker cannot do that to a running container
+          without recreating it, and recreating the process executing the request is not something
+          to automate. <code>infra status</code> reports what is missing and the exact labels to
+          add; the shipped <code>docker-compose.yml</code> already has them.
+        </p>
+        <p class="note">
+          Port 80 already taken? Set <code>OXID_TRAEFIK_HTTP_PORT</code>. The proxy always listens
+          on 80 <em>inside</em> its container; this only chooses where that surfaces on the host.
+          Branch URLs then need that port, since wildcard DNS cannot add one.
+        </p>
+      </section>
+
+      <section class="doc-section" id="register">
+        <h2>Register a project — three ways</h2>
+        <p>All three end in the same place; which one fits depends on whether the daemon can read your checkout.</p>
+
+        <h3>1 — From a local checkout</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> cd ~/code/my-app
+<span class="tk-gray">$</span> oxid up main</pre>
+        <p>
+          The daemon reads the directory directly, so this needs the daemon and your checkout on the
+          same filesystem — a native install, or a containerized daemon with the directory mounted
+          (the shipped compose mounts <code>./repos</code> for exactly this).
+        </p>
+
+        <h3>2 — From a git URL <span class="tag tag-good">works with a containerized daemon</span></h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid up main --repo https://github.com/you/app.git
+<span class="tk-gray">$</span> oxid up main --repo git@github.com:you/app.git   <span class="tk-gray"># scp-style, normalized server-side</span></pre>
+        <p>The daemon clones into its own git cache. No shared filesystem, nothing mounted.</p>
+
+        <h3>3 — A private repository</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid up main --repo https://github.com/you/private.git --git-token ghp_xxx
+<span class="tk-gray">$</span> oxid configure --git-token ghp_xxx     <span class="tk-gray"># or set it later</span>
+<span class="tk-gray">$</span> oxid configure --git-token ''          <span class="tk-gray"># clear it</span></pre>
+        <p>
+          Stored encrypted, never echoed back. It is needed because the daemon's own clone does not
+          inherit any credential helper from your shell.
+        </p>
+
+        <p class="note">
+          With no <code>oxid.toml</code>, Oxid falls back to a <code>docker-compose.yml</code> and
+          then to a bare <code>Dockerfile</code>, deriving the name from the directory, the base
+          domain as <code>&lt;name&gt;.local.dev</code> and the port from <code>EXPOSE</code>. With
+          none of the three it refuses, because there is nothing to build.
+        </p>
+      </section>
+
+      <section class="doc-section" id="deploy">
+        <h2>Deploy a branch — three ways</h2>
+
+        <h3>1 — Push (the point of the product)</h3>
+        <p>
+          Add a webhook in your Git host. Every pushed branch deploys itself, and deleting a branch
+          destroys its environment. All four providers are supported:
+        </p>
+        <table class="docs-table">
+          <thead><tr><th>Provider</th><th>Endpoint</th><th>How it is verified</th></tr></thead>
+          <tbody>
+            <tr><td>GitHub</td><td><code>POST /api/v1/webhooks/github</code></td><td>HMAC-SHA256, <code>X-Hub-Signature-256</code> (<code>sha256=</code> prefixed)</td></tr>
+            <tr><td>GitLab</td><td><code>POST /api/v1/webhooks/gitlab</code></td><td>the secret echoed back in <code>X-Gitlab-Token</code> — GitLab's whole model</td></tr>
+            <tr><td>Gitea</td><td><code>POST /api/v1/webhooks/gitea</code></td><td>HMAC-SHA256, <code>X-Gitea-Signature</code>, bare hex</td></tr>
+            <tr><td>Gogs</td><td><code>POST /api/v1/webhooks/gogs</code></td><td>HMAC-SHA256, <code>X-Gogs-Signature</code>, bare hex</td></tr>
+          </tbody>
+        </table>
+        <p>
+          All four need <code>OXID_WEBHOOK_SECRET</code> set. Until it is, pushes are rejected by
+          design — a typo'd variable must not silently open deploys to anyone who can reach the port.
+        </p>
+        <p class="note">
+          A delivery is answered <code>202 {"status":"queued"}</code> immediately and built
+          afterwards, off a queue that survives a daemon restart. Providers abandon a webhook in
+          seconds — GitHub at ten, with no retry for push events — while a real first build takes
+          far longer, so deploying inside the request reported failures for deploys that had
+          actually succeeded.
+        </p>
+
+        <h3>2 — From the CLI</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid up feature/checkout          <span class="tk-gray"># deploy or redeploy</span>
+<span class="tk-gray">$</span> oxid status                       <span class="tk-gray"># what is live, and where</span>
+<span class="tk-gray">$</span> oxid status --sort state --filter running
+<span class="tk-gray">$</span> oxid down feature/checkout        <span class="tk-gray"># destroy (asks first; --force skips)</span>
+<span class="tk-gray">$</span> oxid down feature/checkout --purge-secrets</pre>
+
+        <h3>3 — Dashboard or API</h3>
+        <p>
+          The dashboard at the daemon root does the same things, and both it and the CLI are thin
+          clients over one <a href="api.html">HTTP API</a> you can drive with <code>curl</code>.
+        </p>
+
+        <h3>Redeploys never take the branch down</h3>
+        <p>
+          The new container is built, started and confirmed healthy <em>before</em> traffic cuts
+          over, and only then is the previous one retired. A broken push leaves the previous build
+          serving.
+        </p>
+      </section>
+      <section class="doc-section" id="config">
+        <h2><code>oxid.toml</code></h2>
+        <p>Every field, with its default. All of them are optional except the project name.</p>
+        <pre class="cmd-block"><span class="tk-gray">[project]</span>
+name = "my-app"            <span class="tk-gray"># required</span>
+pause_after = "30m"        <span class="tk-gray"># idle → paused.    default 30m</span>
+destroy_after = "7d"       <span class="tk-gray"># idle → destroyed. default 7d</span>
+
+<span class="tk-gray">[build]</span>
+dockerfile = "Dockerfile"  <span class="tk-gray"># relative to context</span>
+context = "."              <span class="tk-gray"># monorepo? point at a subdirectory</span>
+on_start = ["./seed.sh"]   <span class="tk-gray"># run inside the container once it is up</span>
+memory_limit_mb = 512      <span class="tk-gray"># falls back to the daemon's default</span>
+cpu_limit_millicores = 1000 <span class="tk-gray"># 1000 = one core</span>
+
+<span class="tk-gray">[routing]</span>
+base_domain = "my-app.local.dev"
+port = 8080                <span class="tk-gray"># the port your app listens on inside the container</span>
+
+<span class="tk-gray">[dependencies.db]</span>
+type = "postgres"          <span class="tk-gray"># postgres | redis</span>
+shared_instance = "local-pg"
+inject_url_as = "DATABASE_URL"</pre>
+
+        <h3>Which fields the branch controls</h3>
+        <p>
+          Not all of them, and the split is deliberate. Every deploy re-reads
+          <code>oxid.toml</code> from the commit being deployed:
+        </p>
+        <table class="docs-table">
+          <thead><tr><th>Comes from the commit</th><th>Stays with the project</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>[build]</code>, <code>[routing].port</code>, <code>[dependencies]</code></td>
+              <td><code>[routing].base_domain</code>, <code>pause_after</code>, <code>destroy_after</code></td>
+            </tr>
+            <tr>
+              <td>Properties of the code — a branch that adds a dependency or needs more memory gets it.</td>
+              <td>Operator decisions, owned by <code>oxid configure</code>. Otherwise one branch could rewrite another branch's URL or TTL.</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid configure --pause-after 45m --destroy-after 3d</pre>
+        <p class="note">
+          A malformed <code>oxid.toml</code> on a branch fails that deploy with the parse error, and
+          the failure is recorded against the environment. A branch with no config file at all keeps
+          the project's settings.
+        </p>
+
+        <h3>Shared dependencies</h3>
+        <p>
+          One Postgres and one Redis serve every branch: each environment leases its own logical
+          database, and the connection string arrives in the variable you named. Point the daemon at
+          them with <code>OXID_POSTGRES_URL</code> / <code>OXID_REDIS_URL</code>. A project that
+          declares a dependency the daemon has no connection string for fails its deploy with that
+          exact message, rather than starting without a database.
+        </p>
+      </section>
+
+      <section class="doc-section" id="secrets">
+        <h2>Secrets &amp; variables</h2>
+        <p>Three scopes, resolved most-specific-wins.</p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid env set SENTRY_DSN=https://... --scope global
+<span class="tk-gray">$</span> oxid env set APP_NAME=shopfront --scope project
+<span class="tk-gray">$</span> oxid env set FEATURE_X=on --scope branch --branch feature/x
+<span class="tk-gray">$</span> oxid env list --scope project
+<span class="tk-gray">$</span> oxid env delete FEATURE_X --scope branch --branch feature/x</pre>
+        <table class="docs-table">
+          <thead><tr><th>Order</th><th>Scope</th><th>Applies to</th></tr></thead>
+          <tbody>
+            <tr><td>1 — weakest</td><td><code>global</code></td><td>every environment on the node</td></tr>
+            <tr><td>2</td><td><code>project</code></td><td>every branch of one project</td></tr>
+            <tr><td>3</td><td><code>branch</code></td><td>one branch</td></tr>
+            <tr><td>4 — strongest</td><td>runtime</td><td>injected by Oxid itself (below)</td></tr>
+          </tbody>
+        </table>
+        <p>
+          Values are <strong>write-only</strong>: the daemon returns names and scopes, never a
+          stored value — not to the CLI, not to the dashboard, not to the API. At rest they are
+          AES-256-GCM encrypted under a key in <code>secret.key</code>, with a fresh nonce per value.
+        </p>
+
+        <h3>What every container receives</h3>
+        <table class="docs-table">
+          <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+          <tbody>
+            <tr><td><code>OXID_BRANCH</code></td><td>the branch name, e.g. <code>feature/checkout</code></td></tr>
+            <tr><td><code>OXID_COMMIT</code></td><td>the deployed commit SHA — what a <code>/version</code> endpoint wants</td></tr>
+            <tr><td><code>OXID_ENV_URL</code></td><td>the environment's routed hostname</td></tr>
+            <tr><td>your declared dependency variable</td><td>e.g. <code>DATABASE_URL</code> for this branch's own database</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Branch secrets survive <code>oxid down</code> by default — a recurring feature branch
+          should not lose its config because it idled out. Pass <code>--purge-secrets</code> to
+          clear them too.
+        </p>
+      </section>
+
+      <section class="doc-section" id="lifecycle">
+        <h2>The lifecycle</h2>
+        <p>An environment is in exactly one state, and the moves between them are fixed.</p>
+        <table class="docs-table">
+          <thead><tr><th>State</th><th>What it means</th><th>Container</th></tr></thead>
+          <tbody>
+            <tr><td><code>building</code></td><td>image building, container starting</td><td>being created</td></tr>
+            <tr><td><code>running</code></td><td>live and serving</td><td>running</td></tr>
+            <tr><td><code>paused</code></td><td>scaled to zero after <code>pause_after</code> of no traffic</td><td><strong>stopped</strong> — its memory is returned</td></tr>
+            <tr><td><code>hibernating</code></td><td>still idle after 4 × <code>pause_after</code></td><td>stopped</td></tr>
+            <tr><td><code>build_failed</code></td><td>this deploy did not come up — the reason is in its audit trail</td><td>none</td></tr>
+            <tr><td><code>destroyed</code></td><td>torn down, by TTL or by hand. Terminal, kept as history</td><td>removed</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          <code>build_failed</code> is its own state, not a flavour of <code>destroyed</code>:
+          "someone's push is broken" and "this was torn down" are different things to whoever is
+          reading <code>oxid status</code>. It can only move on to being cleaned up — a branch
+          recovers by deploying again, which creates its own environment.
+        </p>
+
+        <h3>Waking</h3>
+        <p>
+          A visit to a sleeping branch wakes it. The proxy has no route for a stopped container, so
+          a catch-all router on the daemon answers instead, starts the environment, and returns a
+          small page that polls until the app is up. Measured on the reference machine:
+          <strong>285–900 ms</strong> from asleep to serving — see the
+          <a href="../#benchmarks">benchmarks</a>.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid pause feature/checkout   <span class="tk-gray"># by hand</span>
+<span class="tk-gray">$</span> oxid wake feature/checkout</pre>
+        <p class="note">
+          Suspending stops the container rather than freezing it in memory. A frozen container keeps
+          its whole resident set and — more importantly — disappears from the proxy's routing table
+          without ever coming back, which made waking impossible. Stopping costs a process restart
+          and buys a branch that can actually be woken.
+        </p>
+
+        <h3>Capacity and the queue</h3>
+        <p>
+          With <code>OXID_RESERVED_MEMORY_MB</code> set, a deploy that does not fit is queued rather
+          than overcommitting the host, and deployed automatically as capacity frees. Only
+          <em>running</em> environments count against the budget — a sleeping one holds no memory.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid queue    <span class="tk-gray"># what is waiting, oldest first</span>
+<span class="tk-gray">$</span> oxid stats    <span class="tk-gray"># CPUs, memory, how many environments are running</span></pre>
+      </section>
+      <section class="doc-section" id="team">
+        <h2>Working as a team</h2>
+
+        <h3>Give people scoped tokens, not the master one</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid token create alice --project 3        <span class="tk-gray"># repeatable for several projects</span>
+<span class="tk-gray">$</span> oxid token create ci                       <span class="tk-gray"># no --project = full access</span>
+<span class="tk-gray">$</span> oxid token list
+<span class="tk-gray">$</span> oxid token revoke 4</pre>
+        <p>
+          A scoped token gets <code>404</code> outside its projects — not <code>403</code>, so it
+          cannot even enumerate what it may not touch — and <code>403</code> on node-wide routes:
+          global secrets, capacity, key rotation and token management. It cannot mint another token,
+          so it cannot escalate. The raw value is shown once and only its hash is stored.
+        </p>
+        <p class="note">
+          Only the master credential (<code>OXID_API_TOKEN</code>) can manage tokens. On a fresh
+          zero-config install, <code>oxid token generate</code> fetches the auto-generated one and
+          saves it as a context, so nobody has to dig through container logs.
+        </p>
+
+        <h3>Talking to more than one daemon</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid context add prod --api https://oxid.internal --token $TOKEN
+<span class="tk-gray">$</span> oxid context add staging --api http://10.0.0.5:8080 --token $OTHER
+<span class="tk-gray">$</span> oxid context use prod
+<span class="tk-gray">$</span> oxid context list          <span class="tk-gray"># tokens masked to their last 4 characters</span>
+<span class="tk-gray">$</span> oxid context current</pre>
+        <p>
+          Stored at <code>~/.config/oxid/config.toml</code>. Resolution order for every command:
+          <code>--api</code>/<code>--token</code> flags, then <code>OXID_API</code>/<code>OXID_TOKEN</code>,
+          then the active context, then <code>http://127.0.0.1:8080</code>.
+        </p>
+
+        <h3>Who did what</h3>
+        <p>
+          Every deploy, pause, wake and teardown lands in the audit trail with an operator: the
+          named token that made the request, or the user the webhook says pushed.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid audit                                  <span class="tk-gray"># recent, across every project</span>
+<span class="tk-gray">$</span> oxid audit feature/checkout                 <span class="tk-gray"># one branch's full history</span>
+<span class="tk-gray">$</span> oxid audit --kind build_failed --since 2026-08-01T00:00:00Z
+<span class="tk-gray">$</span> oxid audit --project 3 --branch main --until 2026-09-01T00:00:00Z</pre>
+
+        <h3>Two branches, one subdomain</h3>
+        <p>
+          <code>feature/x</code> and <code>feature-x</code> both normalise to
+          <code>feature-x</code> — DNS labels cannot tell <code>/</code>, <code>_</code> and
+          <code>.</code> apart from <code>-</code>. The second deploy is refused, naming the branch
+          that already owns the address, instead of leaving one of them silently unreachable.
+        </p>
+      </section>
+
+      <section class="doc-section" id="day2">
+        <h2>Day-2 operations</h2>
+
+        <h3>Rolling back</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid rollback feature/checkout              <span class="tk-gray"># to the deploy before the live one</span>
+<span class="tk-gray">$</span> oxid rollback feature/checkout --to a1b2c3d  <span class="tk-gray"># to a specific commit</span></pre>
+        <p>
+          It replays the deploy pipeline at the older commit, with the same zero-downtime cutover —
+          it is a deploy, not a revert of the container. Only commits in that branch's own deploy
+          history are accepted.
+        </p>
+
+        <h3>Watching</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid logs feature/checkout        <span class="tk-gray"># snapshot</span>
+<span class="tk-gray">$</span> oxid logs -f feature/checkout     <span class="tk-gray"># live, over SSE</span>
+<span class="tk-gray">$</span> oxid doctor                       <span class="tk-gray"># reachable? authenticated? versions? infra?</span></pre>
+
+        <h3>Backups and keys</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid backup oxid-$(date +%F).tar   <span class="tk-gray"># database + secret key, consistent snapshot</span>
+<span class="tk-gray">$</span> oxid restore oxid-2026-08-29.tar   <span class="tk-gray"># staged; applied on the daemon's next start</span>
+<span class="tk-gray">$</span> oxid rotate-key                    <span class="tk-gray"># re-encrypt every secret, no downtime</span></pre>
+        <p class="note">
+          A restore never touches the live database in place — it is staged and applied at the next
+          startup, and the daemon refuses the upload at all unless
+          <code>OXID_ALLOW_RESTORE=1</code>. Rotation re-encrypts inside one transaction that
+          excludes concurrent secret writes, and only swaps the in-memory key after it commits: a
+          failed rotation leaves every secret exactly as it was. If you set
+          <code>OXID_MASTER_KEY</code> explicitly rather than relying on
+          <code>secret.key</code>, update it before the next restart.
+        </p>
+
+        <h3>Scripting it</h3>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid status --json | jq -r '.[] | select(.state=="build_failed") | .branch.name'
+<span class="tk-gray">$</span> oxid ps --json | jq '.[].name'</pre>
+        <p>
+          <code>--json</code> works on every command that returns data, is never translated, and
+          errors still go to stderr as plain text — use the exit code to tell failure kinds apart.
+        </p>
+      </section>
+
+      <section class="doc-section" id="language">
+        <h2>Language</h2>
+        <p>Oxid speaks English and Spanish, and each surface picks its language its own way.</p>
+        <table class="docs-table">
+          <thead><tr><th>Surface</th><th>How it decides</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Dashboard</td>
+              <td>The switcher in the top bar, which changes the page in place without a reload. Otherwise your previous choice, then the browser's own languages, then English.</td>
+            </tr>
+            <tr>
+              <td>CLI</td>
+              <td><code>--lang es</code>, then <code>OXID_LANG</code>, then your shell's <code>LC_ALL</code>/<code>LC_MESSAGES</code>/<code>LANG</code>, then English.</td>
+            </tr>
+            <tr>
+              <td>API errors</td>
+              <td><code>Accept-Language</code>, honouring quality values. The dashboard sends whatever its switcher is set to.</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid --lang es status
+<span class="tk-gray">$</span> OXID_LANG=es oxid doctor
+<span class="tk-gray">$</span> curl -H 'Accept-Language: es' http://localhost:8080/api/v1/stats</pre>
+        <p class="note">
+          Three things stay in English on purpose: <code>--json</code> output and API field names,
+          because scripts parse them; log lines, because aggregators match on their text; and any
+          message coming from Docker, git or SQLite, because those strings are produced by those
+          tools and are what you search for when something breaks.
+        </p>
+      </section>
+
+      <p class="docs-footer-note">
+        Every command here has more options than shown — see the
+        <a href="cli.html">CLI reference</a> for the full surface, the
+        <a href="daemon.html">daemon page</a> for every environment variable, and the
+        <a href="api.html">HTTP API</a> for driving it yourself.
+      </p>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <a href="#model" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
+        <span>oxid</span>
+      </a>
+      <p class="footer-tagline">Ephemeral environments that breathe.</p>
+      <nav class="footer-links">
+        <a href="../">Home</a>
+        <a href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/sazardev/oxid/blob/main/LICENSE" target="_blank" rel="noopener">License (0BSD)</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
