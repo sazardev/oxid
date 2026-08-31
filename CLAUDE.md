@@ -254,8 +254,8 @@ already bounds the walk to the root plus one level inside `apps/`,
 
 Embedded in the binary via `include_str!` — no build step, no bundler, and
 no request that leaves the host: Alpine is vendored, there is no webfont and
-no icon font, and the whole shell is ~232KB uncompressed (Alpine is 44KB of
-it; the panel's own CSS/JS/HTML is ~120KB).
+no icon font, and the whole shell is ~240KB uncompressed (Alpine is 53KB of
+it; the panel's own HTML/JS/CSS/i18n is ~185KB).
 
 It is a PWA: `manifest.webmanifest`, `sw.js` and two SVG icons are served
 from the same binary (`api/dashboard.rs`). The service worker caches the
@@ -283,6 +283,18 @@ Spanish and English, in three places that each resolve the language their own wa
 Deliberately **not** translated, and each for a reason worth keeping: `--json` output and API field names (scripts parse them); log lines (aggregators match on their text); and anything wrapping a `git2`/`bollard`/`sqlx` error (those strings come from those libraries and are what an operator searches for).
 
 Every catalog is guarded by tests that fail on a missing key or a placeholder a translation dropped or invented — `every_dashboard_string_exists_in_every_language` also checks the reverse, that no key the UI asks for is undefined.
+
+## Public documentation site
+
+`docs/` is the GitHub Pages site: a landing page plus `docs/docs/*.html`
+(install, guide, stacks, CLI, daemon, API, dashboard, security). Hand-written
+HTML, no generator — the sidebar is duplicated per page, so a nav change means
+editing every one of them.
+
+It is the surface a user meets before the code, so it goes stale in a way the
+repo's own Markdown does not: `install.html` documents what `install.sh`
+prints, `stacks.html` the detection table, `dashboard.html` the panel's asset
+sizes. Change any of those and the page is part of the change.
 
 ## Hooks & CI
 

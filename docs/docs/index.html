@@ -38,16 +38,20 @@
     <aside class="docs-sidebar" aria-label="Documentation navigation">
       <nav>
         <p class="side-group">Overview</p>
-        <a href="#overview" class="active">What is Oxid</a>
-        <a href="#quickstart">Quickstart</a>
-        <a href="install.html">Install — 60s guide</a>
+        <a href="index.html" class="current">Docs home</a>
+        <a href="#overview" class="sub">What is Oxid</a>
+        <a href="#quickstart" class="sub">Quickstart</a>
+        <a href="install.html">Install &amp; setup</a>
         <p class="side-group">Guide</p>
         <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
+        <p class="side-group">Operate</p>
+        <a href="security.html">Security &amp; hardening</a>
       </nav>
     </aside>
 
@@ -82,6 +86,11 @@
               <td><a href="dashboard.html">Dashboard</a></td>
             </tr>
             <tr>
+              <td>Stack detection</td>
+              <td>Reads a repository's own manifests and generates a multi-stage image when it has no <code>Dockerfile</code> — nine runtimes, twenty-three frameworks, monorepos included.</td>
+              <td><a href="stacks.html">Stacks</a></td>
+            </tr>
+            <tr>
               <td>Traefik <span class="tag tag-muted">optional</span></td>
               <td>When <code>OXID_DOCKER_NETWORK</code> is set, containers get <code>Host()</code> subdomains instead of published ports — and wake-on-request scale-to-zero activates.</td>
               <td><a href="daemon.html">Daemon</a></td>
@@ -109,7 +118,15 @@
           </a>
           <a class="card module-card" href="dashboard.html">
             <h3>Web dashboard<span class="arrow" aria-hidden="true">→</span></h3>
-            <p>The embedded UI served at the daemon root — sections, auth and what it can (and can't) do.</p>
+            <p>Every view, the setup wizard, offline PWA behaviour and the layout down to 320px.</p>
+          </a>
+          <a class="card module-card" href="stacks.html">
+            <h3>Stacks &amp; builds<span class="arrow" aria-hidden="true">→</span></h3>
+            <p>Deploying a repository with no Dockerfile: 23 frameworks across 9 runtimes, generated multi-stage images, cache mounts and monorepos.</p>
+          </a>
+          <a class="card module-card" href="security.html">
+            <h3>Security &amp; hardening<span class="arrow" aria-hidden="true">→</span></h3>
+            <p>What the Docker socket implies, where the API is published, scoped tokens, webhook verification and key rotation.</p>
           </a>
         </div>
       </section>

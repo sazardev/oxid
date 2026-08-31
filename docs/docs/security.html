@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oxid — Security &amp; hardening</title>
+  <meta name="description" content="Oxid's security model: publish surface, the bootstrap token endpoint, scoped API tokens, webhook HMAC verification, secrets at rest and key rotation." />
+  <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a href="../" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="28" height="28" />
+        <span>oxid</span><span class="brand-suffix">/ docs</span>
+      </a>
+      <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Toggle navigation">
+        <span></span><span></span><span></span>
+      </button>
+      <nav class="primary-nav" id="primaryNav">
+        <a href="../#why">Why</a>
+        <a href="../#features">Features</a>
+        <a href="../#how">How it works</a>
+        <a href="../#status">Status</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub &#8599;</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="wrap docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <nav>
+        <p class="side-group">Overview</p>
+        <a href="index.html">Docs home</a>
+        <a href="install.html">Install &amp; setup</a>
+        <p class="side-group">Guide</p>
+        <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
+        <p class="side-group">Modules</p>
+        <a href="cli.html">CLI reference</a>
+        <a href="daemon.html">Daemon</a>
+        <a href="api.html">HTTP API</a>
+        <a href="dashboard.html">Web dashboard</a>
+        <p class="side-group">Operate</p>
+        <a href="security.html" class="current">Security &amp; hardening</a>
+        <a href="#sec-surface" class="sub">Publish surface</a>
+        <a href="#sec-bootstrap" class="sub">Bootstrap token</a>
+        <a href="#sec-tokens" class="sub">Token scoping</a>
+        <a href="#sec-webhooks" class="sub">Webhook verification</a>
+        <a href="#sec-secrets" class="sub">Secrets &amp; key rotation</a>
+        <a href="#sec-checklist" class="sub">Checklist</a>
+      </nav>
+    </aside>
+
+    <main class="docs-content" id="content">
+
+      <section class="doc-section" id="sec-model">
+        <p class="eyebrow">// security</p>
+        <h2>What you are actually running</h2>
+        <p style="max-width:70ch;">
+          The daemon mounts the Docker socket. Anything that can reach its API with a valid
+          token can build and run containers on the host, which is the same reach as root.
+          That is inherent to the job &mdash; a control plane that starts containers needs to
+          start containers &mdash; and it is why every control below exists. This page explains
+          what each one protects and why it defaults the way it does;
+          <a href="https://github.com/sazardev/oxid/blob/main/PRODUCTION.md">PRODUCTION.md</a>
+          has the deployment checklist itself.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-surface">
+        <h2>Where the API is published</h2>
+        <p>
+          The daemon always binds <code>0.0.0.0:8080</code> <em>inside</em> its container. What
+          decides exposure is the publish, and the shipped compose publishes
+          <code>127.0.0.1:8080:8080</code> &mdash; the control API is reachable from the host
+          and nowhere else.
+        </p>
+        <p>
+          Widening that to <code>"8080:8080"</code> is a deliberate act with consequences on
+          this page. Do it over a private network, or put a TLS terminator in front. The
+          daemon also refuses to start on a non-loopback bind with no
+          <code>OXID_API_TOKEN</code>, which can only be overridden by setting
+          <code>OXID_ALLOW_OPEN_API=1</code> &mdash; an explicit opt-in to an unauthenticated
+          API, not something that happens by accident.
+        </p>
+        <p class="note">
+          One consequence of the loopback publish: a Git host cannot deliver webhooks to it.
+          Exposing the port is how you enable them &mdash; see
+          <a href="install.html#setup-webhooks">Install &rarr; webhooks</a>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-bootstrap">
+        <h2>The bootstrap token endpoint</h2>
+        <p>
+          <code>GET /api/v1/setup/token</code> hands the auto-generated master token to a
+          caller <strong>before</strong> authentication &mdash; it exists so the onboarding
+          wizard can finish without asking an operator to read container logs. That is a real
+          hole if it answers the wrong caller, so who it answers is a setting:
+        </p>
+        <table class="docs-table">
+          <thead><tr><th><code>OXID_BOOTSTRAP_TOKEN_ACCESS</code></th><th>Hands the token to</th></tr></thead>
+          <tbody>
+            <tr><td><code>loopback</code> <em>(default)</em></td><td>Only a caller from the daemon's own host.</td></tr>
+            <tr><td><code>any</code></td><td>Any caller that can reach the port. Correct only when the port itself is private.</td></tr>
+            <tr><td><code>off</code></td><td>Nobody. Retrieve the token from the file or the logs instead.</td></tr>
+          </tbody>
+        </table>
+        <p>
+          The default withholds because the daemon cannot tell a safe deployment from an
+          exposed one: containerized, it is always bound to <code>0.0.0.0</code> and every
+          caller arrives from the bridge gateway, so loopback detection alone would answer the
+          whole LAN. The operator knows what the publish looks like; the daemon does not.
+        </p>
+        <p class="note">
+          The shipped <code>docker-compose.yml</code> sets <code>any</code>. That is correct
+          <em>only</em> because it publishes on <code>127.0.0.1</code>. If you widen the
+          publish, change this at the same time.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-tokens">
+        <h2>Tokens: master, named and scoped</h2>
+        <p>
+          <code>OXID_API_TOKEN</code> is the master token. Everything else is issued from it
+          and is attributable in the audit trail, which is the reason to stop using the master
+          one for daily work.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray"># full-access operator — same reach as master, but named in the audit trail:</span>
+oxid token create alice
+
+<span class="tk-gray"># scoped operator — may only act on project 1:</span>
+oxid token create ci-frontend --project 1
+
+oxid token list
+oxid token revoke &lt;id&gt;</pre>
+        <p>A scoped token is enforced at the middleware, not by convention:</p>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
+          <li>Another project's routes answer <strong>404</strong>, not 403 &mdash; existence is not disclosed to a token with no business knowing.</li>
+          <li>Node-wide routes (stats, infra, tokens, backup, key rotation) answer <strong>403</strong>.</li>
+        </ul>
+        <p>
+          A few operations require the <em>master</em> token specifically and reject named
+          ones: creating tokens, rotating the master key, and reading the webhook secret.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-webhooks">
+        <h2>Webhook verification</h2>
+        <p>
+          Push webhooks are verified by HMAC-SHA256 against <code>OXID_WEBHOOK_SECRET</code>
+          (GitHub, Gitea, Gogs) or by token echo (GitLab). <strong>Webhooks are rejected
+          entirely while the secret is unset</strong> &mdash; there is no unauthenticated
+          deploy path.
+        </p>
+        <p>
+          A verified push is matched to a project by <strong>exact repository path</strong>,
+          never by substring, so <code>you/app-staging</code> cannot trigger a deploy of
+          <code>you/app</code>. The pushing user is recorded as the audit <code>operator</code>.
+        </p>
+        <p class="note">
+          A push is answered <code>202 queued</code> and deployed off a persisted queue.
+          Providers abandon a delivery in seconds &mdash; GitHub at 10, with no retry for push
+          events &mdash; while a real first build takes far longer.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-secrets">
+        <h2>Secrets at rest, and rotating the key</h2>
+        <p>
+          Project and branch secrets are encrypted with AES-GCM under a master key at
+          <code>{data}/secret.key</code> (0600), generated on first start unless
+          <code>OXID_MASTER_KEY</code> supplies one. Values are never echoed back by the API
+          or printed in logs.
+        </p>
+        <pre class="cmd-block">oxid rotate-key   <span class="tk-gray"># re-encrypts every secret under a fresh key, zero downtime</span></pre>
+        <p>
+          Rotation runs in a <code>BEGIN IMMEDIATE</code> transaction. With a deferred one the
+          write lock is only taken at the first write, leaving a window in which a secret
+          written under the <em>old</em> key survives the swap and becomes undecryptable.
+        </p>
+        <p>
+          Back up <code>{data}</code> as a unit: the database and <code>secret.key</code>
+          belong together, and a database restored without its key has unreadable secrets.
+          <code>oxid backup</code> produces both in one archive.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-restore">
+        <h2>Restore is opt-in, and never in place</h2>
+        <p>
+          <code>POST /api/v1/backup/restore</code> accepts an upload only when the daemon runs
+          with <code>OXID_ALLOW_RESTORE=1</code>. An accepted archive is <em>staged</em> and
+          applied on the next startup &mdash; the live database is never overwritten under
+          running requests, and a restore that fails validation leaves the running system
+          untouched.
+        </p>
+      </section>
+
+      <section class="doc-section" id="sec-rate">
+        <h2>Rate limiting and transport</h2>
+        <table class="docs-table">
+          <thead><tr><th>Control</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>OXID_RATE_LIMIT_PER_SECOND</code> + <code>_BURST</code></td><td>Per-client-IP token bucket on protected routes. Both are required together; setting one alone does nothing. Public setup routes get their own bucket, so hammering them cannot exhaust an operator's.</td></tr>
+            <tr><td><code>OXID_TLS_CERT</code> / <code>OXID_TLS_KEY</code></td><td>When both are set the daemon serves HTTPS itself. Otherwise terminate at Traefik or another proxy &mdash; do not publish plain HTTP beyond a trusted network.</td></tr>
+            <tr><td>Heartbeat endpoint</td><td>Deliberately unauthenticated: Traefik calls it on every request to every environment. It only writes a coalesced timestamp feeding idle detection, and exposes nothing.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="doc-section" id="sec-audit">
+        <h2>The audit trail</h2>
+        <p>
+          Every deploy, pause, wake, destroy, secret write and token action is recorded with
+          its operator, and a failed deploy is recorded too &mdash; a broken Dockerfile leaves
+          a <code>build_failed</code> environment, an audit event and an <code>ERROR</code>
+          line rather than nothing at all.
+        </p>
+        <pre class="cmd-block">oxid audit --limit 50
+oxid audit --branch feat/login
+oxid audit --json | jq '.[] | select(.action == "destroy")'</pre>
+      </section>
+
+      <section class="doc-section" id="sec-checklist">
+        <h2>Before you expose it</h2>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.45rem;">
+          <li>A long random <code>OXID_API_TOKEN</code> is set &mdash; and you are not using it for day-to-day work.</li>
+          <li><code>OXID_WEBHOOK_SECRET</code> is set and matches what the Git host sends.</li>
+          <li><code>OXID_BOOTSTRAP_TOKEN_ACCESS</code> matches your publish: <code>any</code> only while the port is private, otherwise <code>loopback</code> or <code>off</code>.</li>
+          <li>TLS terminates somewhere &mdash; the daemon or a proxy in front of it.</li>
+          <li>Rate limits are set if the port is reachable by anything untrusted.</li>
+          <li><code>OXID_ALLOW_RESTORE</code> stays unset except while you are actually restoring.</li>
+          <li>Backups run, and you have restored one at least once.</li>
+        </ul>
+        <p>
+          Found a hole? <a href="https://github.com/sazardev/oxid/blob/main/SECURITY.md">SECURITY.md</a>
+          has the disclosure process and what is most interesting to report.
+        </p>
+      </section>
+
+      <p class="docs-footer-note">
+        Something missing or wrong? The
+        <a href="https://github.com/sazardev/oxid/issues" target="_blank" rel="noopener">issue tracker</a>
+        takes docs bugs too.
+      </p>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <a href="#content" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
+        <span>oxid</span>
+      </a>
+      <p class="footer-tagline">Ephemeral environments that breathe.</p>
+      <nav class="footer-links">
+        <a href="index.html">Docs home</a>
+        <a href="../">Home</a>
+        <a href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

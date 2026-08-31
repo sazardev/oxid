@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Oxid — Install</title>
-  <meta name="description" content="Install Oxid in 60 seconds: zero-config Docker Compose with auto-generated secrets and a five-step onboarding wizard — plus native, binary and manual options." />
+  <title>Oxid — Install &amp; setup</title>
+  <meta name="description" content="The complete Oxid setup: one-command Docker install that prints your credentials, systemd and binary paths, where the API listens, webhooks, upgrading, removal and troubleshooting." />
   <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -29,7 +29,7 @@
         <a href="../#features">Features</a>
         <a href="../#how">How it works</a>
         <a href="../#status">Status</a>
-        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub &#8599;</a>
       </nav>
     </div>
   </header>
@@ -39,171 +39,384 @@
       <nav>
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
-        <a href="install.html" class="current">Install</a>
-        <a href="#install-docker" class="sub">Docker (recommended)</a>
-        <a href="#install-wizard" class="sub">Wizard — 5 steps</a>
-        <a href="#install-cli" class="sub">CLI alternative</a>
-        <a href="#install-other" class="sub">Other ways</a>
-        <a href="#install-upgrade" class="sub">Upgrading</a>
+        <a href="install.html" class="current">Install &amp; setup</a>
+        <a href="#setup-paths" class="sub">Choosing a path</a>
+        <a href="#setup-docker" class="sub">Docker, step by step</a>
+        <a href="#setup-network" class="sub">Where it listens</a>
+        <a href="#setup-verify" class="sub">Verifying</a>
+        <a href="#setup-first" class="sub">First deploy</a>
+        <a href="#setup-webhooks" class="sub">Webhooks</a>
+        <a href="#setup-server" class="sub">systemd</a>
+        <a href="#setup-upgrade" class="sub">Upgrade &amp; remove</a>
+        <a href="#setup-trouble" class="sub">Troubleshooting</a>
         <p class="side-group">Guide</p>
         <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
+        <p class="side-group">Operate</p>
+        <a href="security.html">Security &amp; hardening</a>
       </nav>
     </aside>
 
     <main class="docs-content" id="content">
 
-      <section class="doc-section" id="install-hero">
-        <p class="eyebrow">// install — 60 seconds</p>
-        <h2>One command to a live preview</h2>
-        <p style="max-width:68ch; color:#c7c7ca; font-size:1.05rem;">
-          No <code>.env</code> to hand-wire. The shipped <code>docker-compose.yml</code> runs with
-          <code>OXID_AUTO_TOKEN=1</code> — secrets generate themselves, persist under <code>/data</code>,
-          and the dashboard's onboarding wizard walks you through the rest in five clicks.
-          Every other install path is still a single binary; Docker is just the fastest.
+      <section class="doc-section" id="setup-hero">
+        <p class="eyebrow">// install &amp; setup</p>
+        <h2>One command, and the credentials are printed for you</h2>
+        <p style="max-width:70ch; font-size:1.05rem;">
+          The installer generates the API token and webhook secret, starts the daemon and
+          Traefik, verifies the wiring, points your CLI at it, and ends by printing everything
+          you need. There is no <code>.env</code> to hand-wire and no log to grep.
         </p>
-        <pre class="cmd-block"><span class="tk-green">TL;DR</span>  <span class="tk-gray">— copy, paste, open the wizard:</span>
-curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
-<span class="tk-gray"># → open http://localhost:8080  → /ui/onboarding</span></pre>
+        <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker</pre>
+        <p>What it prints when it finishes:</p>
+        <pre class="cmd-block"><span class="tk-green">[+]</span> daemon is healthy
+<span class="tk-green">[+]</span> Traefik + network verified (scale-to-zero ready)
+<span class="tk-green">[+]</span> CLI configured — try: oxid doctor
+
+<span class="tk-green">[+]</span> Oxid is up. Everything below is ready to use — nothing else to run.
+
+    Dashboard    http://127.0.0.1:8080/     (on this machine)
+    API token    bf1e7e43fab77a1b7d7974b4a577799c1…
+                 (paste into the dashboard's token box — the CLI on this
+                  machine is already configured with it)
+
+    CLI          oxid doctor          (verifies the token) — then oxid ps
+    Deploy       oxid up &lt;branch&gt;     (from a git checkout)
+
+    Webhook      secret: 1bd90a7984e61c053e24d49ca8c9f569…</pre>
+        <p class="note">
+          Re-running the installer is safe: existing secrets are reused and
+          <strong>never rotated</strong>.
+        </p>
       </section>
 
-      <section class="doc-section" id="install-docker">
-        <h2>Docker — zero-config (recommended)</h2>
-        <p>Fastest path to a production-topology stack (daemon + Traefik, wake-on-request wired).</p>
-
-        <h3 style="font-size:1.05rem; margin:1.5rem 0 0.5rem;">Option A — installer (one line)</h3>
-        <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
-<span class="tk-gray"># verifies checksums of the released CLI, generates OXID_API_TOKEN + WEBHOOK_SECRET</span>
-<span class="tk-gray"># into ./oxid-stack/.env (0600, never rotated on re-run), pulls ghcr.io/sazardev/oxid,</span>
-<span class="tk-gray"># starts daemon + Traefik, waits for /health and verifies wiring.</span>
-
-<span class="tk-gray"># your stack lives in ./oxid-stack — upgrade with:</span>
-<span class="tk-gray">$</span> cd oxid-stack &amp;&amp; docker compose pull &amp;&amp; docker compose up -d</pre>
-        <p class="note">Re-running the installer is safe — existing secrets are reused, never rotated. Your token lives at <code>./oxid-stack/.env</code> (<code>grep ^OXID_API_TOKEN .env</code>).</p>
-
-        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">Option B — manual compose (no <code>.env</code> needed)</h3>
-        <p>Thanks to <code>OXID_AUTO_TOKEN=1</code> the shipped compose file works with <em>nothing</em> to fill in:</p>
-        <pre class="cmd-block"><span class="tk-gray">$</span> git clone https://github.com/sazardev/oxid &amp;&amp; cd oxid
-<span class="tk-gray">$</span> docker compose up -d
-<span class="tk-gray">$</span> docker compose logs oxid-daemon | grep -A2 Generated  <span class="tk-gray"># your token, printed once</span>
-<span class="tk-gray"># → Dashboard: http://localhost:8080</span></pre>
-        <p>Both tokens are generated (64 hex), persisted to <code>/data/api-token</code> and <code>/data/webhook-secret</code> (0600) inside the <code>oxid-data</code> volume, and never logged again. Retrieve later with <code>docker compose cp oxid-daemon:/data/api-token -</code> or simply re-read the volume. Explicit env values always win — pin your own by setting <code>OXID_API_TOKEN</code> / <code>OXID_WEBHOOK_SECRET</code> in a <code>.env</code>.</p>
-
-        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">Option C — single <code>docker run</code></h3>
-        <pre class="cmd-block">docker run -d --name oxid-daemon \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v oxid-data:/data \
-  -p 8080:8080 \
-  -e OXID_API_TOKEN=$(openssl rand -hex 32) \
-  -e OXID_WEBHOOK_SECRET=$(openssl rand -hex 32) \
-  ghcr.io/sazardev/oxid:latest
-<span class="tk-gray"># or: docker build -t oxid-daemon .  from source</span></pre>
-        <p class="note">See <code>docker-compose.yml</code> for the Traefik-wired reference stack. <code>OXID_DOCKER_NETWORK=oxid-net</code> is the supported production topology; without it, scale-to-zero is disabled by design and each env gets its own host port.</p>
-      </section>
-
-      <section class="doc-section" id="install-wizard">
-        <h2>First 5 minutes — the wizard</h2>
-        <p>First visit to <code>http://localhost:8080</code> auto-redirects to <code>/ui/onboarding</code>. Five steps, everything also available later via CLI or API:</p>
+      <section class="doc-section" id="setup-paths">
+        <h2>Choosing a path</h2>
         <table class="docs-table">
-          <thead><tr><th>#</th><th>Step</th><th>What it does</th><th>Behind the scenes</th></tr></thead>
+          <thead><tr><th>Command</th><th>What you get</th><th>Best for</th></tr></thead>
           <tbody>
-            <tr><td>1</td><td><strong>Token</strong></td><td>Paste <code>OXID_API_TOKEN</code>. With <code>OXID_AUTO_TOKEN</code> the hint shows <code>docker compose logs | grep Generated</code>.</td><td><code>GET /api/v1/stats</code> verifies</td></tr>
-            <tr><td>2</td><td><strong>Infrastructure</strong></td><td>Checklist: Docker network, Traefik, self-wiring. One-click fix if anything is missing.</td><td><code>GET /api/v1/infra/status</code> → <code>POST /api/v1/infra/bootstrap</code> (idempotent)</td></tr>
-            <tr><td>3</td><td><strong>First project</strong></td><td>Register by <strong>Git URL</strong> (<code>https://…</code> or scp-style <code>git@host:org/repo.git</code>; private repos take an encrypted PAT) or a path under mounted <code>./repos</code>. Kicks off first deploy of <code>main</code> with live polling.</td><td><code>POST /api/v1/projects {"repo_url":…}</code> → <code>POST /api/v1/projects/{id}/deploy</code></td></tr>
-            <tr><td>4</td><td><strong>Webhooks</strong></td><td>Pick provider, copy URL + auto-generated secret into your Git host. Every push deploys its branch from then on.</td><td><code>GET /api/v1/setup/webhook-secret</code> (master only)</td></tr>
-            <tr><td>5</td><td><strong>CLI</strong></td><td>Copy-paste <code>oxid context add prod --api … --token …</code> and a <code>curl</code> snippet for programmatic registration.</td><td>—</td></tr>
+            <tr>
+              <td><code>sh -s -- --docker</code></td>
+              <td>Compose stack in <code>./oxid-stack</code>: daemon + Traefik, wake-on-request wired, published on <code>127.0.0.1:8080</code>.</td>
+              <td>Almost everyone. Production topology, nothing to configure.</td>
+            </tr>
+            <tr>
+              <td><code>sh -s -- --server</code></td>
+              <td>Native binaries + a systemd unit, <code>/etc/oxid/oxidd.env</code>, bound to <code>0.0.0.0:8080</code>.</td>
+              <td>A dedicated host where you want the daemon outside Docker.</td>
+            </tr>
+            <tr>
+              <td><code>sh</code> (no flags)</td>
+              <td><code>oxid</code> and <code>oxidd</code> in <code>/usr/local/bin</code> (or <code>~/.local/bin</code> without root). Nothing started.</td>
+              <td>Running the daemon under your own supervisor, or just the CLI.</td>
+            </tr>
           </tbody>
         </table>
-        <p>Finish → <code>/ui/environments</code> with your first branch <code>running</code>. Re-run anytime from <em>Setup</em> in the top bar or <code>/ui/onboarding</code>; dismissing sets <code>localStorage oxid_onboarded</code>.</p>
-        <p class="note">Direct-publish mode (no <code>OXID_DOCKER_NETWORK</code>) shows "nothing to bootstrap" at step 2 — a valid topology where each env just gets its own host port. No DNS needed.</p>
+        <p>Flags accepted by every mode:</p>
+        <table class="docs-table">
+          <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><code>--version TAG</code></td><td>Pin a release (default: latest published).</td></tr>
+            <tr><td><code>--bindir DIR</code></td><td>Where binaries go (default <code>/usr/local/bin</code>, falling back to <code>~/.local/bin</code> without root).</td></tr>
+            <tr><td><code>--root DIR</code></td><td>Sandbox prefix for <code>/etc</code>, <code>/var</code> and systemd paths — for testing and containers.</td></tr>
+            <tr><td><code>--no-start</code></td><td>Write everything, start nothing.</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Prebuilt binaries cover Linux (musl/gnu, x86_64/aarch64), macOS and Windows. On
+          macOS drop <code>--server</code>/<code>--docker</code> and install with
+          <code>--bindir</code>, or use <code>nix run github:sazardev/oxid</code>.
+        </p>
       </section>
 
-      <section class="doc-section" id="install-cli">
-        <h2>CLI alternative — no browser needed</h2>
-        <p>The same flow from the terminal, against any daemon (local or remote). The daemon clones the repo itself when you pass a URL — no shared filesystem.</p>
-        <pre class="cmd-block"><span class="tk-gray"># point the CLI at the daemon (once):</span>
-oxid context add prod --api http://localhost:8080 --token $OXID_API_TOKEN
-oxid doctor  <span class="tk-gray"># reachability + token check</span>
+      <section class="doc-section" id="setup-docker">
+        <h2>Docker &mdash; what actually happens</h2>
+        <p>In order, so nothing is a surprise:</p>
+        <ol style="color:#c7c7ca; margin:0 0 1.25rem; padding-left:1.35rem; display:grid; gap:0.45rem;">
+          <li>Fetches <code>docker-compose.yml</code> into <code>./oxid-stack</code> and pins the image to <code>ghcr.io/sazardev/oxid:&lt;version&gt;</code>, verifying the pin took.</li>
+          <li>Writes <code>./oxid-stack/.env</code> at <code>0600</code> with a fresh 64-hex <code>OXID_API_TOKEN</code> and <code>OXID_WEBHOOK_SECRET</code> &mdash; unless one already exists, which is reused untouched.</li>
+          <li><code>docker compose up -d</code>, then waits up to 60s for <code>/api/v1/health</code>.</li>
+          <li><code>POST /api/v1/infra/bootstrap</code> (retried three times) to create the <code>oxid-net</code> network and the Traefik container that scale-to-zero needs.</li>
+          <li><code>oxid context add local</code> <em>and</em> <code>oxid context use local</code>, so the CLI on this machine is authenticated without any flags.</li>
+        </ol>
+        <p>What lands on disk:</p>
+        <pre class="cmd-block">./oxid-stack
+├── docker-compose.yml   <span class="tk-gray"># daemon + Traefik, image pinned</span>
+└── .env                 <span class="tk-gray"># 0600 — API token + webhook secret</span>
 
-<span class="tk-gray"># register + deploy in one:</span>
+<span class="tk-gray"># daemon state lives in the `oxid-data` docker volume (see Daemon → data layout)</span></pre>
+        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">Without the installer</h3>
+        <p>
+          The shipped compose runs with <code>OXID_AUTO_TOKEN=1</code>, so it works with
+          nothing filled in &mdash; the daemon generates both credentials, persists them
+          under <code>/data</code> at <code>0600</code>, and prints them once:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> git clone https://github.com/sazardev/oxid &amp;&amp; cd oxid
+<span class="tk-gray">$</span> docker compose up -d
+<span class="tk-gray">$</span> docker compose logs oxid-daemon | grep -A2 Generated   <span class="tk-gray"># printed once</span></pre>
+        <p>
+          Explicit values always win: set <code>OXID_API_TOKEN</code> /
+          <code>OXID_WEBHOOK_SECRET</code> in a <code>.env</code> to pin your own. Retrieve a
+          generated one later with
+          <code>docker compose cp oxid-daemon:/data/api-token -</code>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="setup-network">
+        <h2>Where it listens &mdash; and what that means</h2>
+        <p>
+          The daemon binds <code>0.0.0.0:8080</code> <em>inside</em> its container, but the
+          compose publishes <code>127.0.0.1:8080:8080</code>. The control API is reachable
+          from the host and from nowhere else. That is the right default for something holding
+          the Docker socket, and it has one visible consequence: <strong>a Git host cannot
+          deliver webhooks to it yet.</strong>
+        </p>
+        <p>To expose it, change the publish and the bootstrap-token setting together:</p>
+        <pre class="cmd-block"><span class="tk-gray"># oxid-stack/docker-compose.yml</span>
+    ports:
+      - <span class="tk-green">"8080:8080"</span>        <span class="tk-gray"># was "127.0.0.1:8080:8080"</span>
+    environment:
+      OXID_BOOTSTRAP_TOKEN_ACCESS: <span class="tk-green">"loopback"</span>   <span class="tk-gray"># was "any"</span>
+
+<span class="tk-gray">$</span> docker compose up -d</pre>
+        <p class="note">
+          <code>any</code> is only correct while the port is private &mdash; it hands the
+          master token to any caller that can reach it, pre-auth. See
+          <a href="security.html#sec-bootstrap">Security &rarr; bootstrap token</a> before
+          widening the publish.
+        </p>
+        <p>
+          The <code>--server</code> mode binds <code>0.0.0.0:8080</code> with no publish in
+          front, so it is reachable on the host's own address from the start. Put it behind
+          Traefik or a firewall accordingly.
+        </p>
+      </section>
+
+      <section class="doc-section" id="setup-verify">
+        <h2>Verifying the install</h2>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid doctor
+<span class="tk-green">[+]</span> Daemon reachable at http://127.0.0.1:8080 (v0.3.1, 0ms)
+<span class="tk-green">[+]</span> Control API authenticates correctly
+<span class="tk-green">[+]</span> CLI (v0.3.1) and daemon (v0.3.1) versions match
+<span class="tk-green">[+]</span> Docker capacity: 12 CPU(s), 15.5 GiB memory, 0 env(s) running
+<span class="tk-green">[+]</span> Docker network `oxid-net` exists
+<span class="tk-green">[+]</span> Traefik is running
+
+<span class="tk-gray">$</span> oxid ps        <span class="tk-gray"># registered projects — node-wide, needs no checkout</span></pre>
+        <p class="note">
+          <code>oxid status</code> is <em>not</em> the command to check an install with: it is
+          scoped to the checkout it runs in and registers it. <code>doctor</code> and
+          <code>ps</code> ask about the daemon itself.
+        </p>
+      </section>
+
+      <section class="doc-section" id="setup-first">
+        <h2>Your first deploy</h2>
+        <p>
+          The daemon clones the repository itself, so it needs a URL it can reach &mdash; not
+          a path on your laptop:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray"># register and deploy in one:</span>
 oxid up main --repo https://github.com/you/app.git
-<span class="tk-gray"># private repo:</span>
+
+<span class="tk-gray"># private repo (the PAT is stored encrypted, never echoed back):</span>
 oxid up main --repo https://github.com/you/private.git --git-token ghp_xxx
 
-<span class="tk-gray"># infra (same as the wizard's step 2):</span>
-oxid infra status
-oxid infra setup  <span class="tk-gray"># idempotent</span></pre>
-        <p class="note">Every command speaks <code>--json</code> with distinct exit codes for CI. See <a href="cli.html">CLI reference</a>.</p>
+<span class="tk-gray"># from inside a checkout, --repo is inferred from its `origin`:</span>
+cd ~/code/app &amp;&amp; oxid up main</pre>
+        <p>
+          That last form is worth explaining. Registration sends the working-tree path, which
+          a containerized daemon cannot see &mdash; and a container is what the Docker install
+          runs. When the daemon rejects the path, the CLI retries with the checkout's
+          <code>origin</code> and says so:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">[~]</span> daemon cannot see /home/you/code/app (it is likely containerized)
+    — registering its origin instead: https://github.com/you/app.git</pre>
+        <p>
+          No Dockerfile? None is needed for the common stacks &mdash; see
+          <a href="stacks.html">Stacks &amp; builds</a>.
+        </p>
       </section>
 
-      <section class="doc-section" id="install-other">
+      <section class="doc-section" id="setup-webhooks">
+        <h2>Webhooks &mdash; deploy on push</h2>
+        <p>
+          Point your Git host at the daemon and every push deploys its branch; deleting a
+          branch destroys its environment.
+        </p>
+        <pre class="cmd-block">URL     http://YOUR-HOST:8080/api/v1/webhooks/github
+        <span class="tk-gray"># also: /gitlab, /gitea, /gogs</span>
+Secret  <span class="tk-gray">the OXID_WEBHOOK_SECRET the installer printed</span>
+        <span class="tk-gray">(or: grep ^OXID_WEBHOOK_SECRET oxid-stack/.env | cut -d= -f2)</span></pre>
+        <p>Two things to get right:</p>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
+          <li><strong>The port has to be reachable by the Git host</strong> &mdash; see <a href="#setup-network">where it listens</a>. A default Docker install is loopback-only.</li>
+          <li><strong>The secret must match.</strong> Webhooks are rejected entirely while <code>OXID_WEBHOOK_SECRET</code> is unset, and a bad signature is a 401.</li>
+        </ul>
+        <p>A quick check that the secret is right, without waiting for a push:</p>
+        <pre class="cmd-block"><span class="tk-gray"># 404 = signature accepted, repo just isn't registered. 401 = wrong secret.</span>
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://127.0.0.1:8080/api/v1/webhooks/github \
+  -H 'X-GitHub-Event: push' -H 'X-Hub-Signature-256: sha256=&lt;hmac&gt;' \
+  -d '{"ref":"refs/heads/main","repository":{"full_name":"you/app"}}'</pre>
+      </section>
+
+      <section class="doc-section" id="setup-server">
+        <h2>Native server &mdash; systemd</h2>
+        <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --server</pre>
+        <p>Writes, all at <code>0600</code> where they hold secrets:</p>
+        <table class="docs-table">
+          <thead><tr><th>Path</th><th>Contents</th></tr></thead>
+          <tbody>
+            <tr><td><code>/usr/local/bin/oxid</code>, <code>oxidd</code></td><td>CLI and daemon binaries.</td></tr>
+            <tr><td><code>/etc/oxid/oxidd.env</code></td><td>Generated token + webhook secret, <code>OXID_DATA_DIR=/var/lib/oxid</code>, <code>OXID_DOCKER_NETWORK=oxid-net</code>, <code>OXID_DAEMON_URL=http://172.17.0.1:8080</code>, backups every 300s keeping 7, JSON logs.</td></tr>
+            <tr><td><code>/etc/systemd/system/oxidd.service</code></td><td><code>Restart=on-failure</code>, <code>NoNewPrivileges=true</code>, <code>LimitNOFILE=65535</code>.</td></tr>
+            <tr><td><code>/var/lib/oxid/</code></td><td>Database, master key, git cache, backups.</td></tr>
+          </tbody>
+        </table>
+        <pre class="cmd-block"><span class="tk-gray">$</span> journalctl -u oxidd -f
+<span class="tk-gray">$</span> sudo grep ^OXID_API_TOKEN /etc/oxid/oxidd.env | cut -d= -f2</pre>
+        <p class="note">
+          TLS: terminate at Traefik, or set <code>OXID_TLS_CERT</code>/<code>OXID_TLS_KEY</code>
+          in that env file and <code>systemctl restart oxidd</code>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="setup-other">
         <h2>Other ways to run</h2>
 
         <article class="doc-entry">
-          <h3>Native server — systemd</h3>
-          <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --server
-<span class="tk-gray"># installs to /usr/local/bin, writes /etc/oxid/oxidd.env (0600)</span>
-<span class="tk-gray"># + /etc/systemd/system/oxidd.service, starts, waits for /health, bootstraps Traefik.</span>
-<span class="tk-gray">$</span> journalctl -u oxidd -f          <span class="tk-gray"># logs</span>
-<span class="tk-gray">$</span> sudo grep ^OXID_API_TOKEN /etc/oxid/oxidd.env | cut -d= -f2  <span class="tk-gray"># your token</span></pre>
-        </article>
-
-        <article class="doc-entry">
-          <h3>Binaries only</h3>
-          <pre class="cmd-block">curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh
-<span class="tk-gray"># → /usr/local/bin/oxid and /usr/local/bin/oxidd (or ~/.local/bin without root)</span>
-<span class="tk-gray"># then run oxidd under your own supervisor with the env vars from Daemon docs.</span></pre>
+          <h3>Single <code>docker run</code></h3>
+          <pre class="cmd-block">docker run -d --name oxid-daemon \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v oxid-data:/data \
+  -p 127.0.0.1:8080:8080 \
+  -e OXID_API_TOKEN=$(openssl rand -hex 32) \
+  -e OXID_WEBHOOK_SECRET=$(openssl rand -hex 32) \
+  ghcr.io/sazardev/oxid:latest</pre>
+          <p class="note">
+            Without <code>OXID_DOCKER_NETWORK=oxid-net</code> this is <em>direct-publish
+            mode</em>: each environment gets its own host port, no DNS is needed, and
+            scale-to-zero is off by design &mdash; idle detection is driven by Traefik's
+            heartbeat, which is not in the path.
+          </p>
         </article>
 
         <article class="doc-entry">
           <h3>Nix / NixOS</h3>
           <pre class="cmd-block">nix run github:sazardev/oxid#oxid -- ps
 nix run github:sazardev/oxid#oxidd
-<span class="tk-gray"># or: nix develop  # dev shell with full toolchain</span></pre>
+<span class="tk-gray"># or: nix develop  # dev shell with the full toolchain</span></pre>
         </article>
 
         <article class="doc-entry">
           <h3>From source</h3>
           <pre class="cmd-block">git clone https://github.com/sazardev/oxid &amp;&amp; cd oxid
-cargo build --workspace  <span class="tk-gray"># toolchain pinned in rust-toolchain.toml</span>
-cargo run -p oxid-daemon  <span class="tk-gray"># or: cargo run -p oxid-cli -- ps</span></pre>
-          <p class="note">See <a href="https://github.com/sazardev/oxid/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> for the <code>fmt → clippy -D warnings → test</code> gate order and hook setup.</p>
+cargo build --workspace   <span class="tk-gray"># toolchain pinned in rust-toolchain.toml</span>
+cargo run -p oxid-daemon</pre>
+          <p class="note">
+            See <a href="https://github.com/sazardev/oxid/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
+            for the <code>fmt → clippy -D warnings → test</code> gate order and hook setup.
+          </p>
         </article>
 
         <article class="doc-entry">
           <h3>Requirements</h3>
-          <ul style="color:#c7c7ca; margin:0; padding-left:1.25rem; display:grid; gap:0.3rem;">
-            <li>Docker on the daemon host (build/run/pause) — not needed for <code>cargo test</code> (pure <code>oxid-core</code> tests are instant).</li>
-            <li>A long random <code>OXID_API_TOKEN</code> when binding beyond <code>127.0.0.1</code> (the daemon refuses to start otherwise; override with <code>OXID_ALLOW_OPEN_API=1</code>).</li>
-            <li>For Traefik subdomains: a wildcard DNS/hosts entry pointing at the host (e.g. <code>*.local.dev → 127.0.0.1</code>).</li>
+          <ul style="color:#c7c7ca; margin:0; padding-left:1.25rem; display:grid; gap:0.35rem;">
+            <li>Docker on the daemon host, for build/run/stop. Not needed for <code>cargo test</code>.</li>
+            <li>A long random <code>OXID_API_TOKEN</code> for any non-loopback bind &mdash; the daemon refuses to start otherwise.</li>
+            <li>For subdomain routing: a wildcard DNS or hosts entry pointing at the host, e.g. <code>*.local.dev → 127.0.0.1</code>.</li>
           </ul>
         </article>
       </section>
 
-      <section class="doc-section" id="install-upgrade">
-        <h2>Upgrading</h2>
-        <pre class="cmd-block"><span class="tk-gray"># installer-managed docker stack:</span>
+      <section class="doc-section" id="setup-upgrade">
+        <h2>Upgrading and removing</h2>
+        <pre class="cmd-block"><span class="tk-gray"># docker stack:</span>
 cd oxid-stack &amp;&amp; docker compose pull &amp;&amp; docker compose up -d
 
-<span class="tk-gray"># binaries (re-run is safe — secrets never rotated):</span>
-curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
+<span class="tk-gray"># native/binaries — re-running never rotates secrets:</span>
 curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --server</pre>
-        <p class="note">Migrations in <code>crates/oxid-daemon/migrations/*.sql</code> run automatically at startup via <code>sqlx</code>. Pre-built binaries for every tagged release cover Linux (musl/gnu x86_64/aarch64), macOS and Windows — see <a href="https://github.com/sazardev/oxid/releases">Releases</a>.</p>
+        <p>
+          Migrations run automatically at startup. Pre-built binaries exist for every tagged
+          release &mdash; see <a href="https://github.com/sazardev/oxid/releases">Releases</a>.
+        </p>
+        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">Removing it</h3>
+        <p>There is no uninstall flag; removal is explicit, because <code>-v</code> destroys
+          your data:</p>
+        <pre class="cmd-block"><span class="tk-gray"># docker stack — `down -v` also deletes the oxid-data volume:</span>
+cd oxid-stack &amp;&amp; docker compose down -v
+docker rm -f oxid-traefik &amp;&amp; docker network rm oxid-net
+
+<span class="tk-gray"># native:</span>
+sudo systemctl disable --now oxidd
+sudo rm /etc/systemd/system/oxidd.service /usr/local/bin/oxid{,d}
+sudo rm -rf /etc/oxid /var/lib/oxid          <span class="tk-gray"># this is your data</span>
+
+<span class="tk-gray"># cli config, if you want it gone too:</span>
+rm -f ~/.config/oxid/config.toml</pre>
+        <p class="note">
+          Take an <code>oxid backup</code> first if there is anything you might want back
+          &mdash; the archive carries the database and the master key together, which is the
+          only combination that restores.
+        </p>
       </section>
 
-      <section class="doc-section" id="install-next">
+      <section class="doc-section" id="setup-trouble">
+        <h2>When it doesn't work</h2>
+        <table class="docs-table">
+          <thead><tr><th>Symptom</th><th>Cause and fix</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><code>401 Unauthorized: missing or invalid bearer token</code></td>
+              <td>The CLI is not pointed at this daemon. <code>oxid context use local</code>, or pass <code>--token "$(grep ^OXID_API_TOKEN oxid-stack/.env | cut -d= -f2)"</code>. An <code>OXID_TOKEN</code> left in your shell overrides the stored context.</td>
+            </tr>
+            <tr>
+              <td><code>connection refused</code> on the host's LAN address</td>
+              <td>Expected: the Docker stack publishes on <code>127.0.0.1</code>. Use <code>127.0.0.1:8080</code>, or <a href="#setup-network">widen the publish</a>.</td>
+            </tr>
+            <tr>
+              <td><code>git failure: failed to resolve path '/home/…'</code></td>
+              <td>A containerized daemon cannot see your checkout. Upgrade to v0.3.1+, where the CLI falls back to the checkout's <code>origin</code>, or pass <code>--repo &lt;url&gt;</code> explicitly.</td>
+            </tr>
+            <tr>
+              <td><code>infra bootstrap failed</code></td>
+              <td>The daemon was not ready or the token was wrong. <code>cd oxid-stack &amp;&amp; docker compose restart oxid-daemon</code>, then <code>oxid infra setup</code> (idempotent).</td>
+            </tr>
+            <tr>
+              <td>Environments 404 after going idle</td>
+              <td>The wake catch-all router is missing. <code>oxid infra status</code> reports it; it ships in the compose file and is what turns a request for a stopped environment into a wake.</td>
+            </tr>
+            <tr>
+              <td>Webhook pushes do nothing</td>
+              <td>Check the daemon is reachable from the Git host at all, then that the secret matches — the provider's delivery log shows the response code. 401 is the secret; 404 is a repository that is not registered under that exact path.</td>
+            </tr>
+            <tr>
+              <td><code>no service declares a build: key</code></td>
+              <td>The repository has a <code>docker-compose.yml</code> Oxid found first. Add <code>build: .</code> to the service you want deployed, or an <code>oxid.toml</code>.</td>
+            </tr>
+            <tr>
+              <td>Daemon refuses to start</td>
+              <td>A non-loopback bind with no <code>OXID_API_TOKEN</code>. Set one — or <code>OXID_ALLOW_OPEN_API=1</code> if you genuinely want an open API.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="doc-section" id="setup-next">
         <h2>Next steps</h2>
         <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
-          <li>Point webhooks at <code>http://DAEMON:8080/api/v1/webhooks/{github,gitlab,gitea,gogs}</code> with the same <code>OXID_WEBHOOK_SECRET</code> — every push deploys, branch deletion destroys.</li>
-          <li>Scope team access: <code>oxid token create alice --project 1</code> (project-scoped tokens 404 outside their projects) — or via the dashboard's Admin page.</li>
-          <li>Configure shared Postgres/Redis: add <code>OXID_POSTGRES_URL</code> / <code>OXID_REDIS_URL</code> to the daemon env so projects declaring those dependencies get per-branch logical databases.</li>
-          <li>Backups: <code>OXID_BACKUP_INTERVAL_SECS</code> or a Litestream sidecar (see <code>docker-compose.yml</code>); restore with <code>oxid restore</code>.</li>
+          <li>Stop using the master token day to day: <code>oxid token create alice --project 1</code> — see <a href="security.html#sec-tokens">token scoping</a>.</li>
+          <li>Shared Postgres/Redis: set <code>OXID_POSTGRES_URL</code> / <code>OXID_REDIS_URL</code> so projects declaring those dependencies get a logical database per branch.</li>
+          <li>Backups: <code>OXID_BACKUP_INTERVAL_SECS</code>, restored with <code>oxid restore</code>.</li>
+          <li>Tune throughput: <code>OXID_DEPLOY_CONCURRENCY</code> — 15 simultaneous pushes settle in 7.1s at the default, 4.2s at 16.</li>
         </ul>
-        <p>Deep dive: <a href="daemon.html">Daemon env vars</a> · <a href="cli.html">CLI reference</a> · <a href="api.html">HTTP API</a> · <a href="dashboard.html">Web dashboard</a> · <a href="https://github.com/sazardev/oxid/blob/main/PRODUCTION.md">PRODUCTION.md</a></p>
+        <p>Deep dive: <a href="guide.html">How Oxid is used</a> &middot; <a href="stacks.html">Stacks &amp; builds</a> &middot; <a href="daemon.html">Daemon env vars</a> &middot; <a href="cli.html">CLI reference</a> &middot; <a href="api.html">HTTP API</a> &middot; <a href="security.html">Security</a> &middot; <a href="https://github.com/sazardev/oxid/blob/main/PRODUCTION.md">PRODUCTION.md</a></p>
       </section>
 
       <p class="docs-footer-note">
@@ -216,7 +429,7 @@ curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh 
 
   <footer class="site-footer">
     <div class="wrap footer-inner">
-      <a href="#install-hero" class="brand">
+      <a href="#content" class="brand">
         <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
         <span>oxid</span>
       </a>

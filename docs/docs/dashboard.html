@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Oxid — Web dashboard</title>
-  <meta name="description" content="The Oxid web dashboard: embedded in the daemon binary, no build step — sections, authentication and what it can do." />
+  <meta name="description" content="Oxid's embedded web dashboard: every view, the five-step setup wizard, offline PWA behaviour, responsive and accessible layout down to 320px, and how authentication works." />
   <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -29,7 +29,7 @@
         <a href="../#features">Features</a>
         <a href="../#how">How it works</a>
         <a href="../#status">Status</a>
-        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub &#8599;</a>
       </nav>
     </div>
   </header>
@@ -39,57 +39,179 @@
       <nav>
         <p class="side-group">Overview</p>
         <a href="index.html">Docs home</a>
-        <a href="install.html">Install</a>
+        <a href="install.html">Install &amp; setup</a>
         <p class="side-group">Guide</p>
         <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html" class="current">Web dashboard</a>
+        <a href="#dash-views" class="sub">The views</a>
+        <a href="#dash-wizard" class="sub">Setup wizard</a>
+        <a href="#dash-pwa" class="sub">Offline / PWA</a>
+        <a href="#dash-responsive" class="sub">Small screens</a>
+        <a href="#dash-i18n" class="sub">Language</a>
+        <a href="#dash-token" class="sub">Authentication</a>
+        <p class="side-group">Operate</p>
+        <a href="security.html">Security &amp; hardening</a>
       </nav>
     </aside>
 
     <main class="docs-content" id="content">
 
-      <section class="doc-section" id="dashboard">
+      <section class="doc-section" id="dash-intro">
         <p class="eyebrow">// dashboard</p>
         <h2>Web dashboard</h2>
-        <p>
-          Served by the daemon itself at <code>/</code> — a handful of static files embedded at
-          compile time, no build step, no bundler, no client-side dependency beyond a vendored
-          Alpine.js. Deep links like <code>/ui/projects/1</code> or
-          <code>/ui/environments/5?tab=logs</code> survive hard refreshes.
+        <p style="max-width:70ch;">
+          Served by the daemon itself at <code>/</code> &mdash; a handful of static files
+          embedded at compile time. No build step, no bundler, and <strong>no request that
+          leaves the host</strong>: Alpine.js is vendored, there is no webfont and no icon
+          font. Deep links like <code>/ui/projects/1</code> or
+          <code>/ui/environments/5?tab=logs</code> survive a hard refresh.
         </p>
+        <p>
+          Everything the panel does goes through the same <a href="api.html">HTTP API</a> the
+          CLI uses. There is no privileged back channel; anything you can do here you can
+          script.
+        </p>
+      </section>
 
+      <section class="doc-section" id="dash-views">
+        <h2>The views</h2>
         <table class="docs-table">
           <thead><tr><th>Section</th><th>What you'll find</th></tr></thead>
           <tbody>
-            <tr><td><code>/ui/onboarding</code></td><td><strong>Setup wizard</strong> — auto-opens on first visit. Five steps: token → infra bootstrap → register by Git URL → webhooks → CLI snippet. Re-run anytime from <em>Setup</em> in the top bar.</td></tr>
-            <tr><td><code>/ui/environments</code></td><td>Every environment across projects — filter by project, state or branch; pause/wake/destroy inline; auto-refresh.</td></tr>
-            <tr><td><code>/ui/environments/{id}</code></td><td>Detail view: address, commit, timestamps, plus tabs for live logs (SSE) and per-environment history.</td></tr>
-            <tr><td><code>/ui/projects</code></td><td>Registered projects and their live branches.</td></tr>
-            <tr><td><code>/ui/projects/{id}</code></td><td>Settings (lifetime policy, private-repo git token), deploy form, per-branch environments.</td></tr>
-            <tr><td><code>/ui/secrets</code></td><td>Global and project-scoped secrets — write-only, values never shown back.</td></tr>
-            <tr><td><code>/ui/queue</code></td><td>Deploys waiting for host capacity.</td></tr>
-            <tr><td><code>/ui/audit</code></td><td>Cross-project audit trail with search and deploy-time durations.</td></tr>
+            <tr><td><code>/ui/onboarding</code></td><td><strong>Setup wizard</strong> — auto-opens on first visit. Five steps, all of them also available from the CLI. Re-run anytime from <em>Setup</em> in the top bar.</td></tr>
+            <tr><td><code>/ui/environments</code></td><td>Every environment across projects — filter by project, state or branch; pause, wake and destroy inline; auto-refresh.</td></tr>
+            <tr><td><code>/ui/environments/{id}</code></td><td>Detail: address, commit, timestamps, plus tabs for live logs (SSE) and that environment's history.</td></tr>
+            <tr><td><code>/ui/projects</code></td><td>Registered projects, their live branches and their detected stack tag.</td></tr>
+            <tr><td><code>/ui/projects/{id}</code></td><td>Settings (idle/lifetime policy, private-repo git token), a deploy form, per-branch environments, and for a monorepo the list of detected services with the active one marked.</td></tr>
+            <tr><td><code>/ui/secrets</code></td><td>Global and project-scoped secrets. Write-only — values are never shown back.</td></tr>
+            <tr><td><code>/ui/queue</code></td><td>Deploys waiting for host capacity, oldest and highest-priority first.</td></tr>
+            <tr><td><code>/ui/audit</code></td><td>Cross-project audit trail with search and deploy durations.</td></tr>
+            <tr><td><code>/ui/diagnostics</code></td><td>The daemon's own health: Docker capacity, network and Traefik wiring, what is missing and how to fix it.</td></tr>
             <tr><td><code>/ui/admin</code></td><td>Backup download, master-key rotation, named API tokens.</td></tr>
           </tbody>
         </table>
+      </section>
 
+      <section class="doc-section" id="dash-wizard">
+        <h2>First five minutes &mdash; the wizard</h2>
+        <p>
+          The first visit redirects to <code>/ui/onboarding</code>. Every step has a CLI
+          equivalent; the wizard exists so a first install does not require reading these docs.
+        </p>
+        <table class="docs-table">
+          <thead><tr><th>#</th><th>Step</th><th>What it does</th><th>Behind the scenes</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td><strong>Token</strong></td><td>Paste the <code>OXID_API_TOKEN</code> — the installer printed it, or the daemon can hand it over directly depending on <code>OXID_BOOTSTRAP_TOKEN_ACCESS</code>.</td><td><code>GET /api/v1/setup/token</code>, verified with <code>GET /api/v1/stats</code></td></tr>
+            <tr><td>2</td><td><strong>Infrastructure</strong></td><td>Checks the Docker network, Traefik and the wake catch-all router. One click fixes whatever is missing.</td><td><code>GET /api/v1/infra/status</code> → <code>POST /api/v1/infra/bootstrap</code> (idempotent)</td></tr>
+            <tr><td>3</td><td><strong>First project</strong></td><td>Register by Git URL (<code>https://…</code> or scp-style <code>git@host:org/repo.git</code>; private repos take an encrypted PAT), then deploy <code>main</code> with live polling.</td><td><code>POST /api/v1/projects</code> → <code>POST /api/v1/projects/{id}/deploy</code></td></tr>
+            <tr><td>4</td><td><strong>Webhooks</strong></td><td>Pick a provider and copy the URL and secret into your Git host.</td><td><code>GET /api/v1/setup/webhook-secret</code> (master token only)</td></tr>
+            <tr><td>5</td><td><strong>CLI</strong></td><td>A copy-paste <code>oxid context add</code> line and a <code>curl</code> snippet for programmatic registration.</td><td>—</td></tr>
+          </tbody>
+        </table>
         <p class="note">
-          If a bearer token is configured on the daemon, paste it into the token field in the
-          top bar — it's kept in the browser's local storage and sent as
-          <code>Authorization: Bearer …</code> on every request. The same
-          <a href="api.html">API</a> powers everything you see here.
+          Direct-publish mode (no <code>OXID_DOCKER_NETWORK</code>) reports &ldquo;nothing to
+          bootstrap&rdquo; at step 2. That is a valid topology — each environment gets its own
+          host port and no DNS is needed — with scale-to-zero off by design.
         </p>
       </section>
+
+      <section class="doc-section" id="dash-pwa">
+        <h2>Installable, and it works offline</h2>
+        <p>
+          The panel is a PWA: <code>manifest.webmanifest</code>, a service worker and two SVG
+          icons are served from the same binary. Installed, it opens like an app; on a phone
+          with no connection it still opens.
+        </p>
+        <p>
+          What the service worker caches is the shell &mdash; HTML, CSS, JS, icons. It
+          <strong>never caches <code>/api/</code></strong>. A cached environment list is a lie
+          about live cluster state, and a lie about whether something is running is worse than
+          an error, so API requests go to the network and fail honestly when it is not there.
+          Tests assert that exclusion rather than trusting the comment.
+        </p>
+        <table class="docs-table">
+          <thead><tr><th>Asset</th><th>Size</th></tr></thead>
+          <tbody>
+            <tr><td><code>index.html</code></td><td>57.7 KB</td></tr>
+            <tr><td><code>app.js</code></td><td>54.5 KB</td></tr>
+            <tr><td><code>vendor/alpine.min.js</code></td><td>53.2 KB</td></tr>
+            <tr><td><code>i18n.js</code></td><td>46.2 KB</td></tr>
+            <tr><td><code>style.css</code></td><td>24.0 KB</td></tr>
+            <tr><td><strong>Whole shell</strong></td><td><strong>240 KB uncompressed</strong></td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Service-worker registration is best-effort: it needs a secure context, which a
+          daemon on a plain-HTTP LAN address does not have. The panel works either way; only
+          offline opening depends on it.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dash-responsive">
+        <h2>Small screens, coarse pointers, weak hardware</h2>
+        <p>
+          The layout is fluid from 320px to ultrawide, and verified there rather than assumed.
+        </p>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.45rem;">
+          <li><strong>Below 760px the tables become cards.</strong> Each <code>&lt;td&gt;</code> carries a <code>data-label</code> holding its column header, so the labels have exactly one source and cannot drift from the table.</li>
+          <li><strong>The nav becomes a thumb-scrollable strip</strong> instead of stacking into a wall of links.</li>
+          <li><strong><code>@media (pointer: coarse)</code> raises controls to a 44px target.</strong> A checkbox needs a wrapping <code>label.check</code> for this, since padding does not enlarge a replaced element.</li>
+          <li><strong>No webfont, no icon font, no CDN.</strong> Nothing to download and nothing to fail on a bad connection.</li>
+        </ul>
+      </section>
+
+      <section class="doc-section" id="dash-i18n">
+        <h2>Language</h2>
+        <p>
+          English and Spanish. The switcher re-renders every binding without a reload, because
+          <code>t()</code> reads the active locale on each call. Language is chosen as:
+          previous choice (<code>localStorage</code>), else <code>navigator.languages</code>,
+          else English.
+        </p>
+        <p>
+          Three things are deliberately <em>not</em> translated, each for a reason worth
+          keeping: <code>--json</code> output and API field names (scripts parse them), log
+          lines (aggregators match on their text), and anything wrapping a
+          <code>git2</code>/<code>bollard</code>/<code>sqlx</code> error &mdash; those strings
+          come from those libraries and are what an operator searches for.
+        </p>
+        <p class="note">
+          Catalogs are guarded by tests that fail on a missing key, a dropped placeholder, an
+          invented one, or a key the UI asks for that no catalog defines.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dash-token">
+        <h2>Authentication</h2>
+        <p>
+          If the daemon has a bearer token, paste it into the token field in the top bar. It is
+          kept in the browser's local storage and sent as
+          <code>Authorization: Bearer …</code> on every request &mdash; it is never written to
+          the daemon, and clearing site data removes it.
+        </p>
+        <p>
+          A project-scoped token works here too: other projects' routes answer 404 and
+          node-wide pages (admin, diagnostics) answer 403, so the panel shows a scoped operator
+          only their own projects. See <a href="security.html#sec-tokens">token scoping</a>.
+        </p>
+      </section>
+
+      <p class="docs-footer-note">
+        Something missing or wrong? The
+        <a href="https://github.com/sazardev/oxid/issues" target="_blank" rel="noopener">issue tracker</a>
+        takes docs bugs too.
+      </p>
     </main>
   </div>
 
   <footer class="site-footer">
     <div class="wrap footer-inner">
-      <a href="#dashboard" class="brand">
+      <a href="#content" class="brand">
         <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
         <span>oxid</span>
       </a>
