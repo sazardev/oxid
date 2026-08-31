@@ -183,10 +183,25 @@ services:
       # from the daemon instead of the proxy.
       - traefik.http.routers.oxid-wake-catchall.rule=HostRegexp(`^.+$`)
       - traefik.http.routers.oxid-wake-catchall.priority=1
-      - traefik.http.routers.oxid-wake-catchall.entrypoints=web
+      # Both entrypoints, and this is load-bearing under TLS. A sleeping
+      # branch has no router of its own, so this catch-all is what turns a
+      # request for it into a wake. With certificates configured the request
+      # arrives on `websecure` — either directly, or because the
+      # HTTP-to-HTTPS redirect sent it there — so a catch-all listening only
+      # on `web` means every sleeping branch stops waking the moment TLS is
+      # switched on. Listing both keeps plain-HTTP installs working exactly
+      # as before.
+      - traefik.http.routers.oxid-wake-catchall.entrypoints=web,websecure
       - traefik.http.routers.oxid-wake-catchall.service=oxid-wake
       - traefik.http.routers.oxid-wake-catchall.middlewares=oxid-wake-rewrite
       - traefik.http.middlewares.oxid-wake-rewrite.replacepath.path=/api/v1/wake
+      # Uncomment together with the ACME settings on the daemon: the
+      # catch-all needs its own certificate to answer on `websecure`, and
+      # under DNS-01 the wildcard is what covers a branch that has never
+      # been awake since certificates were enabled.
+      # - traefik.http.routers.oxid-wake-catchall.tls=true
+      # - traefik.http.routers.oxid-wake-catchall.tls.certresolver=oxid
+      # - traefik.http.routers.oxid-wake-catchall.tls.domains[0].main=*.your-base-domain
     restart: unless-stopped
 
   # OPTIONAL: streaming replication of the SQLite database to off-site

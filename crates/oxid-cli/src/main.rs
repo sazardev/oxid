@@ -544,7 +544,14 @@ fn api_base(cli_flag: Option<&str>) -> String {
 /// environments that predate `public_port`, then to the Traefik-style `url`
 /// when neither exists.
 fn env_display_address(base: &str, env: &Value) -> String {
-    let fallback = env["url"].as_str().unwrap_or("?").to_owned();
+    // In Traefik mode the address is the routed hostname, and the scheme
+    // depends on whether the daemon has certificates. It tells us
+    // (`url_scheme`); printing a bare hostname, which is what this did
+    // before, left a person to guess and paste something that did not work.
+    let fallback = match env["url"].as_str() {
+        Some(url) => format!("{}://{url}/", env["url_scheme"].as_str().unwrap_or("http")),
+        None => "?".to_owned(),
+    };
     let port = env["public_port"]
         .as_u64()
         .or_else(|| env["host_port"].as_u64());
@@ -557,6 +564,9 @@ fn env_display_address(base: &str, env: &Value) -> String {
         .split(['/', ':'])
         .next()
         .unwrap_or("127.0.0.1");
+    // Direct-publish reaches the container's own port, never the proxy that
+    // terminates TLS, so this one genuinely is plain HTTP whatever the
+    // daemon's routing scheme is.
     format!("http://{host}:{port}/")
 }
 

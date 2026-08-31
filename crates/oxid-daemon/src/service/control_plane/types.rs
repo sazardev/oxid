@@ -155,7 +155,7 @@ impl InfraStatus {
                  \x20\x20\x20\x20- \"traefik.http.services.oxid-wake.loadbalancer.server.port=8080\"\n\
                  \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.rule=HostRegexp(`^.+$`)\"\n\
                  \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.priority=1\"\n\
-                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.entrypoints=web\"\n\
+                 \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.entrypoints=web,websecure\"\n\
                  \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.service=oxid-wake\"\n\
                  \x20\x20\x20\x20- \"traefik.http.routers.oxid-wake-catchall.middlewares=oxid-wake-rewrite\"\n\
                  \x20\x20\x20\x20- \"traefik.http.middlewares.oxid-wake-rewrite.replacepath.path=/api/v1/wake\"\n\

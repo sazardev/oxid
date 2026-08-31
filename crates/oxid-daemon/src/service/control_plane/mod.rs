@@ -261,6 +261,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         if self.acme.is_some() { "https" } else { "http" }
     }
 
+    /// An environment's address as a person should type it, scheme included.
+    ///
+    /// The CLI used to print the bare hostname in Traefik mode, because the
+    /// scheme is a property of the proxy and only the daemon knows it. Now
+    /// that certificates can be on, guessing `http://` would be wrong half
+    /// the time and copying the bare host is wrong every time.
+    #[must_use]
+    pub fn public_url(&self, env: &oxid_core::Environment) -> String {
+        if self.docker_network.is_some() {
+            format!("{}://{}/", self.routing_scheme(), env.url)
+        } else {
+            // Direct-publish: the container's own port, never behind the
+            // proxy that terminates TLS, so it genuinely is plain HTTP.
+            env.public_port
+                .or(env.host_port)
+                .map_or_else(|| env.url.clone(), |p| format!("http://<host>:{p}/"))
+        }
+    }
+
     /// Sets the host port the built-in Traefik publishes on
     /// (`OXID_TRAEFIK_HTTP_PORT`). Defaults to 80.
     #[must_use]

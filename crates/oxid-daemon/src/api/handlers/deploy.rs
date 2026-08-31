@@ -64,7 +64,15 @@ pub async fn deploy<
     {
         DeployOutcome::Deployed(env, report) => Ok((
             StatusCode::CREATED,
-            Json(environment_with_report(&env, &report)),
+            Json({
+                let mut body = environment_with_report(&env, &report);
+                // The scheme is a property of the proxy, and only the daemon
+                // knows whether certificates are configured. Sending it means
+                // the CLI prints a URL a person can paste rather than a bare
+                // hostname it had to guess at.
+                body["url_scheme"] = json!(state.cp.routing_scheme());
+                body
+            }),
         )
             .into_response()),
         DeployOutcome::Queued { position } => Ok((
