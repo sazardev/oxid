@@ -74,6 +74,17 @@ is the breaking position.
 
 ### Fixed
 
+- **Two branches could be handed the same Redis database.** Picking the
+  lowest free index is a read followed by a write, and the only thing making
+  that atomic was an *in-process* lock guarding a *fleet-wide* resource. The
+  unique index on `resource_leases` is per `(project, branch, kind,
+  instance)` — not per slot — so nothing in the database would have caught
+  it: both branches got index 3, and one would find the other's keys. The
+  claim is now conditional in a single statement. Deliberately no `UNIQUE
+  (kind, instance, resource_name)` migration: it would fail to apply on any
+  install that already hit this, and a daemon that refuses to start is worse
+  than the bug.
+
 - **`oxid infra setup` failed on any host that had never pulled Traefik.**
   `ensure_traefik` created the container from `traefik:latest` without
   fetching it first, so Docker answered `No such image` and the one command

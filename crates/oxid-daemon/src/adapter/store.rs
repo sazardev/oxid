@@ -463,10 +463,31 @@ impl SqliteStore {
         shared_instance: &str,
         resource_name: &str,
     ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        // Conditional on the slot still being free, in one statement.
+        //
+        // Picking the lowest free Redis index is a read followed by a write,
+        // and the only thing making that atomic was `LockKey::ResourcePool`
+        // — an *in-process* lock guarding a *fleet-wide* resource. The
+        // unique index on this table is per `(project, branch, kind,
+        // instance)`, not per slot, so nothing in the database would have
+        // caught two branches claiming Redis database 3: they would simply
+        // share it, and one would find the other's keys.
+        //
+        // Returning `false` rather than erroring lets the caller try the
+        // next index, which is what it already does when the read said the
+        // slot was taken.
+        //
+        // A `UNIQUE (kind, shared_instance, resource_name)` index would be
+        // the tidier fix and is deliberately *not* added: as a migration it
+        // would fail to apply on any install that already hit this, and a
+        // daemon that refuses to start is worse than the bug it is fixing.
+        let claimed = sqlx::query(
             "INSERT INTO resource_leases \
              (project_id, branch, kind, shared_instance, resource_name, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?, ? \
+              WHERE NOT EXISTS ( \
+                    SELECT 1 FROM resource_leases \
+                     WHERE kind = ? AND shared_instance = ? AND resource_name = ?)",
         )
         .bind(id_as_i64(project_id.0))
         .bind(branch.as_str())
@@ -474,9 +495,17 @@ impl SqliteStore {
         .bind(shared_instance)
         .bind(resource_name)
         .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .bind(kind.to_string())
+        .bind(shared_instance)
+        .bind(resource_name)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
+        if claimed.rows_affected() == 0 {
+            return Err(RepositoryError::Conflict(format!(
+                "`{resource_name}` on `{shared_instance}` is already leased"
+            )));
+        }
         Ok(())
     }
 
@@ -2867,5 +2896,58 @@ mod concurrency_tests {
         )
         .unwrap();
         ProjectStore::create(store, &project).await.unwrap()
+    }
+
+    /// The bug this closes: `LockKey::ResourcePool` is an in-process lock
+    /// guarding a fleet-wide resource, and the unique index on this table
+    /// is per `(project, branch, kind, instance)` — not per slot. So two
+    /// branches claiming Redis database 3 were simply both given it, and
+    /// one would find the other's keys.
+    #[tokio::test]
+    async fn the_same_shared_slot_cannot_be_leased_twice() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let a = seed_project(&store).await;
+
+        store
+            .create_resource_lease(
+                a,
+                &BranchName::parse("one").unwrap(),
+                PoolKind::Redis,
+                "cache",
+                "3",
+            )
+            .await
+            .unwrap();
+
+        // A different branch of the same project asking for the same index
+        // must be refused, not quietly given it.
+        let clash = store
+            .create_resource_lease(
+                a,
+                &BranchName::parse("two").unwrap(),
+                PoolKind::Redis,
+                "cache",
+                "3",
+            )
+            .await;
+        assert!(
+            clash.is_err(),
+            "two branches must not share one Redis index"
+        );
+
+        // A different index on the same instance is fine, and so is the
+        // same index on a different instance.
+        for (instance, name) in [("cache", "4"), ("other", "3")] {
+            store
+                .create_resource_lease(
+                    a,
+                    &BranchName::parse("two").unwrap(),
+                    PoolKind::Redis,
+                    instance,
+                    name,
+                )
+                .await
+                .unwrap();
+        }
     }
 }
