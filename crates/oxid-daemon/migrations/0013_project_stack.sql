@@ -1,0 +1,15 @@
+-- What a project was detected to be built with.
+--
+-- Stored on the project rather than recomputed on demand for two reasons:
+-- the answer comes from files in a checkout the API has no business
+-- touching to answer a dashboard poll, and it is history — a project that
+-- was Node 18 in March and Node 22 in June is worth being able to see.
+--
+-- JSON rather than columns because the shape belongs to the domain
+-- (`oxid_core::services::stack::Stack`) and will gain fields; nothing here
+-- queries into it, so a column per attribute would be schema churn for no
+-- read it enables.
+--
+-- Null is the normal case: a project with its own Dockerfile or `oxid.toml`
+-- told Oxid what it is, and nothing was inferred.
+ALTER TABLE projects ADD COLUMN detected_stack TEXT;

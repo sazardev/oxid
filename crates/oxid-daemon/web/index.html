@@ -382,7 +382,12 @@
             <tbody>
               <template x-for="p in projects" :key="p.id">
                 <tr>
-                  <td :data-label="t('project.col.name')"><a class="link" href="#" @click.prevent="go('/ui/projects/' + p.id)" x-text="p.name"></a></td>
+                  <td :data-label="t('project.col.name')">
+                    <a class="link" href="#" @click.prevent="go('/ui/projects/' + p.id)" x-text="p.name"></a>
+                    <span class="badge badge-stack" x-show="p.detected_stack"
+                          :title="t('project.stackTitle', { evidence: (p.detected_stack?.evidence ?? []).join(', ') })"
+                          x-text="stackLabel(p.detected_stack)"></span>
+                  </td>
                   <td :data-label="t('project.col.repo')" class="mono muted" x-text="p.repo_url"></td>
                   <td :data-label="t('project.col.port')" class="mono" x-text="p.config.port"></td>
                   <td :data-label="t('project.col.environments')" class="mono" x-text="p.environments.length"></td>
@@ -408,6 +413,13 @@
               </div>
             </div>
             <p class="mono muted" x-text="currentProject().repo_url"></p>
+            <p class="muted" x-show="currentProject().detected_stack">
+              <span class="badge badge-stack" x-text="stackLabel(currentProject().detected_stack)"></span>
+              <span x-text="t('project.stackDetected', {
+                evidence: (currentProject().detected_stack?.evidence ?? []).join(', '),
+                confidence: confidenceLabel(currentProject().detected_stack)
+              })"></span>
+            </p>
             <dl class="data-grid mono">
               <dt :title="t('project.field.containerPortTitle')" x-text="t('project.field.containerPort')"></dt><dd x-text="currentProject().config.port"></dd>
               <dt x-text="t('project.field.dockerfile')"></dt><dd x-text="currentProject().config.build.dockerfile ?? 'Dockerfile'"></dd>

@@ -579,6 +579,41 @@ function dashboard() {
       return port ? `${location.hostname}:${port}` : env.url;
     },
 
+    /**
+     * A detected stack as a tag: `nestjs · node 22`.
+     *
+     * Built here rather than sent as a string so the pieces stay separate
+     * in the API — a consumer filtering by runtime should not have to parse
+     * a label meant for a human.
+     */
+    stackLabel(stack) {
+      if (!stack) {
+        return "";
+      }
+      let label = stack.framework === "none" ? stack.runtime : stack.framework;
+      if (stack.framework !== "none" && stack.runtime !== "static") {
+        label += ` · ${stack.runtime}`;
+      }
+      if (stack.runtime_version) {
+        label += ` ${stack.runtime_version}`;
+      }
+      return label;
+    },
+
+    /**
+     * How sure the detection was, in words.
+     *
+     * Literal keys rather than one built from the value: the catalog test
+     * can only check the translation calls it can read statically, and a
+     * key assembled at runtime is a missing translation nobody notices
+     * until it is in front of a user.
+     */
+    confidenceLabel(stack) {
+      return stack?.confidence === "certain"
+        ? this.t("project.confidence.certain")
+        : this.t("project.confidence.likely");
+    },
+
     hostMemoryLabel() {
       if (!this.stats.host_total_memory_bytes) {
         return "—";

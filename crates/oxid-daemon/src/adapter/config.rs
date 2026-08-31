@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use oxid_core::services::stack::{RepoManifest, Stack, detect};
 use oxid_core::{BuildConfig, Dependency, DomainError, PoolKind, ProjectConfig, Ttl};
 
 /// A parsed `oxid.toml`, ready for [`oxid_core::Project::new`].
@@ -20,6 +21,11 @@ pub struct ParsedProject {
     pub name: String,
     /// Domain configuration validated through [`ProjectConfig`].
     pub config: ProjectConfig,
+    /// What the repository was detected to be built with, when Oxid had to
+    /// work it out rather than being told. `None` means the repository
+    /// answered for itself — an `oxid.toml`, a Compose file or a
+    /// `Dockerfile` — and nothing was inferred.
+    pub stack: Option<Stack>,
 }
 
 /// Errors raised while reading or interpreting `oxid.toml`.
@@ -169,7 +175,11 @@ impl Config {
             dependencies,
         )?;
 
-        Ok(ParsedProject { name, config })
+        Ok(ParsedProject {
+            name,
+            config,
+            stack: None,
+        })
     }
 }
 
@@ -260,9 +270,45 @@ pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
         return zero_config_project(name, None, DEFAULT_CONTEXT.to_owned(), port);
     }
 
+    // Last: work out what this is. Deliberately after every explicit
+    // answer, so detection only ever fills a gap — a committed Dockerfile
+    // is a decision someone made and is never second-guessed.
+    if let Some(stack) = detect(&read_manifest(repo_dir)) {
+        let mut parsed = zero_config_project(name, None, DEFAULT_CONTEXT.to_owned(), stack.port)?;
+        parsed.stack = Some(stack);
+        return Ok(parsed);
+    }
+
     Err(ConfigError::NoConfigFound {
         repo_dir: repo_dir.to_owned(),
     })
+}
+
+/// Describes `repo_dir` for [`detect`].
+///
+/// Only the root is listed and only the manifests the domain asks for are
+/// opened — a repository is never trawled, and a large one costs a single
+/// `read_dir` plus a handful of small reads. Unreadable files are simply
+/// absent: detection treats "cannot read" and "not there" the same way, and
+/// neither is worth failing a deploy over.
+fn read_manifest(repo_dir: &Path) -> RepoManifest {
+    let mut manifest = RepoManifest::default();
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return manifest;
+    };
+    for entry in entries.flatten() {
+        manifest
+            .entries
+            .push(entry.file_name().to_string_lossy().into_owned());
+    }
+    for name in RepoManifest::files_worth_reading() {
+        if manifest.entries.iter().any(|e| e == name)
+            && let Ok(body) = std::fs::read_to_string(repo_dir.join(name))
+        {
+            manifest.files.insert((*name).to_owned(), body);
+        }
+    }
+    manifest
 }
 
 fn zero_config_project(
@@ -289,7 +335,11 @@ fn zero_config_project(
         build,
         Vec::new(),
     )?;
-    Ok(ParsedProject { name, config })
+    Ok(ParsedProject {
+        name,
+        config,
+        stack: None,
+    })
 }
 
 /// Derives a safe project name from `repo_dir`'s own directory name
@@ -511,6 +561,59 @@ inject_url_as = "URL"
         let parsed = parse_project(dir.path()).unwrap();
         assert_eq!(parsed.name, "my-awesome-api");
         assert_eq!(parsed.config.port, 8080);
+    }
+
+    #[test]
+    fn a_repository_with_no_dockerfile_is_detected_rather_than_refused() {
+        // The demand this removes: a team adding preview environments to an
+        // existing NestJS service had to become Docker authors first.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@nestjs/core":"^10.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+
+        let parsed = parse_project(dir.path()).unwrap();
+        let stack = parsed.stack.expect("nothing was detected");
+        assert_eq!(stack.framework.as_str(), "nestjs");
+        assert_eq!(stack.package_manager.unwrap().as_str(), "pnpm");
+        // The port comes from the framework, not from Oxid's default.
+        assert_eq!(parsed.config.port, 3000);
+    }
+
+    #[test]
+    fn a_committed_dockerfile_is_never_second_guessed() {
+        // Detection fills a gap; it does not overrule a decision someone
+        // made. A Nest repo whose Dockerfile exposes 9000 is a repo that
+        // serves on 9000, whatever Nest's default is.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"@nestjs/core":"^10.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "FROM node:22\nEXPOSE 9000\n").unwrap();
+
+        let parsed = parse_project(dir.path()).unwrap();
+        assert_eq!(parsed.config.port, 9000);
+        assert!(
+            parsed.stack.is_none(),
+            "detection ran even though the repository answered for itself"
+        );
+    }
+
+    #[test]
+    fn an_unrecognisable_repository_still_asks_for_a_dockerfile() {
+        // Better than a generated build that dies halfway through for
+        // reasons the developer has to reverse-engineer.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# notes").unwrap();
+        assert!(matches!(
+            parse_project(dir.path()),
+            Err(ConfigError::NoConfigFound { .. })
+        ));
     }
 
     #[test]

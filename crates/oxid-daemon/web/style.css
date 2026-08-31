@@ -459,6 +459,14 @@ h2 {
   overflow-x: auto;
 }
 
+/* A detected stack is a guess Oxid made, not a fact the project stated —
+   the muted treatment says so without needing a caption. */
+.badge-stack {
+  border-color: var(--ash-gray);
+  color: var(--ash-gray);
+  margin-left: var(--gap-2);
+}
+
 .env-table {
   width: 100%;
   border-collapse: collapse;

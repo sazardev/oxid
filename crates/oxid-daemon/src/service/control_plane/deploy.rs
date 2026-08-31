@@ -25,6 +25,7 @@ use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
 use crate::request_context::current_request_id;
 use oxid_core::services::gc::{self, GcAction};
+use oxid_core::services::stack::{RepoManifest, Stack, detect as detect_stack};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
@@ -423,6 +424,37 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(BuildContext { path: cleanup })
     }
 
+    /// Writes a generated Dockerfile into `context` when it has none.
+    ///
+    /// Returns what was detected, or `None` when the context already has a
+    /// Dockerfile (the overwhelmingly common case, and the one where Oxid
+    /// must keep its hands off) or when nothing recognisable was found —
+    /// in which case the build fails with Docker's own "Dockerfile not
+    /// found", which is the honest error rather than a generated build that
+    /// dies halfway through for reasons nobody can trace.
+    ///
+    /// Writing into the copy rather than the checkout matters twice over:
+    /// the developer's `git status` stays clean, and the moment they commit
+    /// a Dockerfile of their own it wins, with no state to clear first.
+    fn materialise_dockerfile(context: &Path, dockerfile: &str) -> Option<Stack> {
+        let target = context.join(dockerfile);
+        if target.exists() {
+            return None;
+        }
+        let stack = detect_stack(&read_context_manifest(context))?;
+        match std::fs::write(&target, stack.dockerfile()) {
+            Ok(()) => Some(stack),
+            Err(e) => {
+                // Not fatal on its own: the build is about to fail with
+                // Docker's own message, and that is clearer than replacing
+                // it with a filesystem error about a file the developer
+                // never asked for.
+                tracing::warn!(path = %target.display(), error = %e, "could not write the generated Dockerfile");
+                None
+            }
+        }
+    }
+
     /// Records a failed deploy everywhere an operator might look for it:
     /// the environment row flips to `BuildFailed`, an audit event captures
     /// the reason and who triggered it, and an ERROR line lands in the log.
@@ -739,14 +771,34 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         };
         drop(git_guard);
 
+        let dockerfile = project
+            .config
+            .build
+            .dockerfile
+            .clone()
+            .unwrap_or_else(|| "Dockerfile".to_owned());
+
+        // A repository with no Dockerfile used to be refused outright, which
+        // asked every team wanting preview environments to become Docker
+        // authors first. If the context has none, work out what the project
+        // is and write one — into the private copy, never into the
+        // developer's checkout, so nothing appears in their `git status` and
+        // committing their own Dockerfile silently takes over from the next
+        // deploy onward.
+        let detected = Self::materialise_dockerfile(context.path(), &dockerfile);
+        if let Some(stack) = &detected {
+            tracing::info!(
+                branch = %branch,
+                stack = %stack.label(),
+                confidence = ?stack.confidence,
+                evidence = ?stack.evidence,
+                "no Dockerfile in the build context; generated one from the detected stack"
+            );
+        }
+
         let build = BuildSpec {
             context: context.path().to_owned(),
-            dockerfile: project
-                .config
-                .build
-                .dockerfile
-                .clone()
-                .unwrap_or_else(|| "Dockerfile".to_owned()),
+            dockerfile,
             image: image.clone(),
         };
         let build_report = match self.oci.build(&build).await {
@@ -922,6 +974,29 @@ impl Drop for BuildContext {
 }
 
 /// Recursive copy that preserves symlinks as symlinks.
+/// Describes a build context for stack detection. Same contract as the
+/// registration-time reader in `adapter::config`: root entries only, and
+/// only the manifests the domain asks to see.
+fn read_context_manifest(context: &Path) -> RepoManifest {
+    let mut manifest = RepoManifest::default();
+    let Ok(entries) = std::fs::read_dir(context) else {
+        return manifest;
+    };
+    for entry in entries.flatten() {
+        manifest
+            .entries
+            .push(entry.file_name().to_string_lossy().into_owned());
+    }
+    for name in RepoManifest::files_worth_reading() {
+        if manifest.entries.iter().any(|e| e == name)
+            && let Ok(body) = std::fs::read_to_string(context.join(name))
+        {
+            manifest.files.insert((*name).to_owned(), body);
+        }
+    }
+    manifest
+}
+
 fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {

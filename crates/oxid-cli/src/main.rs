@@ -2209,21 +2209,64 @@ async fn cmd_ps(
         bg(t("empty.projects"));
         return Ok(());
     }
-    println!(
-        "{:<5} {:<24} {}",
-        t("table.id"),
-        t("table.name"),
-        t("table.baseDomain")
-    );
-    for project in &projects {
+    // The stack column is only worth its width when something was actually
+    // detected: a fleet of projects that all carry their own Dockerfile
+    // would otherwise get a column of dashes.
+    let show_stack = projects
+        .iter()
+        .any(|p| p.get("detected_stack").is_some_and(|s| !s.is_null()));
+    if show_stack {
+        println!(
+            "{:<5} {:<24} {:<28} {}",
+            t("table.id"),
+            t("table.name"),
+            t("table.baseDomain"),
+            t("table.stack")
+        );
+    } else {
         println!(
             "{:<5} {:<24} {}",
-            project["id"].as_u64().unwrap_or_default(),
-            project["name"].as_str().unwrap_or("?"),
-            project["config"]["base_domain"].as_str().unwrap_or("?"),
+            t("table.id"),
+            t("table.name"),
+            t("table.baseDomain")
         );
     }
+    for project in &projects {
+        let id = project["id"].as_u64().unwrap_or_default();
+        let name = project["name"].as_str().unwrap_or("?");
+        let domain = project["config"]["base_domain"].as_str().unwrap_or("?");
+        if show_stack {
+            println!(
+                "{id:<5} {name:<24} {domain:<28} {}",
+                stack_label(&project["detected_stack"])
+            );
+        } else {
+            println!("{id:<5} {name:<24} {domain}");
+        }
+    }
     Ok(())
+}
+
+/// Renders a detected stack as `nestjs · node 20`.
+///
+/// Assembled from the parts rather than sent as a string, so the API keeps
+/// them separate — a script filtering by runtime should not have to parse a
+/// label written for a person.
+fn stack_label(stack: &Value) -> String {
+    let Some(runtime) = stack["runtime"].as_str() else {
+        return "—".to_owned();
+    };
+    let framework = stack["framework"].as_str().unwrap_or("none");
+    let mut label = if framework == "none" {
+        runtime.to_owned()
+    } else {
+        format!("{framework} · {runtime}")
+    };
+    if let Some(version) = stack["runtime_version"].as_str() {
+        label.push(' ');
+        label.push_str(version);
+    }
+    label
 }
 
 /// Resolves the endpoint context for a scope: global vs project/branch.

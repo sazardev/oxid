@@ -843,6 +843,10 @@ fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
             .expect("serializing Vec<Dependency> cannot fail"),
         memory_limit_mb: project.config.build.memory_limit_mb.map(u64::cast_signed),
         cpu_limit_millicores: project.config.build.cpu_limit_millicores.map(i64::from),
+        detected_stack: project
+            .detected_stack
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok()),
     }
 }
 
@@ -859,15 +863,16 @@ struct ProjectBinds<'a> {
     dependencies_json: String,
     memory_limit_mb: Option<i64>,
     cpu_limit_millicores: Option<i64>,
+    detected_stack: Option<String>,
 }
 
 const PROJECT_COLUMNS: &str = "id, name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores";
+     memory_limit_mb, cpu_limit_millicores, detected_stack";
 
 const PROJECT_COLUMNS_NO_ID: &str = "name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores";
+     memory_limit_mb, cpu_limit_millicores, detected_stack";
 
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -909,7 +914,15 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
     .map_err(|e| validation(&e))?;
     let repo_url = RepoUrl::parse(repo_url).map_err(|e| validation(&e))?;
 
-    Project::new(ProjectId(id), name, repo_url, config).map_err(|e| validation(&e))
+    // A stack that no longer deserializes — an older daemon's shape, or a
+    // hand-edited row — is dropped rather than failing the read. It is a
+    // label, and losing a label must never make a project unloadable.
+    let detected_stack: Option<String> = row.try_get("detected_stack").map_err(storage)?;
+    let detected_stack = detected_stack.and_then(|json| serde_json::from_str(&json).ok());
+
+    Project::new(ProjectId(id), name, repo_url, config)
+        .map(|project| project.with_detected_stack(detected_stack))
+        .map_err(|e| validation(&e))
 }
 
 impl ProjectStore for SqliteStore {
@@ -917,7 +930,7 @@ impl ProjectStore for SqliteStore {
         let binds = project_to_binds(project);
         let row = sqlx::query(&format!(
             "INSERT INTO projects ({PROJECT_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.name)
         .bind(binds.repo_url)
@@ -931,6 +944,7 @@ impl ProjectStore for SqliteStore {
         .bind(binds.dependencies_json)
         .bind(binds.memory_limit_mb)
         .bind(binds.cpu_limit_millicores)
+        .bind(binds.detected_stack)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -981,7 +995,7 @@ impl ProjectStore for SqliteStore {
             "UPDATE projects SET name = ?, base_domain = ?, pause_after_seconds = ?, \
              destroy_after_seconds = ?, port = ?, dockerfile = ?, build_context = ?, \
              on_start_json = ?, dependencies_json = ?, memory_limit_mb = ?, \
-             cpu_limit_millicores = ? WHERE id = ?",
+             cpu_limit_millicores = ?, detected_stack = ? WHERE id = ?",
         )
         .bind(binds.name)
         .bind(binds.base_domain)
@@ -994,6 +1008,7 @@ impl ProjectStore for SqliteStore {
         .bind(binds.dependencies_json)
         .bind(binds.memory_limit_mb)
         .bind(binds.cpu_limit_millicores)
+        .bind(binds.detected_stack)
         .bind(id_as_i64(project.id.0))
         .execute(&self.pool)
         .await

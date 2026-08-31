@@ -89,6 +89,39 @@ One SQLite file, WAL, opened as a pool (`OXID_DB_MAX_CONNECTIONS`, default 8). T
 
 Measured on 12k environments / 60k audit events: heartbeat throughput went from flat at ~180 req/s (1→64 concurrent, p50 6ms→321ms) to 948–5108 req/s with p50 under 12ms. `environments(url)` is indexed — it is the column the busiest query in the system filters on.
 
+## Stack detection
+
+A repository with no `Dockerfile` used to be refused outright, which asked
+every team wanting preview environments to become Docker authors first.
+`oxid_core::services::stack` reads what a repository already says about
+itself — `package.json`, `go.mod`, `pyproject.toml`, `Cargo.toml` — and
+generates a Dockerfile for it. Measured on a Nest service: the generated
+multi-stage image is 215MB against 1.63GB for the single-stage Dockerfile
+someone writes by hand.
+
+Load-bearing, in order of how easy each is to undo:
+
+- **Detection runs last.** `adapter::config::parse_project` tries
+  `oxid.toml`, then Compose, then a committed `Dockerfile`, and only then
+  detects. A Dockerfile someone wrote is a decision, never second-guessed.
+- **The generated file goes in the private build-context copy**, never the
+  checkout — the developer's `git status` stays clean, and committing their
+  own Dockerfile takes over with no state to clear.
+- **`detect` returns `None` rather than guessing.** An unrecognised
+  repository gets the same "write a Dockerfile" error it always did; a
+  generated build that dies halfway through is worse than an honest refusal.
+- **The wire name equals the display name.** A derived `rename_all` turns
+  `NestJs` into `nest-js`, giving the panel one spelling and the logs
+  another; every variant is renamed explicitly and a test pins it.
+- **The domain is pure.** `detect` takes a `RepoManifest` (which paths
+  exist, plus the contents of the few manifests it asks for), so every rule
+  is testable without a filesystem, a network or Docker, and the adapter
+  only reads files.
+
+The result is stored on the project (`detected_stack`, migration `0013`) and
+shown as a tag in the dashboard and an `oxid ps` column. Null is the normal
+case: the project answered for itself.
+
 ## Dashboard
 
 Embedded in the binary via `include_str!` — no build step, no bundler, and

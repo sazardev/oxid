@@ -217,6 +217,7 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "table.api" => "API",
         "table.id" => "ID",
         "table.baseDomain" => "BASE DOMAIN",
+        "table.stack" => "STACK",
         "table.scope" => "SCOPE",
     }
 }
@@ -306,6 +307,7 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "table.api" => "API",
         "table.id" => "ID",
         "table.baseDomain" => "DOMINIO BASE",
+        "table.stack" => "STACK",
         "table.scope" => "ÁMBITO",
     }
 }

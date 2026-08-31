@@ -54,6 +54,30 @@ is the breaking position.
 
 ### Added
 
+- **A repository no longer needs a Dockerfile.** Oxid reads what a project
+  already says about itself — `package.json`, `go.mod`, `pyproject.toml`,
+  `Cargo.toml` — and generates one. Recognised today: NestJS, Next.js, Vite
+  and Create React App and Angular (as SPAs), Express and other plain Node
+  servers, Go with Fiber, Gin or Echo, FastAPI, Flask, Django, Axum, Actix,
+  and a plain directory of static files. The package manager comes from the
+  lockfile and the runtime version from `.nvmrc`, `engines.node`, `go.mod`
+  or `requires-python`.
+
+  Every generated Dockerfile is multi-stage, and that is the point on a host
+  meant to run many environments at once: measured on a Nest service, 215MB
+  against the 1.63GB of the single-stage Dockerfile written by hand. It also
+  installs dependencies before copying the source, so a commit that does not
+  touch the lockfile reuses the install layer — on a branch rebuilt every
+  push, that layer is most of the build.
+
+  It only ever fills a gap. `oxid.toml`, a Compose file or a committed
+  `Dockerfile` all win, the generated file is written into the private build
+  context and never the checkout, and a repository Oxid cannot identify gets
+  the same "write a Dockerfile" error as before rather than a build that
+  fails halfway through.
+- **The detected stack is tracked and shown**, as a dashboard tag with the
+  evidence behind it (`Detected from package.json, @nestjs/core`), a column
+  in `oxid ps`, and a `detected_stack` field on the project in the API.
 - **The dashboard is a PWA and works on a phone.** A manifest, a service
   worker and SVG icons ship in the binary like the rest of the panel, so it
   installs to a home screen and opens with the daemon unreachable — verified

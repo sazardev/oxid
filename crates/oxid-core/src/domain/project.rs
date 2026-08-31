@@ -31,6 +31,13 @@ pub struct Project {
     pub repo_url: RepoUrl,
     /// Configuration declared in `oxid.toml`.
     pub config: ProjectConfig,
+    /// What the repository was detected to be built with, when Oxid had to
+    /// work it out. `None` means the repository answered for itself — an
+    /// `oxid.toml`, a Compose file or a committed `Dockerfile` — and
+    /// nothing was inferred, which is both the common case and the one
+    /// where a guess would be presumptuous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_stack: Option<crate::services::stack::Stack>,
 }
 
 impl Project {
@@ -54,7 +61,19 @@ impl Project {
             name,
             repo_url,
             config,
+            detected_stack: None,
         })
+    }
+
+    /// Records what the repository was detected to be built with.
+    ///
+    /// Separate from [`Project::new`] because detection is not part of
+    /// being a valid project: the overwhelming majority carry a Dockerfile
+    /// and are never detected at all.
+    #[must_use]
+    pub fn with_detected_stack(mut self, stack: Option<crate::services::stack::Stack>) -> Self {
+        self.detected_stack = stack;
+        self
     }
 }
 
