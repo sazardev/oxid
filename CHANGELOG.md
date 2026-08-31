@@ -4,7 +4,10 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
-## [Unreleased]
+## [0.3.1] - 2026-08-31
+
+A patch for the install path itself: v0.3.0 shipped a CLI whose first
+`oxid up` failed against the daemon its own installer sets up.
 
 ### Fixed
 
