@@ -91,13 +91,19 @@ services:
       # instead/alongside — see the commented service below.
       OXID_BACKUP_INTERVAL_SECS: "300"
       OXID_BACKUP_KEEP: "7"
-      # Zero-config mode: any of OXID_API_TOKEN / OXID_WEBHOOK_SECRET not
-      # set below is generated on first start, persisted under /data and
-      # printed ONCE to `docker compose logs oxid-daemon` — that printout is
-      # how you retrieve the dashboard/CLI token (the container has no
-      # shell). Explicit values always win; pin yours by uncommenting:
-      #   OXID_API_TOKEN: <openssl rand -hex 32>
-      #   OXID_WEBHOOK_SECRET: <openssl rand -hex 32>
+      # Taken from `.env` beside this file when it sets them, and generated
+      # on first start when it does not.
+      #
+      # The `:-` default is what makes both work from one file. Empty is
+      # treated as unset by the daemon, so a stack with no `.env` still
+      # self-provisions and prints the credentials ONCE to `docker compose
+      # logs oxid-daemon` (the container has no shell to read them with).
+      #
+      # These were commented out, and `install.sh` wrote an `.env` the stack
+      # then ignored — so the installer reported a token the daemon had
+      # never heard of, and every command with it answered 401.
+      OXID_API_TOKEN: ${OXID_API_TOKEN:-}
+      OXID_WEBHOOK_SECRET: ${OXID_WEBHOOK_SECRET:-}
       OXID_AUTO_TOKEN: "1"
       # Lets `oxid token generate` and the dashboard's "generate for me"
       # button retrieve that generated token over the published port.
