@@ -605,6 +605,18 @@ impl DockerClient {
     /// Creates and starts a brand-new Traefik container from `spec`. Only
     /// called by `ensure_traefik` when no container by that name exists yet.
     async fn create_and_start_traefik(&self, spec: &TraefikSpec) -> Result<(), OciError> {
+        // Pull first: creating a container from an image the host has never
+        // seen fails with a bare `No such image`, and nothing else in this
+        // path would have fetched it.
+        //
+        // The Docker install hid this because its compose file pulls Traefik
+        // before the daemon ever runs. `install.sh --server` has no compose
+        // file, so on a fresh machine `oxid infra setup` — the one command
+        // that is supposed to build the topology — failed on the image it
+        // was about to start. Docker answers a pull for an image already
+        // present from its own store, so this is cheap on every later call.
+        ContainerPort::pull_image(self, &spec.image).await?;
+
         // The container side is always 80 — that is where Traefik's `web`
         // entrypoint listens (`--entrypoints.web.address=:80` below), and it
         // has nothing to do with which host port the operator publishes it

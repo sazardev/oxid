@@ -4,6 +4,29 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
+## [Unreleased]
+
+### Fixed
+
+- **`oxid infra setup` failed on any host that had never pulled Traefik.**
+  `ensure_traefik` created the container from `traefik:latest` without
+  fetching it first, so Docker answered `No such image` and the one command
+  whose job is to build the topology failed on the image it was about to
+  start. The Docker install hid this because its compose file pulls Traefik
+  before the daemon ever runs; `install.sh --server` has no compose file, so
+  a fresh systemd machine — a dedicated server, the case the mode exists for
+  — hit it every time.
+
+### Added
+
+- **CI runs the tests that talk to a real Docker daemon and a real
+  Postgres.** Eight tests were written and then never executed anywhere:
+  `cargo test --workspace` skips `#[ignore]` by definition, so the layer
+  that drives containers was the one layer with no CI at all. A new
+  `integration` job in `ci.yml` runs `cargo test --workspace -- --ignored`
+  against a Postgres service container. Its first run found the Traefik pull
+  bug above.
+
 ## [0.4.1] - 2026-08-31
 
 Five defects found by installing the published v0.4.0 bundle on a real

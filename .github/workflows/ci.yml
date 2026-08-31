@@ -46,6 +46,43 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
+  # The 8 `#[ignore]`d tests: everything that talks to a real Docker daemon
+  # or a real Postgres. They were written, and then never run anywhere —
+  # `cargo test --workspace` above skips them by definition, so the layer
+  # that drives containers was the one layer with no CI at all. The first
+  # run of this job found `ensure_traefik` failing on a host that had never
+  # pulled the image, which is every fresh `install.sh --server` machine.
+  integration:
+    name: real docker + postgres
+    runs-on: ubuntu-latest
+    services:
+      # The test hardcodes `postgres://oxid:oxid@127.0.0.1:5432/postgres`,
+      # so the credentials here are part of its contract.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: oxid
+          POSTGRES_PASSWORD: oxid
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (per rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Docker is preinstalled on ubuntu-latest runners; fail loudly rather
+      # than silently skipping if that ever stops being true.
+      - name: Docker is available
+        run: docker version
+
+      - name: cargo test --workspace -- --ignored
+        run: cargo test --workspace -- --ignored --test-threads=1
+
   security:
     name: audit, deny, secret scan
     runs-on: ubuntu-latest
