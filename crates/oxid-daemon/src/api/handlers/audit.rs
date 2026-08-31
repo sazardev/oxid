@@ -95,6 +95,48 @@ pub async fn list_queue<
     Ok(Json(queue))
 }
 
+/// Cancels one queued deploy.
+///
+/// Scoped the same way the listing is: an operator who cannot see a
+/// project's queue entries cannot cancel them either, and gets the same
+/// `404` they would get for an id that does not exist — telling them "that
+/// exists but isn't yours" is itself information about another project.
+pub async fn cancel_queued<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+    Path(id): Path<u64>,
+) -> ApiResult<Json<Value>> {
+    let visible = match operator_scopes(authed.as_ref()) {
+        None => true,
+        Some(scopes) => state
+            .cp
+            .list_deploy_queue()
+            .await?
+            .into_iter()
+            .any(|entry| entry.id == id && scopes.contains(&entry.project_id.0)),
+    };
+    let cancelled = if visible {
+        state.cp.cancel_queued_deploy(id).await?
+    } else {
+        None
+    };
+    match cancelled {
+        Some(entry) => Ok(Json(json!({
+            "status": "cancelled",
+            "id": entry.id,
+            "branch": entry.branch,
+            "project_id": entry.project_id.0,
+        }))),
+        None => Err(ApiError::not_found(crate::i18n::tf(
+            "notFound.queued",
+            &[("id", &id.to_string())],
+        ))),
+    }
+}
+
 pub async fn environment_audit<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,

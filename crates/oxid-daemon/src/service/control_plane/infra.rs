@@ -137,12 +137,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
     }
 
+    /// Translated like every other message an operator reads: the
+    /// dashboard sends `Accept-Language`, and this one was hardcoded
+    /// English, so a Spanish panel showed an English answer — which is the
+    /// exact gap the daemon's catalog exists to close.
     pub(crate) fn no_network_configured() -> CpError {
-        CpError::NotFound(
-            "OXID_DOCKER_NETWORK is not set on this daemon — set it first, then restart, \
-             before running `oxid infra status`/`setup`"
-                .to_owned(),
-        )
+        CpError::NotFound(crate::i18n::t("infra.noNetwork").to_owned())
     }
 
     pub(crate) fn traefik_labels(

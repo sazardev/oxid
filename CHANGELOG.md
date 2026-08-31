@@ -54,6 +54,18 @@ is the breaking position.
 
 ### Added
 
+- **`DELETE /api/v1/queue/{id}` cancels a queued deploy**, with a button in
+  the dashboard's queue view. The drain stops at the first entry that does
+  not fit, so a large deploy is never starved by small ones behind it — and
+  the other side of that is one entry which can never fit holding up
+  everything after it. Until now the cures were making it fit or restarting
+  into an empty database. Scoped like the listing: an operator who cannot
+  see an entry gets the same `404` for cancelling it.
+- **A diagnostics page** — everything `oxid doctor` reports (reachable,
+  version, latency, whether the token authenticates and how far it reaches)
+  next to what only the daemon knows: capacity, queue depth, routing mode,
+  and the infrastructure wiring. "Something is wrong, where do I look" had
+  no single answer in the dashboard before.
 - **The dashboard can register a project.** It could only ever be done
   inside the onboarding wizard, which runs once and then gets out of the
   way — so a team's second repository had no route into the dashboard at
@@ -85,6 +97,25 @@ is the breaking position.
   does not fit a tablet, and letting it widen the document put a horizontal
   scrollbar under the nav and the stat strip too. Each table now scrolls
   inside its own box; verified at 1440, 1024, 768 and 480 px.
+- **Every failed read showed a bare status code.** The API answers errors as
+  a message written to be acted on — "set `OXID_DOCKER_NETWORK` first, then
+  restart" — and in the caller's own language. Reads threw the status code
+  instead and discarded the body, so the dashboard displayed `404` where the
+  daemon had explained exactly what to do. Both halves of the API surface now
+  fail the same way.
+- **`OXID_DOCKER_NETWORK is not set` was hardcoded English.** The dashboard
+  sends `Accept-Language`, so a Spanish panel showed an English answer — the
+  exact gap the daemon's catalog exists to close.
+- **The infrastructure panel flickered against its own refresh.** The page
+  re-reads every few seconds and each cycle blanked the result before
+  fetching, so "Checking…" sat next to the answer it was supposedly
+  replacing. A refresh now either replaces the answer or reports why it
+  could not, and a failed check keeps a way to retry it — the retry button
+  used to live inside the block that renders only on success.
+- **Registering a project from the projects page said it was deploying.** It
+  reused the wizard's message, where registering *is* followed by a deploy.
+  Nothing deploys from that page, and saying so sent people looking for a
+  build that never started.
 - **Counted messages read wrong in the singular** — "1 environments", "1
   entornos". Both languages inflect the noun, so the counted strings carry
   a `.one` and an `.other` form, with a test for the keys that are built at

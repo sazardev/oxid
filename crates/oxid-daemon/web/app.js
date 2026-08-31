@@ -19,6 +19,7 @@ const ROUTES = [
   { name: "audit", re: /^\/ui\/audit\/?$/, keys: [] },
   { name: "secrets", re: /^\/ui\/secrets\/?$/, keys: [] },
   { name: "admin", re: /^\/ui\/admin\/?$/, keys: [] },
+  { name: "diagnostics", re: /^\/ui\/diagnostics\/?$/, keys: [] },
   { name: "onboarding", re: /^\/ui\/onboarding\/?$/, keys: [] },
   { name: "environments", re: /^\/(ui\/environments)?\/?$/, keys: [] },
 ];
@@ -77,6 +78,7 @@ function dashboard() {
     selection: [],
     bulkBusy: false,
     restore: { busy: false, fileName: "" },
+    diagnostics: { running: false },
     filterProject: "",
     filterState: "",
     filterQuery: "",
@@ -279,6 +281,9 @@ function dashboard() {
           case "admin":
             await this.loadInfra();
             break;
+          case "diagnostics":
+            await this.runDiagnostics();
+            break;
           case "onboarding":
             await this.loadSetupStatus();
             break;
@@ -340,6 +345,28 @@ function dashboard() {
       this.confirmModal.open = false;
     },
 
+    /**
+     * Turns a failed response into an `Error` carrying what the daemon
+     * actually said.
+     *
+     * The API answers errors as `{"error": "..."}`, in the caller's
+     * language, and those messages are written to be acted on — "set
+     * OXID_DOCKER_NETWORK first, then restart" rather than a number. Reads
+     * used to throw the bare status code instead, so the dashboard showed
+     * `404` where the daemon had explained exactly what to do. Shared with
+     * `apiSend` so both halves of the API surface fail the same way.
+     */
+    async apiError(res) {
+      const text = await res.text().catch(() => "");
+      let message = text || `${res.status}`;
+      try {
+        message = JSON.parse(text).error ?? message;
+      } catch {
+        // not JSON — use the raw text as-is
+      }
+      return new Error(message);
+    },
+
     async apiGet(path) {
       const res = await fetch(this.apiBase + path, {
         headers: this.authHeaders(),
@@ -351,7 +378,7 @@ function dashboard() {
       }
       this.authError = false;
       if (!res.ok) {
-        throw new Error(`${res.status}`);
+        throw await this.apiError(res);
       }
       return res.json();
     },
@@ -387,14 +414,7 @@ function dashboard() {
       }
       this.authError = false;
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
-        let message = text || `${res.status}`;
-        try {
-          message = JSON.parse(text).error ?? message;
-        } catch {
-          // not JSON — use the raw text as-is
-        }
-        throw new Error(message);
+        throw await this.apiError(res);
       }
       return res;
     },
@@ -1256,7 +1276,11 @@ function dashboard() {
         this.newProject.repoUrl = "";
         this.newProject.repoDir = "";
         this.newProject.gitToken = "";
-        this.showNotice(this.t("notice.registered", { name: project.name }));
+        // Not `notice.registered`: that one belongs to the wizard, where
+        // registering is immediately followed by a deploy. Nothing deploys
+        // from here, and saying it does sends people looking for a build
+        // that was never started.
+        this.showNotice(this.t("notice.projectAdded", { name: project.name }));
         await this.loadProjectsWithEnvironments();
       } catch (err) {
         this.newProject.error =
@@ -1266,12 +1290,89 @@ function dashboard() {
       }
     },
 
-    /** Reads the Docker network + Traefik wiring scale-to-zero depends on. */
+    /**
+     * Cancels a queued deploy.
+     *
+     * The drain stops at the first entry that does not fit, so that a large
+     * deploy is not starved by a stream of small ones — which also means one
+     * entry that can never fit holds up everything behind it. Until there
+     * was a way to drop it, the only cures were making it fit or restarting
+     * into an empty database.
+     */
+    async cancelQueued(item) {
+      if (
+        !(await this.confirmDialog(this.t("confirm.cancelDeploy", { branch: item.branch })))
+      ) {
+        return;
+      }
+      try {
+        await this.apiSend("DELETE", `/api/v1/queue/${item.id}`);
+        this.showNotice(this.t("notice.deployCancelled", { branch: item.branch }));
+      } catch (err) {
+        this.showNotice(this.t("notice.cancelFailed", { error: err.message }));
+      }
+      await this.loadForRoute();
+    },
+
+    /**
+     * Everything `oxid doctor` reports, plus what only the daemon knows.
+     *
+     * The pieces were already on screen but scattered — is it reachable, is
+     * this token any good, what version, is the wiring intact, is there room
+     * to deploy. "Something is wrong, where do I look" had no single answer
+     * in the dashboard, which is exactly the question a diagnostics page is.
+     */
+    async runDiagnostics() {
+      this.diagnostics.running = true;
+      const started = performance.now();
+      const out = { checkedAt: new Date().toISOString() };
+      try {
+        const res = await fetch(this.apiBase + "/api/v1/health", { cache: "no-store" });
+        out.latencyMs = Math.round(performance.now() - started);
+        out.reachable = res.ok;
+        out.version = (await res.json()).version;
+      } catch (err) {
+        out.reachable = false;
+        out.error = err.message;
+      }
+      // Deliberately a *protected* route: reachability and a working
+      // credential are different failures and an operator needs to know
+      // which one they have.
+      try {
+        await this.apiGet("/api/v1/stats");
+        out.tokenValid = true;
+      } catch (err) {
+        out.tokenValid = false;
+        out.tokenError = err.message;
+      }
+      if (out.tokenValid) {
+        try {
+          await this.apiGet("/api/v1/tokens");
+          out.master = true;
+        } catch {
+          // A named or project-scoped token — not an error, just less.
+          out.master = false;
+        }
+        await this.loadInfra();
+      }
+      this.diagnostics = { ...out, running: false };
+    },
+
+    /**
+     * Reads the Docker network + Traefik wiring scale-to-zero depends on.
+     *
+     * Nothing already on screen is cleared while the next read is in
+     * flight. This page re-reads every few seconds, and blanking the result
+     * at the start of each cycle made the panel flicker between "Checking…"
+     * and its answer — with the placeholder winning often enough to sit
+     * there next to a result it was supposedly replacing. A refresh either
+     * replaces the answer or reports why it could not.
+     */
     async loadInfra() {
       this.infra.loading = true;
-      this.infra.error = "";
       try {
         this.infra.status = await this.apiGet("/api/v1/infra/status");
+        this.infra.error = "";
       } catch (err) {
         this.infra.error =
           err.message === "unauthorized" ? this.t("notice.masterOnly") : err.message;
@@ -1319,14 +1420,7 @@ function dashboard() {
           body: file,
         });
         if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          let message = text || `${res.status}`;
-          try {
-            message = JSON.parse(text).error ?? message;
-          } catch {
-            // not JSON — use the raw text as-is
-          }
-          throw new Error(message);
+          throw await this.apiError(res);
         }
         this.showNotice(this.t("notice.restoreStaged"));
       } catch (err) {

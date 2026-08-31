@@ -153,6 +153,8 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "notFound.environment" => "environment `{id}` not found",
         "notFound.secret" => "secret `{name}` not found",
         "notFound.token" => "token `{id}` not found",
+        "notFound.queued" => "no deploy with id `{id}` is waiting in the queue",
+        "infra.noNetwork" => "OXID_DOCKER_NETWORK is not set on this daemon — set it first, then restart, before running `oxid infra status`/`setup`",
         "notFound.branch" => "branch `{branch}` has no environment in this project",
         "notFound.repo" => "no project registered for `{repo}`",
         // -- validation ------------------------------------------------------------
@@ -190,6 +192,8 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "notFound.environment" => "entorno `{id}` no encontrado",
         "notFound.secret" => "secreto `{name}` no encontrado",
         "notFound.token" => "token `{id}` no encontrado",
+        "notFound.queued" => "no hay ningún despliegue con id `{id}` esperando en la cola",
+        "infra.noNetwork" => "OXID_DOCKER_NETWORK no está definida en este daemon — defínela, reinicia, y luego ejecuta `oxid infra status`/`setup`",
         "notFound.branch" => "la rama `{branch}` no tiene entorno en este proyecto",
         "notFound.repo" => "no hay ningún proyecto registrado para `{repo}`",
         // -- validation ------------------------------------------------------------

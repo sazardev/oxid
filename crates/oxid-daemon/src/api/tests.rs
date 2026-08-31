@@ -2202,6 +2202,149 @@ async fn deploy_queues_past_capacity_and_the_queue_endpoint_reports_it() {
 }
 
 #[tokio::test]
+async fn a_queued_deploy_can_be_cancelled() {
+    // The drain stops at the first entry that does not fit, so a large
+    // deploy is not starved by small ones behind it. The other side of that
+    // is that an entry which can *never* fit holds up everything behind it,
+    // and until this endpoint the only cures were making it fit or
+    // restarting into an empty database.
+    let (app, _) = test_app_with_admission_control(8000, 100).await;
+    let repo = repo_dir_with_config();
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+    let project: Project = serde_json::from_slice(&body).unwrap();
+    for branch in ["main", "other"] {
+        json_request(
+            &app,
+            "POST",
+            format!("/api/v1/projects/{}/deploy", project.id.0).as_str(),
+            json!({ "branch": branch }),
+        )
+        .await;
+    }
+
+    let (_, body) = json_request(&app, "GET", "/api/v1/queue", json!({})).await;
+    let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    let id = entries[0]["id"].as_u64().unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        "DELETE",
+        format!("/api/v1/queue/{id}").as_str(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cancelled: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(cancelled["status"], "cancelled");
+    // The response names the branch: a queue id means nothing to whoever
+    // has to say what was dropped.
+    assert_eq!(cancelled["branch"], "other");
+
+    let (_, body) = json_request(&app, "GET", "/api/v1/queue", json!({})).await;
+    let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert!(entries.is_empty(), "{entries:?}");
+}
+
+#[tokio::test]
+async fn a_scoped_operator_cannot_cancel_another_project_s_queued_deploy() {
+    // Same rule the listing follows, and the same answer: `404`, not `403`.
+    // "That exists but isn't yours" is itself information about a project
+    // this credential is not supposed to know about.
+    let store = SqliteStore::open_in_memory().await.unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let cp = ControlPlane::new(
+        store,
+        FakeGit::default(),
+        FakeOci::default(),
+        cache.path().to_owned(),
+    )
+    .with_resource_defaults(Some(100), None)
+    .with_admission_control(Some(8000))
+    .with_readiness_check(false);
+    let app = router(ApiState {
+        cp,
+        webhook_secret: Some("test-secret".to_owned()),
+        api_token: Some("master-secret".to_owned()),
+        data_dir: test_data_dir(),
+        allow_restore: false,
+        rate_limit: None,
+        auto_token: false,
+        bootstrap_access: BootstrapAccess::Loopback,
+    });
+
+    let repo = repo_dir_with_config();
+    json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+        Some("master-secret"),
+    )
+    .await;
+    for branch in ["main", "other"] {
+        json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/projects/1/deploy",
+            json!({ "branch": branch }),
+            Some("master-secret"),
+        )
+        .await;
+    }
+    let (_, body) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/queue",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    let id = entries[0]["id"].as_u64().unwrap();
+
+    // Scoped to a project that does not exist, so project 1's entry is out
+    // of scope for it.
+    let bob = mint_token(&app, json!({ "name": "bob", "projects": [99] })).await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "DELETE",
+        format!("/api/v1/queue/{id}").as_str(),
+        json!({}),
+        Some(&bob),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // And it is still there for whoever may see it.
+    let (_, body) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/queue",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    let entries: Vec<Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(entries.len(), 1, "the entry was cancelled out of scope");
+}
+
+#[tokio::test]
+async fn cancelling_a_queue_entry_that_is_gone_is_a_404() {
+    // Not an error worth a 500: the drain may have deployed it a moment
+    // before the click landed.
+    let (app, _) = test_app_with_admission_control(8000, 100).await;
+    let (status, _) = json_request(&app, "DELETE", "/api/v1/queue/9999", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn rollback_endpoint_is_wired_and_errors_clearly_with_no_prior_deploy() {
     let repo = repo_dir_with_config();
     let (app, _) = test_app().await;

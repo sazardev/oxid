@@ -159,6 +159,45 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(self.store.list_deploy_queue().await?)
     }
 
+    /// Drops a queued deploy without running it.
+    ///
+    /// A queue entry is a push waiting for capacity that may never come —
+    /// a branch asking for more memory than the node has, or one abandoned
+    /// while it waited. Until now the only way to clear one was to make it
+    /// fit or to restart into an empty database, so a single wedged entry
+    /// stopped the drain for everything behind it (the drain stops at the
+    /// first entry that does not fit, deliberately, so a big deploy is not
+    /// starved by small ones).
+    ///
+    /// Returns the cancelled entry so the caller can report *what* it
+    /// cancelled, and `None` when the id is gone — which is not an error:
+    /// the drain may have deployed it a moment earlier.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the queue cannot be read or written.
+    pub async fn cancel_queued_deploy(
+        &self,
+        id: u64,
+    ) -> Result<Option<crate::adapter::store::QueuedDeploy>, CpError> {
+        let Some(entry) = self
+            .store
+            .list_deploy_queue()
+            .await?
+            .into_iter()
+            .find(|entry| entry.id == id)
+        else {
+            return Ok(None);
+        };
+        self.store.remove_from_deploy_queue(id).await?;
+        tracing::info!(
+            queue_id = id,
+            project_id = %entry.project_id,
+            branch = %entry.branch,
+            "queued deploy cancelled"
+        );
+        Ok(Some(entry))
+    }
+
     /// Aggregate counts + host capacity for the web dashboard's overview —
     /// one call instead of the client fetching every project's environments
     /// just to total them up.

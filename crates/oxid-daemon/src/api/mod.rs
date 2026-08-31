@@ -254,6 +254,7 @@ pub fn router<
         .route("/api/v1/rotate-key", post(handlers::tokens::rotate_key))
         .route("/api/v1/audit", get(handlers::audit::recent_audit))
         .route("/api/v1/queue", get(handlers::audit::list_queue))
+        .route("/api/v1/queue/{id}", delete(handlers::audit::cancel_queued))
         // Master-only: reveals the (env-provided or auto-generated) webhook
         // secret so the wizard can hand it over for the Git host config —
         // same trust level as `GET /api/v1/backup`, which ships `secret.key`.

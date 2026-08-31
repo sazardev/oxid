@@ -32,6 +32,7 @@
         <a href="/ui/audit" :class="route.name==='audit'&&'active'" @click.prevent="go('/ui/audit')" x-text="t('nav.audit')"></a>
         <a href="/ui/secrets" :class="route.name==='secrets'&&'active'" @click.prevent="go('/ui/secrets')" x-text="t('nav.secrets')"></a>
         <a href="/ui/admin" :class="route.name==='admin'&&'active'" @click.prevent="go('/ui/admin')" x-text="t('nav.admin')"></a>
+        <a href="/ui/diagnostics" :class="route.name==='diagnostics'&&'active'" @click.prevent="go('/ui/diagnostics')" x-text="t('nav.diagnostics')"></a>
         <a href="/ui/onboarding" :class="route.name==='onboarding'&&'active'" @click.prevent="go('/ui/onboarding')" :title="t('nav.setupTitle')" x-text="t('nav.setup')"></a>
       </nav>
       <div class="conn">
@@ -516,6 +517,7 @@
       <!-- ================= QUEUE ================= -->
       <section class="page" x-show="route.name === 'queue'" x-cloak>
         <h1 x-text="t('queue.title')"></h1>
+        <p class="muted" x-text="t('queue.hint')"></p>
         <template x-if="queue.length === 0">
           <p class="muted" x-text="t('queue.empty')"></p>
         </template>
@@ -528,6 +530,8 @@
                 <th x-text="t('queue.col.branch')"></th>
                 <th x-text="t('queue.col.operator')"></th>
                 <th x-text="t('queue.col.requested')"></th>
+                <th x-text="t('queue.col.attempts')"></th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -538,6 +542,10 @@
                   <td class="mono" x-text="item.branch"></td>
                   <td class="muted" x-text="item.operator ?? t('audit.anonymous')"></td>
                   <td class="mono muted" x-text="formatTime(item.requested_at)"></td>
+                  <td class="mono muted" x-text="item.attempts || 0"></td>
+                  <td class="actions">
+                    <button class="btn btn-sm btn-danger" @click="cancelQueued(item)" x-text="t('action.cancelDeploy')"></button>
+                  </td>
                 </tr>
               </template>
             </tbody>
@@ -862,6 +870,87 @@
       </section>
 
       <!-- ================= ADMIN ================= -->
+      <!-- ================= DIAGNOSTICS ================= -->
+      <section class="page" x-show="route.name === 'diagnostics'" x-cloak>
+        <div class="page-head">
+          <h1 x-text="t('diag.title')"></h1>
+          <button class="btn btn-sm" :disabled="diagnostics.running" @click="runDiagnostics()"
+                  x-text="diagnostics.running ? t('action.working') : t('action.recheck')"></button>
+        </div>
+        <p class="muted" x-text="t('diag.hint')"></p>
+
+        <div class="card">
+          <h2 x-text="t('diag.daemonTitle')"></h2>
+          <dl class="data-grid mono">
+            <dt x-text="t('diag.reachable')"></dt>
+            <dd>
+              <span class="badge" :class="diagnostics.reachable ? 'badge-running' : 'badge-build_failed'"
+                    x-text="diagnostics.reachable ? t('diag.yes') : t('diag.no')"></span>
+              <span class="muted" x-show="diagnostics.error" x-text="diagnostics.error"></span>
+            </dd>
+            <dt x-text="t('diag.version')"></dt>
+            <dd x-text="diagnostics.version ?? '—'"></dd>
+            <dt x-text="t('diag.latency')"></dt>
+            <dd x-text="diagnostics.latencyMs !== undefined ? diagnostics.latencyMs + ' ms' : '—'"></dd>
+            <dt x-text="t('diag.checkedAt')"></dt>
+            <dd x-text="diagnostics.checkedAt ? formatTime(diagnostics.checkedAt) : '—'"></dd>
+          </dl>
+        </div>
+
+        <div class="card">
+          <h2 x-text="t('diag.credentialTitle')"></h2>
+          <dl class="data-grid mono">
+            <dt x-text="t('diag.tokenValid')"></dt>
+            <dd>
+              <span class="badge" :class="diagnostics.tokenValid ? 'badge-running' : 'badge-build_failed'"
+                    x-text="diagnostics.tokenValid ? t('diag.yes') : t('diag.no')"></span>
+              <span class="muted" x-show="diagnostics.tokenError" x-text="diagnostics.tokenError"></span>
+            </dd>
+            <dt x-show="diagnostics.tokenValid" x-text="t('diag.tokenScope')"></dt>
+            <dd x-show="diagnostics.tokenValid"
+                x-text="diagnostics.master ? t('diag.scopeMaster') : t('diag.scopeNamed')"></dd>
+          </dl>
+          <p class="muted" x-show="diagnostics.tokenValid === false" x-text="t('diag.tokenHint')"></p>
+        </div>
+
+        <div class="card">
+          <h2 x-text="t('diag.capacityTitle')"></h2>
+          <dl class="data-grid mono">
+            <dt x-text="t('diag.hostMemory')"></dt>
+            <dd x-text="hostMemoryLabel()"></dd>
+            <dt x-text="t('diag.running')"></dt>
+            <dd x-text="stats.environments_running"></dd>
+            <dt x-text="t('diag.queued')"></dt>
+            <dd>
+              <span x-text="stats.queue_length"></span>
+              <a class="link" href="#" x-show="stats.queue_length > 0"
+                 @click.prevent="go('/ui/queue')" x-text="t('diag.seeQueue')"></a>
+            </dd>
+            <dt x-text="t('diag.routing')"></dt>
+            <dd>
+              <span class="badge" :class="stats.traefik_enabled ? 'badge-running' : 'badge-paused'"
+                    x-text="stats.traefik_enabled ? t('diag.viaTraefik') : t('diag.directPublish')"></span>
+              <span class="muted" x-show="!stats.traefik_enabled" x-text="t('diag.directPublishHint')"></span>
+            </dd>
+          </dl>
+        </div>
+
+        <div class="card">
+          <h2 x-text="t('admin.infraTitle')"></h2>
+          <p class="muted" x-show="infra.loading && !infra.error && !infra.status" x-text="t('admin.infraLoading')"></p>
+          <p class="error-text" x-show="infra.error" x-text="infra.error"></p>
+          <template x-if="infra.status">
+            <div>
+              <p class="muted" x-show="(infra.status.next_steps ?? []).length === 0" x-text="t('admin.infraAllGood')"></p>
+              <template x-for="step in infra.status.next_steps ?? []" :key="step">
+                <pre class="mono muted next-step" x-text="step"></pre>
+              </template>
+              <a class="link" href="#" @click.prevent="go('/ui/admin')" x-text="t('diag.goAdmin')"></a>
+            </div>
+          </template>
+        </div>
+      </section>
+
       <section class="page" x-show="route.name === 'admin'" x-cloak>
         <h1 x-text="t('admin.title')"></h1>
         <div class="project-actions">
@@ -872,8 +961,14 @@
         <h2 x-text="t('admin.infraTitle')"></h2>
         <p class="muted" x-text="t('admin.infraHint')"></p>
         <div class="card">
-          <p class="muted" x-show="infra.loading" x-text="t('admin.infraLoading')"></p>
-          <p class="error-text" x-show="infra.error" x-text="infra.error"></p>
+          <p class="muted" x-show="infra.loading && !infra.error && !infra.status" x-text="t('admin.infraLoading')"></p>
+          <!-- Outside the `x-if` below on purpose: when the check itself
+               fails, that block renders nothing, and the only control for
+               recovering from the error would disappear with it. -->
+          <div class="project-actions" x-show="infra.error">
+            <p class="error-text grow" x-text="infra.error"></p>
+            <button class="btn btn-sm" :disabled="infra.loading" @click="loadInfra()" x-text="t('action.recheck')"></button>
+          </div>
           <template x-if="infra.status">
             <div>
               <dl class="data-grid mono">
