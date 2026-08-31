@@ -4,6 +4,27 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
+## [Unreleased]
+
+### Fixed
+
+- `install.sh` printed credentials and URLs that did not work. The Docker
+  stack publishes on `127.0.0.1` only, but the summary advertised the host's
+  LAN address, so the CLI command it printed was refused and the webhook URL
+  named an address no Git host could reach. It now prints where the daemon
+  actually listens in each mode, and says explicitly what to change to expose
+  the webhook endpoint.
+- `install.sh` suggested `oxid status` as the first command. `status` is
+  scoped to the checkout it is run from and registers it, so as a "did this
+  work" command it failed for reasons unrelated to the install. It now
+  suggests `oxid doctor` and `oxid ps`, neither of which needs a checkout.
+- Deploying from a checkout against a containerized daemon failed with a raw
+  `failed to resolve path` from git2. Registration sends the working-tree
+  path, which a daemon in a container cannot see — and a container is what
+  the one-command install sets up, so this was the default experience, fixed
+  only by discovering `--repo`. The CLI now retries with the checkout's
+  `origin` when the daemon rejects the path, and says that it did.
+
 ## [0.3.0] - 2026-08-31
 
 Oxid deploys a repository that has no Dockerfile. Sixteen stacks across

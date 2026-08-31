@@ -774,12 +774,46 @@ async fn main() {
 /// project.
 async fn register_project(client: &Client, base: &str) -> Result<Value, CliError> {
     let repo_dir = std::env::current_dir().map_err(|e| format!("cannot resolve cwd: {e}"))?;
-    register_with_body(
-        client,
-        base,
-        json!({ "repo_dir": repo_dir.display().to_string() }),
-    )
-    .await
+    let repo_dir = repo_dir.display().to_string();
+    let local = try_register(client, base, json!({ "repo_dir": &repo_dir })).await;
+
+    // A containerized daemon — which is what the one-command install sets up —
+    // cannot see the caller's checkout, so registering it by path fails with
+    // an error naming that path. That is the common case, not an exotic one,
+    // and the fix is the `--repo` the user would have had to discover: this
+    // repository's own `origin`. Falling back to it turns a confusing 500
+    // into the registration they meant. Only the path failure triggers this,
+    // and only when there is an `origin` to fall back to — anything else is
+    // reported as-is rather than retried against a different repository.
+    match local {
+        Ok(project) => Ok(project),
+        Err(RegisterFailure::Rejected { body, .. })
+            if body.contains(&repo_dir) && git_origin_url().is_some() =>
+        {
+            let url = git_origin_url().unwrap_or_default();
+            bg(format!(
+                "daemon cannot see {repo_dir} (it is likely containerized) — registering its origin instead: {url}"
+            ));
+            register_project_by_url(client, base, &url, None).await
+        }
+        Err(RegisterFailure::Rejected { status, body }) => {
+            Err(response_error(&body, status, "project registration failed"))
+        }
+        Err(RegisterFailure::Fatal(err)) => Err(err),
+    }
+}
+
+/// This checkout's `origin` fetch URL, if it has one.
+fn git_origin_url() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Registers a project straight from a remote URL — the daemon clones it
@@ -799,28 +833,48 @@ async fn register_project_by_url(
 }
 
 async fn register_with_body(client: &Client, base: &str, body: Value) -> Result<Value, CliError> {
+    try_register(client, base, body)
+        .await
+        .map_err(|failure| match failure {
+            RegisterFailure::Rejected { status, body } => {
+                response_error(&body, status, "project registration failed")
+            }
+            RegisterFailure::Fatal(err) => err,
+        })
+}
+
+/// Why a registration attempt did not produce a project.
+enum RegisterFailure {
+    /// The daemon answered with an error status. Kept unreported so a
+    /// caller can decide to retry differently before the user sees it.
+    Rejected { status: StatusCode, body: String },
+    /// Anything that leaves no useful second attempt.
+    Fatal(CliError),
+}
+
+/// Posts one registration and returns the daemon's rejection intact, without
+/// printing it — [`register_with_body`] is the reporting wrapper.
+async fn try_register(client: &Client, base: &str, body: Value) -> Result<Value, RegisterFailure> {
     let url = format!("{base}/api/v1/projects");
     let response = client
         .post(&url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| connect_error(&url, &e))?;
+        .map_err(|e| RegisterFailure::Fatal(connect_error(&url, &e)))?;
     let status = response.status();
-    let response_body = response
-        .text()
-        .await
-        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    let response_body = response.text().await.map_err(|e| {
+        RegisterFailure::Fatal(CliError::from(format!("cannot read daemon response: {e}")))
+    })?;
     if !status.is_success() {
-        return Err(response_error(
-            &response_body,
+        return Err(RegisterFailure::Rejected {
             status,
-            "project registration failed",
-        ));
+            body: response_body,
+        });
     }
-    let project: Value = serde_json::from_str(&response_body)
-        .map_err(|e| format!("invalid daemon response: {e}"))?;
-    Ok(project)
+    serde_json::from_str(&response_body).map_err(|e| {
+        RegisterFailure::Fatal(CliError::from(format!("invalid daemon response: {e}")))
+    })
 }
 
 async fn get_json(client: &Client, url: String) -> Result<Value, CliError> {

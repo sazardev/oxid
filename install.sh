@@ -276,15 +276,16 @@ EOF
 
     Dashboard    http://${HOST_ADDR}:8080/
     API token    ${API_TOKEN}
-                 (paste into the dashboard's token box, or use the CLI below)
+                 (paste into the dashboard's token box — the CLI on this
+                  machine is already configured with it)
 
-    CLI          oxid --api http://${HOST_ADDR}:8080 --token ${API_TOKEN} status
+    CLI          oxid doctor          (verifies the token) — then oxid ps
     Deploy       oxid up <branch>     (from a git checkout)
 
     Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
     Secret       ${WEBHOOK_SECRET}
 
-    These live in ${ENV_FILE} (0600).
+    Credentials live in ${ENV_FILE} (0600).
     Data/backups ${DATA}   (snapshots every 300s in ${DATA}/backups)
     Logs         journalctl -u oxidd -f
 
@@ -361,21 +362,33 @@ EOF
   HOST_ADDR="$(reachable_host)"
   configure_cli "http://127.0.0.1:8080" "${API_TOKEN}"
 
+  # The URLs say `127.0.0.1` because that is where this stack actually
+  # listens: the compose file publishes `127.0.0.1:8080:8080`, so nothing
+  # off this host can reach the control API. Printing the LAN address would
+  # be friendlier and wrong — the commands would not work, and the webhook
+  # URL would be one a Git host can never deliver to.
   cat <<EOF
 
 [+] Oxid is up. Everything below is ready to use — nothing else to run.
 
-    Dashboard    http://${HOST_ADDR}:8080/
+    Dashboard    http://127.0.0.1:8080/     (on this machine)
     API token    ${API_TOKEN}
-                 (paste into the dashboard's token box, or use the CLI below)
+                 (paste into the dashboard's token box — the CLI on this
+                  machine is already configured with it)
 
-    CLI          oxid --api http://${HOST_ADDR}:8080 --token ${API_TOKEN} status
-    Deploy       oxid up <branch>     (from a git checkout)
+    CLI          oxid doctor          (verifies the token) — then oxid ps
+    Deploy       oxid up <branch>     (from a git checkout; its `origin` is
+                 what gets registered, since this daemon runs in a container
+                 and cannot see your working tree)
 
-    Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
-    Secret       ${WEBHOOK_SECRET}
+    Webhook      secret: ${WEBHOOK_SECRET}
+                 The control API is published on 127.0.0.1 only, so a Git
+                 host cannot reach it yet. To let it: change the ports line
+                 in ${STACK}/docker-compose.yml to "8080:8080", run
+                 'docker compose up -d', and point the webhook at
+                 http://${HOST_ADDR}:8080/api/v1/webhooks/github
 
-    These live in ${STACK}/.env (0600). Upgrade with:
+    Credentials live in ${STACK}/.env (0600). Upgrade with:
       cd ${STACK} && docker compose pull && docker compose up -d
 EOF
   exit 0
