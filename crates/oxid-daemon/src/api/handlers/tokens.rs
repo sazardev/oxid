@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::middleware::require_master;
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
@@ -32,6 +33,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::{Capability, Role};
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -40,6 +42,7 @@ use oxid_core::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use time::OffsetDateTime;
 use tower_governor::GovernorLayer;
 
 /// Body for `POST /api/v1/tokens`.
@@ -60,6 +63,24 @@ pub struct CreateTokenBody {
     /// a can-do-nothing token is almost certainly a client bug.
     #[serde(default)]
     projects: Option<Vec<u64>>,
+    /// What this credential may do: `viewer`, `developer`, `maintainer` or
+    /// `admin`.
+    ///
+    /// Omitting it keeps exactly the power a token had before roles existed
+    /// — `maintainer` when scoped to projects, `admin` when not — because an
+    /// upgrade must never quietly take away a permission somebody's CI is
+    /// relying on. The same rule the `0017` migration applies to rows that
+    /// predate it, so a client and a stored token cannot disagree.
+    ///
+    /// Least privilege is therefore something you *ask* for. `oxid token
+    /// create` prints the role it granted, so the permissive default is
+    /// visible rather than silent.
+    #[serde(default)]
+    role: Option<String>,
+    /// How long the credential lasts, as a duration (`30d`, `12h`).
+    /// Omitted means it never expires.
+    #[serde(default)]
+    expires_in: Option<String>,
 }
 
 /// Mints a named token, master-token-only. The raw token is only ever
@@ -72,13 +93,31 @@ pub async fn create_token<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<CreateTokenBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_master(&state, authed.as_ref())?;
+    // Not master-only any more: an `admin` credential is the whole point of
+    // having roles, and a devops who cannot delegate user management has to
+    // keep handing out the master token — which is what the roles exist to
+    // stop. A scoped credential still cannot reach this, whatever its role.
+    authorize(&authed, Capability::ManageAccess, None)?;
     if body.name.trim().is_empty() {
         return Err(ApiError::from_validation("token name cannot be empty"));
     }
+    let role = match body.role.as_deref() {
+        None if body.projects.is_some() => Role::Maintainer,
+        None => Role::Admin,
+        Some(raw) => raw.parse::<Role>().map_err(ApiError::from_validation)?,
+    };
+    let expires_at = body
+        .expires_in
+        .as_deref()
+        .map(|raw| {
+            Ttl::parse(raw)
+                .map(|ttl| OffsetDateTime::now_utc().unix_timestamp() + ttl.whole_seconds())
+                .map_err(|e| ApiError::from_validation(e.to_string()))
+        })
+        .transpose()?;
     let (id, token) = state
         .cp
-        .create_operator_token(body.name.trim(), body.projects.clone())
+        .create_operator_token(body.name.trim(), body.projects.clone(), role, expires_at)
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -87,6 +126,8 @@ pub async fn create_token<
             "name": body.name,
             "token": token,
             "projects": body.projects,
+            "role": role.as_str(),
+            "expires_at": expires_at,
         })),
     ))
 }
@@ -100,7 +141,7 @@ pub async fn list_tokens<
     State(state): State<ApiState<G, O>>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<Vec<crate::adapter::store::ApiTokenSummary>>> {
-    require_master(&state, authed.as_ref())?;
+    authorize(&authed, Capability::ManageAccess, None)?;
     Ok(Json(state.cp.list_operator_tokens().await?))
 }
 
@@ -113,7 +154,7 @@ pub async fn revoke_token<
     Path(id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
-    require_master(&state, authed.as_ref())?;
+    authorize(&authed, Capability::ManageAccess, None)?;
     state.cp.revoke_operator_token(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -168,4 +209,30 @@ pub async fn rotate_key<
                      on secret.key, update it too before the next restart",
         })),
     ))
+}
+
+/// Body for `PATCH /api/v1/tokens/{id}` — suspending or restoring access.
+#[derive(Debug, Deserialize)]
+pub struct UpdateTokenBody {
+    /// `true` switches the credential off, `false` back on.
+    suspended: bool,
+}
+
+/// Suspends or restores a named credential without destroying it.
+///
+/// Revocation is permanent and forces reissuing a token everywhere it is
+/// configured; suspension is the reversible one an operator actually wants
+/// for somebody on leave, or a contractor between engagements.
+pub async fn update_token<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
+    Json(body): Json<UpdateTokenBody>,
+) -> ApiResult<Json<Value>> {
+    authorize(&authed, Capability::ManageAccess, None)?;
+    state.cp.set_operator_suspended(id, body.suspended).await?;
+    Ok(Json(json!({ "id": id, "suspended": body.suspended })))
 }

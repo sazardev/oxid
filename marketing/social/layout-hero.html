@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;600&family=Fira+Sans:wght@500;700;800&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="brand.css" />
+<style>
+  body { width: 100vw; height: 100vh; }
+  .frame { align-items: center; justify-content: center; flex-direction: column; gap: 1.4vw; }
+  .mark-wrap { width: 6.2vw; height: 6.2vw; display: flex; align-items: center; justify-content: center; margin-bottom: 0.6vw; }
+  .mark-wrap svg { width: 100%; height: 100%; }
+  .wordmark { font-size: 7.4vw; display: flex; align-items: baseline; }
+  .cursor { width: 0.42em; height: 0.62em; margin-left: 0.1em; }
+  .tagline { font-size: 2.5vw; margin-top: 0.5vw; }
+  .subtagline { font-size: 1.35vw; margin-top: 0.6vw; color: var(--ash); }
+  .badge { font-size: 1vw; padding: 0.45vw 1vw; gap: 0.5vw; position: absolute; top: 2.6vw; right: 2.8vw; }
+
+  .term { width: 42vw; margin-top: 2vw; border: 1px solid var(--border); background: var(--iron); text-align: left; }
+  .term-bar { display: flex; align-items: center; gap: 0.5vw; padding: 0.7vw 1vw; border-bottom: 1px solid var(--border); background: var(--iron); }
+  .term-dot { width: 0.6vw; height: 0.6vw; border-radius: 50%; background: var(--border); }
+  .term-title { font-family: var(--font-mono); font-size: 0.85vw; color: var(--ash); margin-left: 0.6vw; }
+  .term-body { font-family: var(--font-mono); font-size: 1.15vw; padding: 1.2vw 1.4vw; line-height: 1.9; background: var(--iron-2); }
+  .term-body .p { color: var(--ash); }
+  .term-body .orange { color: var(--orange); }
+  .term-body .green { color: var(--green); }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="grid-bg"></div>
+    <div class="wash"></div>
+    <div class="badge"><span class="dot"></span>self-hosted&nbsp;·&nbsp;0BSD&nbsp;·&nbsp;rust</div>
+    <div class="mark-wrap">
+      <svg viewBox="0 0 120 120" role="img" aria-label="Oxid">
+        <path d="M37.5,21.03 L15,60 L37.5,98.97 L82.5,98.97 L105,60 L82.5,21.03"
+          fill="none" stroke="#DE5236" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </div>
+    <h1 class="wordmark">oxid<span class="cursor"></span></h1>
+    <p class="tagline">Every branch comes alive.</p>
+    <p class="subtagline">Self-hosted preview environments that scale to zero. Written in Rust.</p>
+    <div class="term">
+      <div class="term-bar"><span class="term-dot"></span><span class="term-dot"></span><span class="term-dot"></span><span class="term-title">oxid — live session</span></div>
+      <div class="term-body"><span class="p">$</span> git push origin feature-login<br />
+        <span class="orange">[&gt;]</span> Building image (cache hit: 85%) ...<br />
+        <span class="green">[+]</span> https://feature-login.local.dev<br />
+        <span class="p">$</span> oxid pause feature-login</div>
+    </div>
+  </div>
+</body>
+</html>

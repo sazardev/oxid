@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, require_unscoped};
+use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -31,6 +32,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -54,7 +56,7 @@ pub async fn backup<
 ) -> ApiResult<Response> {
     // A backup contains every project's encrypted secrets and the (hashed)
     // token table — node-wide material, not any single operator's scope.
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::ManageNode, None)?;
     let snapshot_path = state
         .data_dir
         .join(format!(".backup-snapshot-{}.sqlite", std::process::id()));
@@ -109,7 +111,7 @@ pub async fn restore<
     authed: Option<Extension<AuthedAs>>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::ManageNode, None)?;
     if !state.allow_restore {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,

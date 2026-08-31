@@ -170,30 +170,24 @@
       <section class="doc-section" id="setup-network">
         <h2>Where it listens &mdash; and what that means</h2>
         <p>
-          The daemon binds <code>0.0.0.0:8080</code> <em>inside</em> its container, but the
-          compose publishes <code>127.0.0.1:8080:8080</code>. The control API is reachable
-          from the host and from nowhere else. That is the right default for something holding
-          the Docker socket, and it has one visible consequence: <strong>a Git host cannot
-          deliver webhooks to it yet.</strong>
+          <strong>On every interface, on purpose.</strong> The compose publishes
+          <code>8080:8080</code> and <code>--server</code> binds <code>0.0.0.0:8080</code>, so
+          your team's CLIs and your Git host can reach it without editing anything. A
+          preview-environment server nobody can reach is not one.
         </p>
-        <p>To expose it, change the publish and the bootstrap-token setting together:</p>
-        <pre class="cmd-block"><span class="tk-gray"># oxid-stack/docker-compose.yml</span>
-    ports:
-      - <span class="tk-green">"8080:8080"</span>        <span class="tk-gray"># was "127.0.0.1:8080:8080"</span>
-    environment:
-      OXID_BOOTSTRAP_TOKEN_ACCESS: <span class="tk-green">"loopback"</span>   <span class="tk-gray"># was "any"</span>
-
-<span class="tk-gray">$</span> docker compose up -d</pre>
+        <p>What stands between that port and your cluster is the credential, not the bind:</p>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
+          <li>Every <code>/api/v1/*</code> route requires a bearer token.</li>
+          <li>The daemon refuses to start on a non-loopback bind without <code>OXID_API_TOKEN</code>.</li>
+          <li>Credentials carry a <a href="security.html#sec-tokens">role, a scope and an expiry</a>.</li>
+          <li><code>OXID_BOOTSTRAP_TOKEN_ACCESS</code> is <code>off</code>, so nothing hands out a token pre-auth. The installer prints it instead.</li>
+        </ul>
         <p class="note">
-          <code>any</code> is only correct while the port is private &mdash; it hands the
-          master token to any caller that can reach it, pre-auth. See
-          <a href="security.html#sec-bootstrap">Security &rarr; bootstrap token</a> before
-          widening the publish.
-        </p>
-        <p>
-          The <code>--server</code> mode binds <code>0.0.0.0:8080</code> with no publish in
-          front, so it is reachable on the host's own address from the start. Put it behind
-          Traefik or a firewall accordingly.
+          <strong>Put TLS in front before this crosses a network you do not control.</strong> A
+          bearer token over plain HTTP is readable by anything on the path. On a trusted LAN
+          this is fine as it stands; on anything else, terminate TLS at Traefik or set
+          <code>OXID_TLS_CERT</code>/<code>OXID_TLS_KEY</code>. To go the other way, narrow the
+          publish to <code>"127.0.0.1:8080:8080"</code> and reach it over SSH.
         </p>
       </section>
 
@@ -260,7 +254,7 @@ Secret  <span class="tk-gray">the OXID_WEBHOOK_SECRET the installer printed</spa
         </p>
         <p>Two things to get right:</p>
         <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
-          <li><strong>The port has to be reachable by the Git host</strong> &mdash; see <a href="#setup-network">where it listens</a>. A default Docker install is loopback-only.</li>
+          <li><strong>The Git host has to reach the port.</strong> It is published on every interface, so on a server with a public address this already works; behind NAT you still need a forward or a tunnel.</li>
           <li><strong>The secret must match.</strong> Webhooks are rejected entirely while <code>OXID_WEBHOOK_SECRET</code> is unset, and a bad signature is a 401.</li>
         </ul>
         <p>A quick check that the secret is right, without waiting for a push:</p>
@@ -382,8 +376,12 @@ rm -f ~/.config/oxid/config.toml</pre>
               <td>The CLI is not pointed at this daemon. <code>oxid context use local</code>, or pass <code>--token "$(grep ^OXID_API_TOKEN oxid-stack/.env | cut -d= -f2)"</code>. An <code>OXID_TOKEN</code> left in your shell overrides the stored context.</td>
             </tr>
             <tr>
-              <td><code>connection refused</code> on the host's LAN address</td>
-              <td>Expected: the Docker stack publishes on <code>127.0.0.1</code>. Use <code>127.0.0.1:8080</code>, or <a href="#setup-network">widen the publish</a>.</td>
+              <td><code>403 Forbidden: this action needs the … role</code></td>
+              <td>Working as intended: the credential's role is below what the action needs. <code>oxid token list</code> shows every role; an admin can issue a stronger one.</td>
+            </tr>
+            <tr>
+              <td><code>403 … this access expired</code> / <code>… suspended</code></td>
+              <td>The credential ran out or was switched off. <code>oxid token resume &lt;id&gt;</code> restores a suspended one; an expired one has to be reissued.</td>
             </tr>
             <tr>
               <td><code>git failure: failed to resolve path '/home/…'</code></td>
@@ -416,7 +414,7 @@ rm -f ~/.config/oxid/config.toml</pre>
       <section class="doc-section" id="setup-next">
         <h2>Next steps</h2>
         <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
-          <li>Stop using the master token day to day: <code>oxid token create alice --project 1</code> — see <a href="security.html#sec-tokens">token scoping</a>.</li>
+          <li>Stop using the master token day to day: <code>oxid token create juan --project 1 --role developer --expires-in 90d</code> — see <a href="security.html#sec-tokens">giving people access</a>.</li>
           <li>Shared Postgres/Redis: set <code>OXID_POSTGRES_URL</code> / <code>OXID_REDIS_URL</code> so projects declaring those dependencies get a logical database per branch.</li>
           <li>Backups: <code>OXID_BACKUP_INTERVAL_SECS</code>, restored with <code>oxid restore</code>.</li>
           <li>Tune throughput: <code>OXID_DEPLOY_CONCURRENCY</code> — 15 simultaneous pushes settle in 7.1s at the default, 4.2s at 16.</li>

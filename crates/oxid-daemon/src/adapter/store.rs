@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use oxid_core::services::access::{Grant, Role};
 use oxid_core::services::branch_filter::DeployConfig;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
@@ -523,24 +524,55 @@ impl SqliteStore {
         name: &str,
         token_hash: &str,
         scoped_projects: Option<&[u64]>,
+        role: Role,
+        expires_at: Option<i64>,
     ) -> Result<u64, RepositoryError> {
         let scopes = scoped_projects
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| storage(format!("cannot serialize token scopes: {e}")))?;
         let row = sqlx::query(
-            "INSERT INTO api_tokens (name, token_hash, created_at, scoped_projects) \
-             VALUES (?, ?, ?, ?) RETURNING id",
+            "INSERT INTO api_tokens (name, token_hash, created_at, scoped_projects, role, \
+             expires_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(token_hash)
         .bind(OffsetDateTime::now_utc().unix_timestamp())
         .bind(scopes)
+        .bind(role.as_str())
+        .bind(expires_at)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
         let id: i64 = row.try_get("id").map_err(storage)?;
         u64::try_from(id).map_err(|_| storage("token id overflowed u64"))
+    }
+
+    /// Suspends or restores a token's access.
+    ///
+    /// Separate from revocation on purpose: revoking is permanent and the
+    /// credential can never come back, while somebody on leave, or a
+    /// contractor between engagements, needs their access switched off and
+    /// on again without reissuing a token and updating every place it is
+    /// configured.
+    ///
+    /// Idempotent in both directions.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn set_api_token_suspended(
+        &self,
+        id: u64,
+        suspended: bool,
+    ) -> Result<bool, RepositoryError> {
+        let at = suspended.then(|| OffsetDateTime::now_utc().unix_timestamp());
+        let result = sqlx::query("UPDATE api_tokens SET suspended_at = ? WHERE id = ?")
+            .bind(at)
+            .bind(id_as_i64(id))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Looks up the operator a token belongs to (name + project scopes), if
@@ -554,7 +586,7 @@ impl SqliteStore {
         token_hash: &str,
     ) -> Result<Option<OperatorIdentity>, RepositoryError> {
         let row = sqlx::query(
-            "SELECT name, scoped_projects FROM api_tokens \
+            "SELECT name, scoped_projects, role, expires_at, suspended_at FROM api_tokens \
              WHERE token_hash = ? AND revoked_at IS NULL",
         )
         .bind(token_hash)
@@ -568,9 +600,26 @@ impl SqliteStore {
                 .map(|s| serde_json::from_str::<Vec<u64>>(&s))
                 .transpose()
                 .map_err(|e| storage(format!("corrupt scope list on api token `{name}`: {e}")))?;
+            // A role that does not parse — an older daemon's spelling, or a
+            // hand-edited row — falls back to `viewer` rather than failing
+            // the request. Access control must fail *closed*: the safe
+            // direction here is the least power, which is the opposite of
+            // the branch filter, where the safe direction is deploying.
+            let role: Option<String> = r.try_get("role").map_err(storage)?;
+            let role = role
+                .and_then(|raw| raw.parse::<Role>().ok())
+                .unwrap_or(Role::Viewer);
+            let expires_at: Option<i64> = r.try_get("expires_at").map_err(storage)?;
+            let suspended_at: Option<i64> = r.try_get("suspended_at").map_err(storage)?;
             Ok(OperatorIdentity {
                 name,
-                scoped_projects,
+                scoped_projects: scoped_projects.clone(),
+                grant: Grant {
+                    role,
+                    projects: scoped_projects,
+                    expires_at,
+                    suspended: suspended_at.is_some(),
+                },
             })
         })
         .transpose()
@@ -583,8 +632,8 @@ impl SqliteStore {
     /// Returns [`RepositoryError`] on query failure.
     pub async fn list_api_tokens(&self) -> Result<Vec<ApiTokenSummary>, RepositoryError> {
         let rows = sqlx::query(
-            "SELECT id, name, created_at, revoked_at, scoped_projects \
-             FROM api_tokens ORDER BY id DESC",
+            "SELECT id, name, created_at, revoked_at, scoped_projects, role, \
+             expires_at, suspended_at FROM api_tokens ORDER BY id DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -600,12 +649,23 @@ impl SqliteStore {
                     .map(|s| serde_json::from_str::<Vec<u64>>(&s))
                     .transpose()
                     .map_err(|e| storage(format!("corrupt scope list on token {id}: {e}")))?;
+                let role: Option<String> = r.try_get("role").map_err(storage)?;
+                let expires_at: Option<i64> = r.try_get("expires_at").map_err(storage)?;
+                let suspended_at: Option<i64> = r.try_get("suspended_at").map_err(storage)?;
                 Ok(ApiTokenSummary {
                     id: u64::try_from(id).map_err(|_| storage("token id overflowed u64"))?,
                     name,
                     created_at,
                     revoked: revoked_at.is_some(),
                     scoped_projects,
+                    role: role
+                        .and_then(|raw| raw.parse::<Role>().ok())
+                        .unwrap_or(Role::Viewer),
+                    expires_at: expires_at
+                        .map(OffsetDateTime::from_unix_timestamp)
+                        .transpose()
+                        .map_err(|e| storage(format!("bad expiry on token {id}: {e}")))?,
+                    suspended: suspended_at.is_some(),
                 })
             })
             .collect()
@@ -767,6 +827,13 @@ pub struct ApiTokenSummary {
     /// which creation rejects — it exists here only as a safe-direction
     /// interpretation of a corrupt row.
     pub scoped_projects: Option<Vec<u64>>,
+    /// What this token may do within its scope.
+    pub role: Role,
+    /// When it stops working, if ever.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    /// Whether access is currently suspended (reversible, unlike revoked).
+    pub suspended: bool,
 }
 
 /// What a named API token resolves to at authentication time: who it
@@ -779,6 +846,8 @@ pub struct OperatorIdentity {
     /// `Some(ids)` = limited to those projects — every other project is
     /// answered with `404` so its existence isn't revealed.
     pub scoped_projects: Option<Vec<u64>>,
+    /// What this credential may do, where, and until when.
+    pub grant: Grant,
 }
 
 // ---------------------------------------------------------------------------
@@ -2066,11 +2135,17 @@ mod tests {
         let store = SqliteStore::open_in_memory().await.unwrap();
 
         let unscoped_id = store
-            .create_api_token("root", "hash-unscoped", None)
+            .create_api_token("root", "hash-unscoped", None, Role::Admin, None)
             .await
             .unwrap();
         let scoped_id = store
-            .create_api_token("alice", "hash-scoped", Some(&[3, 1, 3]))
+            .create_api_token(
+                "alice",
+                "hash-scoped",
+                Some(&[3, 1, 3]),
+                Role::Maintainer,
+                None,
+            )
             .await
             .unwrap();
         let _ = (unscoped_id, scoped_id);
@@ -2119,7 +2194,7 @@ mod tests {
     async fn legacy_tokens_without_scope_column_read_as_unscoped() {
         let store = SqliteStore::open_in_memory().await.unwrap();
         store
-            .create_api_token("old-row", "hash-old", None)
+            .create_api_token("old-row", "hash-old", None, Role::Admin, None)
             .await
             .unwrap();
         let identity = store

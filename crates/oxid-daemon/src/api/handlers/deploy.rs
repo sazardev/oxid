@@ -18,8 +18,9 @@ use std::path::PathBuf;
 use crate::DeployOutcome;
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
+use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::middleware::operator_name;
-use crate::api::middleware::{AuthedAs, authorize_project};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -34,6 +35,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -53,7 +55,7 @@ pub async fn deploy<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<DeployBody>,
 ) -> ApiResult<Response> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Operate, Some(id))?;
     let branch = parse_branch(&body.branch)?;
     match state
         .cp
@@ -107,7 +109,7 @@ pub async fn rollback<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<RollbackBody>,
 ) -> ApiResult<Response> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Operate, Some(id))?;
     let branch = parse_branch(&body.branch)?;
     let (env, report) = state
         .cp

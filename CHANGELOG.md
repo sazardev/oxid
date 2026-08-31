@@ -6,6 +6,77 @@ is the breaking position.
 
 ## [Unreleased]
 
+### Added
+
+- **Roles, scopes and expiries on every credential — users a devops can
+  actually manage.** A named token used to have one level of power: inside
+  its projects it could do *everything*, including rewriting secrets and
+  deleting the project. That is right for the person running the server and
+  far too much for the developer who wants to watch their branch come up.
+
+  ```
+  oxid token create juan  --project 1 --role developer  --expires-in 90d
+  oxid token create ana   --project 1 --role viewer
+  oxid token create ops2               --role admin
+  oxid token list      # role, status, scope, expiry
+  oxid token suspend 2 # reversible — someone on leave
+  oxid token resume 2
+  ```
+
+  | Role | Can | Cannot |
+  |---|---|---|
+  | `viewer` | read projects, environments, logs, history | change anything |
+  | `developer` | deploy, roll back, pause, wake, destroy environments | secrets, project settings |
+  | `maintainer` | its projects' secrets, settings, branch filter, deletion | anything node-wide |
+  | `admin` | the node, and issuing access to others | rotate the master key, read the webhook secret |
+
+  Five things hold this up:
+
+  - **Roles are cumulative, and a test proves it.** A matrix where a middle
+    role lacks something a lower one has is a bug nobody finds by reading it.
+  - **Scope is checked before role.** Answering "your role is too low" for
+    another team's project would confirm the project exists; out-of-scope is
+    a `404`, everything else a `403` that says why — a person told "your
+    access expired" opens a ticket, one told `404` files a bug.
+  - **A scoped credential can never act node-wide, whatever its role.**
+    "Admin of project 3" is not an admin of the server. This caught a real
+    hole during development: an earlier version also asked whether the
+    capability *looked* project-local, which let a scoped maintainer write a
+    **global** secret — one injected into every project's deploys.
+  - **Issuing access needs `admin`, not the master token.** A devops who
+    cannot delegate has to hand out the master credential, which is the one
+    thing roles exist to stop. Rotating the master key and reading the
+    webhook secret stay master-only.
+  - **Suspension is reversible; revocation is not.** Somebody on leave gets
+    switched off and back on with the same token, rather than reissuing one
+    and updating everywhere it is configured.
+
+  Omitting `--role` reproduces exactly what a token could do before —
+  `maintainer` when scoped, `admin` when not — because an upgrade must never
+  quietly remove a permission. Migration `0017` backfills existing rows by
+  the same rule. Least privilege is therefore something you ask for, and
+  `token create` prints the role it granted so the permissive default is
+  visible rather than silent.
+
+### Changed
+
+- **The control API is published on every interface by default.** It was
+  `127.0.0.1` only, which meant a team's developers could not connect their
+  CLI and a Git host could not deliver a webhook without editing the compose
+  file first — and the webhook URL the installer printed pointed at an
+  address nothing could reach.
+
+  The port was never the security boundary; the credential is. Every route
+  requires a bearer token, the daemon refuses to start on a non-loopback bind
+  without one, credentials now carry a role and an expiry, and
+  `OXID_BOOTSTRAP_TOKEN_ACCESS` is now `off` in the shipped compose — so
+  nothing hands out a token pre-auth. The installer prints it instead, which
+  reaches exactly one person on the machine that ran it.
+
+  What an open port does not give you is confidentiality: put TLS in front
+  before this crosses a network you do not control. Narrowing the publish
+  back to `127.0.0.1:8080:8080` remains one line.
+
 ### Fixed
 
 - **A branch with an uppercase letter could not be deployed at all.** The

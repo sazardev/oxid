@@ -25,6 +25,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::{Capability, Grant};
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -153,36 +154,6 @@ pub(crate) fn operator_scopes(authed: Option<&Extension<AuthedAs>>) -> Option<&[
     }
 }
 
-/// Rejects a request touching a project its credential isn't scoped to.
-///
-/// Answers `404`, not `403`: a scoped operator probing another team's
-/// project id must not be able to distinguish "exists but forbidden" from
-/// "doesn't exist".
-pub(crate) fn authorize_project(
-    authed: &Option<Extension<AuthedAs>>,
-    project_id: ProjectId,
-) -> ApiResult<()> {
-    match operator_scopes(authed.as_ref()) {
-        None => Ok(()),
-        Some(scopes) if scopes.contains(&project_id.0) => Ok(()),
-        Some(_) => Err(ApiError::not_found(format!("project `{}`", project_id.0))),
-    }
-}
-
-/// Restricts a node-wide endpoint (stats, infra, backups, global secrets,
-/// project registration) to unrestricted credentials. Unlike
-/// [`authorize_project`] this answers `403` — there's no existence to hide,
-/// and a scoped operator deserves a message explaining *why*.
-pub(crate) fn require_unscoped(authed: &Option<Extension<AuthedAs>>) -> ApiResult<()> {
-    if operator_scopes(authed.as_ref()).is_some() {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            crate::i18n::t("auth.unscopedOnly"),
-        ));
-    }
-    Ok(())
-}
-
 /// Rejects requests missing a valid `Authorization: Bearer <token>` header
 /// when `state.api_token` is configured; passes everything through
 /// unchanged otherwise (open by default, see [`ApiState::api_token`]). A
@@ -234,10 +205,17 @@ pub(crate) fn operator_name(authed: Option<&Extension<AuthedAs>>) -> Option<Stri
     }
 }
 
-/// Restricts an endpoint to the master `OXID_API_TOKEN` — used for token
-/// management, so any named operator can't mint or revoke other operators'
-/// credentials. A no-op when the API has no token configured at all
-/// (matches every other endpoint's "open by default" behavior).
+/// Restricts an endpoint to the master `OXID_API_TOKEN` itself.
+///
+/// Kept alongside the role model rather than folded into it, for the two
+/// operations where being an `admin` is deliberately not enough: rotating
+/// the master encryption key, and reading the webhook secret. Both are
+/// irreversible or forgeable in a way that issuing a token is not, and the
+/// role model has no way to say "the one credential the operator holds" —
+/// an admin role is a role, and roles are things admins hand out.
+///
+/// A no-op when the API has no token configured at all, matching every
+/// other endpoint's open-by-default behaviour.
 pub(crate) fn require_master<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
@@ -254,6 +232,41 @@ pub(crate) fn require_master<
             StatusCode::FORBIDDEN,
             crate::i18n::t("auth.masterOnly"),
         )),
+    }
+}
+
+/// The grant a request carries: an explicit one for a named token, and full
+/// admin for the master credential or an unauthenticated open-API daemon.
+pub(crate) fn grant_of(authed: Option<&Extension<AuthedAs>>) -> Grant {
+    match authed {
+        Some(Extension(AuthedAs::Operator(identity))) => identity.grant.clone(),
+        _ => Grant::master(),
+    }
+}
+
+/// Enforces one capability, optionally against a specific project.
+///
+/// The single place route handlers ask "may this caller do this". Denials
+/// that would reveal a project's existence become `404`; everything else is
+/// a `403` that says what is wrong, because a person told their access
+/// expired can act on that, and one told `404` files a bug against the
+/// daemon.
+///
+/// # Errors
+/// [`ApiError`] carrying the mapped status.
+pub(crate) fn authorize(
+    authed: &Option<Extension<AuthedAs>>,
+    capability: Capability,
+    project: Option<u64>,
+) -> ApiResult<()> {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    match grant_of(authed.as_ref()).authorize(capability, project, now) {
+        Ok(()) => Ok(()),
+        Err(denial) if denial.hides_existence() => Err(ApiError::not_found(format!(
+            "project `{}`",
+            project.unwrap_or_default()
+        ))),
+        Err(denial) => Err(ApiError::new(StatusCode::FORBIDDEN, denial.describe())),
     }
 }
 

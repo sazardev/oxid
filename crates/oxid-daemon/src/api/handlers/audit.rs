@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use crate::api::ApiState;
 use crate::api::DEFAULT_AUDIT_LIMIT;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, authorize_project, operator_scopes};
+use crate::api::middleware::authorize;
+use crate::api::middleware::{AuthedAs, operator_scopes};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -32,6 +33,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -59,7 +61,7 @@ pub async fn recent_audit<
         None => Ok(Json(state.cp.recent_audit_events(&filter).await?)),
         Some(scopes) => {
             if let Some(project_id) = filter.project_id {
-                authorize_project(&authed, project_id)?;
+                authorize(&authed, Capability::Read, Some(project_id.0))?;
                 return Ok(Json(state.cp.recent_audit_events(&filter).await?));
             }
             let mut events = Vec::new();
@@ -150,7 +152,7 @@ pub async fn environment_audit<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Read, Some(project_id.0))?;
     let filter = query.into_filter()?;
     Ok(Json(
         state

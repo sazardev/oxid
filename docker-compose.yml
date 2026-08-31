@@ -105,41 +105,48 @@ services:
       OXID_API_TOKEN: ${OXID_API_TOKEN:-}
       OXID_WEBHOOK_SECRET: ${OXID_WEBHOOK_SECRET:-}
       OXID_AUTO_TOKEN: "1"
-      # Lets `oxid token generate` and the dashboard's "generate for me"
-      # button retrieve that generated token over the published port.
+      # `GET /api/v1/setup/token` hands the generated master token to a
+      # caller *before* authentication, so the dashboard's onboarding can
+      # finish without anyone reading container logs.
       #
-      # Tied to the `127.0.0.1:8080:8080` publish below, and only safe
-      # because of it: this daemon cannot see which address its port was
-      # published on — inside the container it is always `0.0.0.0`, and
-      # Docker's forwarding makes the operator on this host and a stranger
-      # on the network arrive from the same bridge address. The default
-      # (`loopback`) therefore withholds the token from both, which for a
-      # containerized daemon means everyone. **If you widen the publish
-      # below to all interfaces, remove this line** — otherwise anyone who
-      # can reach the port can ask for the master token, and with it the
-      # database, the AES key that encrypts every secret, and the ability to
-      # deploy. Set it to `off` to disable the endpoint outright and read
-      # the token from `docker compose logs oxid-daemon` instead.
-      OXID_BOOTSTRAP_TOKEN_ACCESS: any
+      # `off`, because the port below is published on every interface. A
+      # containerized daemon cannot tell who is asking — inside the
+      # container the bind is always `0.0.0.0`, and Docker's forwarding
+      # makes the operator on this host and a stranger on the network
+      # arrive from the same bridge address — so `loopback` would not
+      # actually mean loopback here, and `any` would hand the master token,
+      # and with it every secret and the ability to deploy, to whoever
+      # reached the port first.
+      #
+      # The installer prints the token instead, which is strictly better:
+      # it reaches exactly one person, on the machine that ran it.
+      OXID_BOOTSTRAP_TOKEN_ACCESS: "off"
       # Joining Traefik's network switches deployed containers from
       # publishing a host port to being routed by Traefik labels instead
       # (see ControlPlane::with_traefik / SPEC.md §3.2).
       OXID_DOCKER_NETWORK: oxid-net
       OXID_DAEMON_URL: http://oxid-daemon:8080
     ports:
-      # Direct access for the CLI/dashboard (`OXID_API=http://localhost:8080`).
-      # Bound to loopback deliberately: everything on this port is the
-      # control plane — deploying, destroying, reading secret names. The
-      # daemon no longer *depends* on this binding for the one pre-auth
-      # endpoint that hands over a credential (`GET /api/v1/setup/token`
-      # now answers only callers on the daemon's own host, whatever the
-      # bind), but keeping the port local is still the right default.
-      # Widen to `"8080:8080"` (all interfaces) only over a private/trusted
-      # network, and prefer setting an explicit OXID_API_TOKEN first if you
-      # do. Traefik only routes *deployed environments*, not this control
-      # API — remove this line entirely if you'd rather reach it exclusively
-      # through Traefik/a private network.
-      - "127.0.0.1:8080:8080"
+      # The control plane, for the CLI, the dashboard and Git webhooks.
+      #
+      # Published on every interface, because a preview-environment server
+      # nobody can reach is not one: the team's developers connect their
+      # CLI to it, and GitHub has to deliver pushes to it. Loopback-only
+      # meant every one of those needed a manual edit here first, and the
+      # webhook URL the installer printed pointed somewhere no Git host
+      # could deliver.
+      #
+      # What makes that safe is that the port is not the security boundary:
+      # every `/api/v1/*` route requires a bearer token, the daemon refuses
+      # to start on a non-loopback bind without one, credentials carry a
+      # role and a scope, and the one pre-auth endpoint that hands over a
+      # token is disabled above.
+      #
+      # Still: terminate TLS in front of this before it crosses anything
+      # you do not control — a bearer token over plain HTTP is readable by
+      # the network. Narrow it back to `"127.0.0.1:8080:8080"` if the only
+      # thing that ever talks to this daemon lives on this host.
+      - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - oxid-data:/data

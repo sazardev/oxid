@@ -69,6 +69,28 @@ Four invariants in that pipeline are load-bearing and easy to undo by accident:
 - **Scale-to-zero stops containers, it does not pause them.** Traefik's Docker provider only publishes routers for `running` containers and ignores pause/unpause events, so a `docker pause`d environment loses its route permanently and 404s instead of waking. `ControlPlane::pause` and the GC both use `stop`; waking dispatches on `container_status`, never on the stored state.
 - **Wake-on-request needs the daemon's catch-all router.** A stopped environment has no router of its own, so the lowest-priority `oxid-wake-catchall` router on the daemon's container is what catches the request and rewrites it to `/api/v1/wake`. It ships in `docker-compose.yml` and `oxid infra status` reports it missing.
 - **The environment row is created before the image build.** It is what gives a failure somewhere to be recorded; every failure path funnels through `record_deploy_failure` so a broken Dockerfile leaves an `EnvironmentState::BuildFailed` row, an audit event and an ERROR line instead of nothing at all. `BuildFailed` is a real state, distinct from `Destroyed`: it means "someone's push is broken", it can only transition onward to `Destroy`/`TtlExpired`, and it is deliberately excluded from `find_environment_by_branch`'s notion of *live* so a failure never hides the instance still serving the branch.
+- **Access is a role, a scope and an expiry — and scope beats role.**
+  `oxid_core::services::access` is the only place the rules live;
+  `api::middleware::authorize(&authed, Capability::X, project)` is the only
+  way a route asks. Four ordered roles (viewer/developer/maintainer/admin),
+  cumulative by construction (`Role::minimum_for`), pinned by a test. Two
+  rules are easy to undo: an out-of-scope denial must answer `404` (a `403`
+  confirms the project exists), and a scoped credential must be refused
+  **any** action with no project id, whatever the capability — the version
+  that also asked whether the capability looked project-local let a scoped
+  maintainer write a global secret. Omitting a role on creation reproduces
+  pre-roles power (maintainer scoped, admin unscoped), matching migration
+  `0017`'s backfill; changing that default silently removes permissions.
+  `require_master` survives for exactly two operations an admin must not
+  have: key rotation and reading the webhook secret.
+
+- **The shipped compose publishes on every interface, and that is deliberate.**
+  The port is not the boundary — the token is. What makes it safe is the pair:
+  `OXID_BOOTSTRAP_TOKEN_ACCESS: off` (nothing hands out a credential pre-auth)
+  plus the daemon's refusal to start on a non-loopback bind without a token.
+  Re-enabling `any` while the port is open hands the master token to whoever
+  reaches it first.
+
 - **Branch filtering is decided before the checkout, and only for webhooks.**
   `[deploy].branches`/`ignore`/`max_environments` live on the project row
   (migration `0016`), not in the per-commit `branch_config`, because the whole

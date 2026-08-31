@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, authorize_project, operator_scopes, require_unscoped};
+use crate::api::middleware::authorize;
+use crate::api::middleware::{AuthedAs, operator_scopes};
 use crate::api::types::{RegisterBody, RegistrationSource};
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -28,6 +29,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -154,7 +156,7 @@ pub async fn delete_project<
     Path(id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<StatusCode> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::ManageProject, Some(id))?;
     state.cp.delete_project(ProjectId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -213,7 +215,7 @@ pub async fn update_project<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<UpdateProjectBody>,
 ) -> ApiResult<Json<Project>> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::ManageProject, Some(id))?;
     let pause_after = body
         .pause_after
         .map(|raw| Ttl::parse(&raw))

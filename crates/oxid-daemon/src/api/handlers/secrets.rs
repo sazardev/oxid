@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, authorize_project, require_unscoped};
+use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -32,6 +33,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -143,7 +145,7 @@ pub async fn set_global_secret<
 ) -> ApiResult<StatusCode> {
     // Global scope leaks into every project's deploys — not something a
     // token scoped to a subset of projects may write or read.
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::Secrets, None)?;
     do_set_secret(state, None, body).await
 }
 
@@ -155,7 +157,7 @@ pub async fn list_global_secrets<
     authed: Option<Extension<AuthedAs>>,
     query: Query<SecretListQuery>,
 ) -> ApiResult<Json<Value>> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::Secrets, None)?;
     do_list_secrets(state, None, query.0).await
 }
 
@@ -168,7 +170,7 @@ pub async fn delete_global_secret<
     authed: Option<Extension<AuthedAs>>,
     query: Query<SecretDeleteQuery>,
 ) -> ApiResult<StatusCode> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::Secrets, None)?;
     do_delete_secret(state, None, &name, query.0).await
 }
 
@@ -181,7 +183,7 @@ pub async fn set_project_secret<
     authed: Option<Extension<AuthedAs>>,
     Json(body): Json<SecretBody>,
 ) -> ApiResult<StatusCode> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Secrets, Some(id))?;
     do_set_secret(state, Some(ProjectId(id)), body).await
 }
 
@@ -194,7 +196,7 @@ pub async fn list_project_secrets<
     authed: Option<Extension<AuthedAs>>,
     query: Query<SecretListQuery>,
 ) -> ApiResult<Json<Value>> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Secrets, Some(id))?;
     do_list_secrets(state, Some(ProjectId(id)), query.0).await
 }
 
@@ -207,7 +209,7 @@ pub async fn delete_project_secret<
     authed: Option<Extension<AuthedAs>>,
     query: Query<SecretDeleteQuery>,
 ) -> ApiResult<StatusCode> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Secrets, Some(id))?;
     do_delete_secret(state, Some(ProjectId(id)), &name, query.0).await
 }
 

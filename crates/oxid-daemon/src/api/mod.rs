@@ -66,7 +66,6 @@ pub use error::{ApiError, ApiResult};
 use middleware::AuthedAs;
 use middleware::{
     ClientIpKeyExtractor, handle_panic, operator_name, request_id_middleware, require_bearer_token,
-    require_master,
 };
 pub use types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
@@ -250,7 +249,7 @@ pub fn router<
         )
         .route(
             "/api/v1/tokens/{id}",
-            delete(handlers::tokens::revoke_token),
+            delete(handlers::tokens::revoke_token).patch(handlers::tokens::update_token),
         )
         .route("/api/v1/rotate-key", post(handlers::tokens::rotate_key))
         .route("/api/v1/audit", get(handlers::audit::recent_audit))

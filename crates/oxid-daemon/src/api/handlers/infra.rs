@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, require_unscoped};
+use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -31,6 +32,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -48,7 +50,7 @@ pub async fn stats<
     State(state): State<ApiState<G, O>>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::NodeStats>> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::ManageNode, None)?;
     Ok(Json(state.cp.node_stats().await?))
 }
 
@@ -62,7 +64,7 @@ pub async fn infra_status<
     State(state): State<ApiState<G, O>>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::InfraStatus>> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::ManageNode, None)?;
     Ok(Json(state.cp.infra_status().await?))
 }
 
@@ -76,6 +78,6 @@ pub async fn infra_bootstrap<
     State(state): State<ApiState<G, O>>,
     authed: Option<Extension<AuthedAs>>,
 ) -> ApiResult<Json<crate::InfraStatus>> {
-    require_unscoped(&authed)?;
+    authorize(&authed, Capability::ManageNode, None)?;
     Ok(Json(state.cp.infra_bootstrap().await?))
 }

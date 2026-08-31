@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;600&family=Fira+Sans:wght@500;700;800&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="brand.css" />
+<style>
+  body { width: 100vw; height: 100vh; }
+  .frame { align-items: center; justify-content: flex-start; flex-direction: row; gap: 3vw; padding: 0 6vw; }
+  .mark-wrap { flex: none; width: 13vw; height: 13vw; display: flex; align-items: center; justify-content: center; }
+  .mark-wrap svg { width: 100%; height: 100%; }
+  .text-col { display: flex; flex-direction: column; gap: 0.5vw; }
+  .wordmark { font-size: 5.6vw; display: flex; align-items: baseline; }
+  .cursor { width: 0.42em; height: 0.62em; margin-left: 0.1em; }
+  .tagline { font-size: 2.35vw; }
+  .subtagline { font-size: 1.35vw; }
+  .badge { font-size: 1.15vw; padding: 0.45vw 1vw; gap: 0.5vw; position: absolute; top: 2.6vw; right: 3vw; }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="grid-bg"></div>
+    <div class="wash"></div>
+    <div class="badge"><span class="dot"></span>self-hosted&nbsp;·&nbsp;rust</div>
+    <div class="mark-wrap">
+      <svg viewBox="0 0 120 120" role="img" aria-label="Oxid">
+        <path d="M37.5,21.03 L15,60 L37.5,98.97 L82.5,98.97 L105,60 L82.5,21.03"
+          fill="none" stroke="#DE5236" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" />
+      </svg>
+    </div>
+    <div class="text-col">
+      <h1 class="wordmark">oxid<span class="cursor"></span></h1>
+      <p class="tagline">Every branch comes alive.</p>
+      <p class="subtagline">Push&nbsp;→&nbsp;live preview. Idle&nbsp;→&nbsp;scales to zero.</p>
+    </div>
+  </div>
+</body>
+</html>

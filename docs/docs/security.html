@@ -84,17 +84,22 @@
           and nowhere else.
         </p>
         <p>
-          Widening that to <code>"8080:8080"</code> is a deliberate act with consequences on
-          this page. Do it over a private network, or put a TLS terminator in front. The
-          daemon also refuses to start on a non-loopback bind with no
-          <code>OXID_API_TOKEN</code>, which can only be overridden by setting
-          <code>OXID_ALLOW_OPEN_API=1</code> &mdash; an explicit opt-in to an unauthenticated
-          API, not something that happens by accident.
+          <strong>The shipped compose publishes on every interface</strong>, because a
+          preview-environment server nobody can reach is not one: the team's developers point
+          their CLI at it and the Git host has to deliver pushes to it. The port is not the
+          security boundary &mdash; the credential is.
         </p>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
+          <li>Every <code>/api/v1/*</code> route requires a bearer token.</li>
+          <li>The daemon refuses to start on a non-loopback bind with no <code>OXID_API_TOKEN</code>, overridable only by an explicit <code>OXID_ALLOW_OPEN_API=1</code>.</li>
+          <li>Credentials carry a role, a scope and an expiry.</li>
+          <li>The one pre-auth endpoint that hands over a token is <strong>disabled</strong> in that compose &mdash; see below.</li>
+        </ul>
         <p class="note">
-          One consequence of the loopback publish: a Git host cannot deliver webhooks to it.
-          Exposing the port is how you enable them &mdash; see
-          <a href="install.html#setup-webhooks">Install &rarr; webhooks</a>.
+          What the open port does <em>not</em> give you is confidentiality: a bearer token over
+          plain HTTP is readable by anything on the path. Terminate TLS in front of the daemon
+          before it crosses a network you do not control, or narrow the publish back to
+          <code>127.0.0.1:8080:8080</code> and reach it over SSH.
         </p>
       </section>
 
@@ -121,35 +126,68 @@
           whole LAN. The operator knows what the publish looks like; the daemon does not.
         </p>
         <p class="note">
-          The shipped <code>docker-compose.yml</code> sets <code>any</code>. That is correct
-          <em>only</em> because it publishes on <code>127.0.0.1</code>. If you widen the
-          publish, change this at the same time.
+          The shipped <code>docker-compose.yml</code> sets <code>off</code>, because it
+          publishes on every interface. <code>loopback</code> would not mean loopback there
+          &mdash; a containerized daemon sees every caller arrive from the bridge gateway
+          &mdash; and <code>any</code> would hand the master token to whoever reached the port
+          first. The installer prints the token instead, which reaches exactly one person on
+          the machine that ran it.
         </p>
       </section>
 
       <section class="doc-section" id="sec-tokens">
-        <h2>Tokens: master, named and scoped</h2>
+        <h2>Giving people access</h2>
         <p>
-          <code>OXID_API_TOKEN</code> is the master token. Everything else is issued from it
-          and is attributable in the audit trail, which is the reason to stop using the master
-          one for daily work.
+          <code>OXID_API_TOKEN</code> is the master credential. Everything else is issued from
+          it, is attributable in the audit trail, and says three things: <strong>what</strong>
+          a person may do, <strong>where</strong>, and <strong>until when</strong>.
         </p>
-        <pre class="cmd-block"><span class="tk-gray"># full-access operator — same reach as master, but named in the audit trail:</span>
-oxid token create alice
+        <pre class="cmd-block"><span class="tk-gray"># a developer on one project, for a quarter:</span>
+oxid token create juan --project 1 --role developer --expires-in 90d
 
-<span class="tk-gray"># scoped operator — may only act on project 1:</span>
-oxid token create ci-frontend --project 1
+<span class="tk-gray"># read-only, for whoever just watches the previews:</span>
+oxid token create ana --project 1 --role viewer
 
-oxid token list
-oxid token revoke &lt;id&gt;</pre>
-        <p>A scoped token is enforced at the middleware, not by convention:</p>
-        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
-          <li>Another project's routes answer <strong>404</strong>, not 403 &mdash; existence is not disclosed to a token with no business knowing.</li>
-          <li>Node-wide routes (stats, infra, tokens, backup, key rotation) answer <strong>403</strong>.</li>
-        </ul>
+<span class="tk-gray"># another operator, who can then issue access themselves:</span>
+oxid token create devops2 --role admin
+
+oxid token list                <span class="tk-gray"># role, status, scope, expiry</span>
+oxid token suspend &lt;id&gt;        <span class="tk-gray"># reversible — someone on leave</span>
+oxid token resume &lt;id&gt;
+oxid token revoke &lt;id&gt;         <span class="tk-gray"># permanent</span></pre>
+
+        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">The roles</h3>
+        <table class="docs-table">
+          <thead><tr><th>Role</th><th>Can</th><th>Cannot</th></tr></thead>
+          <tbody>
+            <tr><td><code>viewer</code></td><td>See projects, environments, logs, history.</td><td>Change anything at all.</td></tr>
+            <tr><td><code>developer</code></td><td>Deploy, roll back, pause, wake, destroy environments.</td><td>Read or write secrets; change the project.</td></tr>
+            <tr><td><code>maintainer</code></td><td>Its projects' secrets, settings and branch filter; delete the project.</td><td>Anything node-wide.</td></tr>
+            <tr><td><code>admin</code></td><td>The node: stats, infra, backups, and issuing access to others.</td><td>Rotate the master key or read the webhook secret &mdash; those stay with the master credential.</td></tr>
+          </tbody>
+        </table>
         <p>
-          A few operations require the <em>master</em> token specifically and reject named
-          ones: creating tokens, rotating the master key, and reading the webhook secret.
+          Roles are cumulative &mdash; each one can do everything the one below it can, and a
+          test pins that, because a matrix where a middle role is missing something a lower one
+          has is a bug nobody finds by reading it.
+        </p>
+        <p>
+          The line worth understanding is between <code>developer</code> and
+          <code>maintainer</code>: shipping the code and reading the credentials that code is
+          handed are different powers, and most of a team only needs the first.
+        </p>
+
+        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">Scope, and what a denial reveals</h3>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
+          <li>Another project's routes answer <strong>404</strong>, not 403 &mdash; existence is not disclosed to a credential with no business knowing. Scope is checked <em>before</em> role for exactly this reason: answering &ldquo;your role is too low&rdquo; would confirm the project exists.</li>
+          <li>Everything else answers <strong>403 with the reason</strong> &mdash; expired, suspended, or the role needed. A developer told &ldquo;your access expired&rdquo; opens a ticket; one told 404 files a bug against the daemon.</li>
+          <li><strong>A scoped credential can never act node-wide, whatever its role.</strong> &ldquo;Admin of project 3&rdquo; is not an admin of the server, and a global secret &mdash; injected into every project's deploys &mdash; counts as node-wide.</li>
+        </ul>
+        <p class="note">
+          Omitting <code>--role</code> reproduces the power a token had before roles existed:
+          <code>maintainer</code> when scoped, <code>admin</code> when not. An upgrade never
+          quietly removes a permission &mdash; which means least privilege is something you
+          ask for. <code>oxid token create</code> prints the role it granted.
         </p>
       </section>
 

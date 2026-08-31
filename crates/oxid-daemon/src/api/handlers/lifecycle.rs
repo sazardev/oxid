@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, authorize_project, operator_name};
+use crate::api::middleware::authorize;
+use crate::api::middleware::{AuthedAs, operator_name};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -31,6 +32,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -55,7 +57,7 @@ pub async fn pause<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Operate, Some(project_id.0))?;
     state
         .cp
         .pause_with_operator(EnvironmentId(env_id), operator_name(authed.as_ref()))
@@ -75,7 +77,7 @@ pub async fn wake<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Operate, Some(project_id.0))?;
     state
         .cp
         .wake_with_operator(EnvironmentId(env_id), operator_name(authed.as_ref()))
@@ -95,7 +97,7 @@ pub async fn logs<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Read, Some(project_id.0))?;
     let logs = state.cp.logs(EnvironmentId(env_id)).await?;
     Ok(Json(json!({ "logs": logs })))
 }
@@ -114,7 +116,7 @@ pub async fn stream_logs<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Read, Some(project_id.0))?;
     let log_stream = state.cp.stream_logs(EnvironmentId(env_id)).await?;
     let events = log_stream.map(|item| {
         Ok(match item {
@@ -148,7 +150,7 @@ pub async fn destroy<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Operate, Some(project_id.0))?;
     state
         .cp
         .destroy_with_operator(

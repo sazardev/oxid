@@ -1075,8 +1075,14 @@ async fn public_routes_stay_open_even_with_a_token_configured() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Issuing access needs the `admin` role, not the master token itself.
+///
+/// This deliberately changed: while it was master-only, a devops who wanted
+/// to delegate user management had to hand out the master credential — the
+/// one thing the role model exists to stop. A non-admin still cannot, which
+/// is the part that matters.
 #[tokio::test]
-async fn creating_a_token_requires_the_master_credential() {
+async fn issuing_access_requires_an_admin_credential() {
     let app = test_app_with_token("master-secret").await;
 
     // A request with no token at all isn't even authenticated.
@@ -1098,13 +1104,30 @@ async fn creating_a_token_requires_the_master_credential() {
     let alice_token = created["token"].as_str().unwrap().to_owned();
     assert_eq!(alice_token.len(), 64, "expected a 32-byte hex token");
 
-    // Alice's own (non-master) token cannot mint tokens for others.
+    // Alice was minted with no `role`, and no scope — which is `admin`, the
+    // power an unscoped named token has always had. She *can* now delegate.
     let (status, _) = json_request_with_auth(
         &app,
         "POST",
         "/api/v1/tokens",
         json!({ "name": "bob" }),
         Some(&alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "an admin may issue access");
+
+    // But a developer may not — this is the line that has to hold.
+    let dev = mint_token(
+        &app,
+        json!({ "name": "dev", "projects": [1], "role": "developer" }),
+    )
+    .await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "escalation" }),
+        Some(&dev),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -4129,5 +4152,291 @@ async fn the_environment_cap_refuses_a_new_branch_but_never_a_redeploy() {
     assert_eq!(
         value["status"], "queued",
         "a redeploy must not hit the cap: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// roles: what a person may do, where, and for how long
+// ---------------------------------------------------------------------------
+
+/// A viewer is the role you hand a product owner: they watch previews and
+/// can break nothing.
+#[tokio::test]
+async fn a_viewer_reads_everything_in_scope_and_changes_nothing() {
+    let app = two_project_app().await;
+    let tok = mint_token(
+        &app,
+        json!({ "name": "pm", "projects": [1], "role": "viewer" }),
+    )
+    .await;
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/projects/1/environments",
+        json!({}),
+        Some(&tok),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a viewer must be able to read");
+
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/api/v1/projects/1/deploy",
+            json!({ "branch": "main" }),
+        ),
+        (
+            "PATCH",
+            "/api/v1/projects/1",
+            json!({ "pause_after": "10m" }),
+        ),
+        (
+            "POST",
+            "/api/v1/projects/1/secrets",
+            json!({ "name": "K", "scope": "project", "value": "v" }),
+        ),
+    ] {
+        let (status, body) = json_request_with_auth(&app, method, uri, body, Some(&tok)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} should be forbidden for a viewer: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+/// The line that matters most in the whole model: a developer ships code,
+/// and never reads the credentials that code is handed.
+#[tokio::test]
+async fn a_developer_deploys_but_cannot_touch_secrets_or_settings() {
+    let app = two_project_app().await;
+    let tok = mint_token(
+        &app,
+        json!({ "name": "juan", "projects": [1], "role": "developer" }),
+    )
+    .await;
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/deploy",
+        json!({ "branch": "main" }),
+        Some(&tok),
+    )
+    .await;
+    assert!(status.is_success(), "a developer must be able to deploy");
+
+    for (method, uri, body) in [
+        ("GET", "/api/v1/projects/1/secrets", json!({})),
+        (
+            "POST",
+            "/api/v1/projects/1/secrets",
+            json!({ "name": "K", "scope": "project", "value": "v" }),
+        ),
+        (
+            "PATCH",
+            "/api/v1/projects/1",
+            json!({ "pause_after": "10m" }),
+        ),
+    ] {
+        let (status, _) = json_request_with_auth(&app, method, uri, body, Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[tokio::test]
+async fn a_maintainer_owns_its_project_but_not_the_node() {
+    let app = two_project_app().await;
+    let tok = mint_token(
+        &app,
+        json!({ "name": "lead", "projects": [1], "role": "maintainer" }),
+    )
+    .await;
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/secrets",
+        json!({ "name": "K", "scope": "project", "value": "v" }),
+        Some(&tok),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "a maintainer owns its project's secrets"
+    );
+
+    for uri in ["/api/v1/stats", "/api/v1/infra/status", "/api/v1/tokens"] {
+        let (status, _) = json_request_with_auth(&app, "GET", uri, json!({}), Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+}
+
+/// The point of having roles at all: a devops can delegate user management
+/// instead of handing out the master token.
+#[tokio::test]
+async fn an_admin_token_can_issue_access_without_the_master_token() {
+    let app = two_project_app().await;
+    let admin = mint_token(&app, json!({ "name": "devops", "role": "admin" })).await;
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "issued-by-admin", "projects": [1], "role": "developer" }),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // But an admin *of a project* is not an admin of the server.
+    let scoped_admin = mint_token(
+        &app,
+        json!({ "name": "team-lead", "projects": [1], "role": "admin" }),
+    )
+    .await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "nope" }),
+        Some(&scoped_admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Access that ends on its own is the difference between a policy and an
+/// intention: nobody remembers to revoke the contractor's token.
+#[tokio::test]
+async fn access_stops_working_once_it_expires() {
+    let app = two_project_app().await;
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "contractor", "role": "admin", "expires_in": "1s" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let tok = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, _) =
+        json_request_with_auth(&app, "GET", "/api/v1/stats", json!({}), Some(&tok)).await;
+    assert!(status.is_success(), "it should work before expiring");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let (status, body) =
+        json_request_with_auth(&app, "GET", "/api/v1/stats", json!({}), Some(&tok)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // And it says *why*, so the person opens a ticket instead of a bug.
+    assert!(
+        String::from_utf8_lossy(&body).contains("expired"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+#[tokio::test]
+async fn an_expiry_in_the_past_is_refused_rather_than_minted_dead() {
+    let app = two_project_app().await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "oops", "expires_in": "0s" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Suspension is the reversible one — for somebody on leave, without
+/// reissuing a token and updating everywhere it is configured.
+#[tokio::test]
+async fn suspending_access_is_reversible_unlike_revoking_it() {
+    let app = two_project_app().await;
+    let (_, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/tokens",
+        json!({ "name": "on-leave", "projects": [1], "role": "developer" }),
+        Some("master-secret"),
+    )
+    .await;
+    let created: Value = serde_json::from_slice(&body).unwrap();
+    let (id, tok) = (
+        created["id"].as_u64().unwrap(),
+        created["token"].as_str().unwrap().to_owned(),
+    );
+    let env_url = "/api/v1/projects/1/environments";
+
+    let (status, _) = json_request_with_auth(&app, "GET", env_url, json!({}), Some(&tok)).await;
+    assert!(status.is_success());
+
+    let (status, _) = json_request_with_auth(
+        &app,
+        "PATCH",
+        &format!("/api/v1/tokens/{id}"),
+        json!({ "suspended": true }),
+        Some("master-secret"),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, body) = json_request_with_auth(&app, "GET", env_url, json!({}), Some(&tok)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(String::from_utf8_lossy(&body).contains("suspended"));
+
+    // Back on, same token — nothing had to be reissued.
+    json_request_with_auth(
+        &app,
+        "PATCH",
+        &format!("/api/v1/tokens/{id}"),
+        json!({ "suspended": false }),
+        Some("master-secret"),
+    )
+    .await;
+    let (status, _) = json_request_with_auth(&app, "GET", env_url, json!({}), Some(&tok)).await;
+    assert!(status.is_success(), "resuming must restore the same token");
+}
+
+/// An upgrade must never quietly remove a permission somebody relies on, so
+/// omitting `role` reproduces exactly what a token could do before roles
+/// existed: everything within its scope, or everything at all when unscoped.
+#[tokio::test]
+async fn a_token_created_without_a_role_keeps_the_power_it_used_to_have() {
+    let app = two_project_app().await;
+    // No `role` in the request is the shape every pre-roles client sends.
+    let scoped = mint_token(&app, json!({ "name": "legacy", "projects": [1] })).await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects/1/secrets",
+        json!({ "name": "K", "scope": "project", "value": "v" }),
+        Some(&scoped),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "a scoped token with no role must still reach secrets, as before"
+    );
+
+    let unscoped = mint_token(&app, json!({ "name": "legacy-ci" })).await;
+    let (status, _) =
+        json_request_with_auth(&app, "GET", "/api/v1/stats", json!({}), Some(&unscoped)).await;
+    assert!(
+        status.is_success(),
+        "an unscoped token with no role must still be node-wide, as before"
     );
 }

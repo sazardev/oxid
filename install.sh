@@ -285,6 +285,10 @@ EOF
     Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
     Secret       ${WEBHOOK_SECRET}
 
+    Give a teammate access — they never need this master token:
+      oxid token create juan --project 1 --role developer --expires-in 90d
+      roles: viewer (read) | developer (deploy) | maintainer (+secrets) | admin
+
     Credentials live in ${ENV_FILE} (0600).
     Data/backups ${DATA}   (snapshots every 300s in ${DATA}/backups)
     Logs         journalctl -u oxidd -f
@@ -381,12 +385,16 @@ EOF
                  what gets registered, since this daemon runs in a container
                  and cannot see your working tree)
 
-    Webhook      secret: ${WEBHOOK_SECRET}
-                 The control API is published on 127.0.0.1 only, so a Git
-                 host cannot reach it yet. To let it: change the ports line
-                 in ${STACK}/docker-compose.yml to "8080:8080", run
-                 'docker compose up -d', and point the webhook at
-                 http://${HOST_ADDR}:8080/api/v1/webhooks/github
+    Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
+    Secret       ${WEBHOOK_SECRET}
+
+    Give a teammate access — they never need this master token:
+      oxid token create juan --project 1 --role developer --expires-in 90d
+      roles: viewer (read) | developer (deploy) | maintainer (+secrets) | admin
+
+    The control API is on every interface so your team and your Git host can
+    reach it. Every route needs a token, but the token crosses the network in
+    the clear — put TLS in front before this leaves a network you trust.
 
     Credentials live in ${STACK}/.env (0600). Upgrade with:
       cd ${STACK} && docker compose pull && docker compose up -d

@@ -318,11 +318,32 @@ enum TokenAction {
         /// 404s everywhere else.
         #[arg(long = "project")]
         project: Vec<u64>,
+        /// What this person may do: `viewer` (read only), `developer`
+        /// (deploy, pause, wake, destroy environments), `maintainer` (also
+        /// secrets and project settings) or `admin` (also the node and
+        /// issuing access). Defaults to `developer`.
+        #[arg(long)]
+        role: Option<String>,
+        /// How long the access lasts, e.g. `30d` or `12h`. Omit for one
+        /// that never expires.
+        #[arg(long)]
+        expires_in: Option<String>,
     },
     /// List every token (revoked ones included), without the raw value.
     List,
     /// Revoke a token by id.
     Revoke {
+        /// Token id, from `oxid token list`.
+        id: u64,
+    },
+    /// Suspend a token's access without destroying it — reversible with
+    /// `resume`, unlike `revoke`.
+    Suspend {
+        /// Token id, from `oxid token list`.
+        id: u64,
+    },
+    /// Restore access to a suspended token.
+    Resume {
         /// Token id, from `oxid token list`.
         id: u64,
     },
@@ -738,11 +759,26 @@ async fn main() {
         Command::Backup { file } => cmd_backup(&client, &base, &file).await,
         Command::Restore { file } => cmd_restore(&client, &base, &file).await,
         Command::Token { action } => match action {
-            TokenAction::Create { name, project } => {
-                cmd_token_create(&client, &base, &name, &project).await
+            TokenAction::Create {
+                name,
+                project,
+                role,
+                expires_in,
+            } => {
+                cmd_token_create(
+                    &client,
+                    &base,
+                    &name,
+                    &project,
+                    role.as_deref(),
+                    expires_in.as_deref(),
+                )
+                .await
             }
             TokenAction::List => cmd_token_list(&client, &base).await,
             TokenAction::Revoke { id } => cmd_token_revoke(&client, &base, id).await,
+            TokenAction::Suspend { id } => cmd_token_suspend(&client, &base, id, true).await,
+            TokenAction::Resume { id } => cmd_token_suspend(&client, &base, id, false).await,
             TokenAction::Generate { save_as } => {
                 cmd_token_generate(&client, &base, save_as.as_deref()).await
             }
@@ -1858,16 +1894,62 @@ async fn cmd_restore(client: &Client, base: &str, file: &str) -> Result<(), CliE
     Ok(())
 }
 
+/// Suspends or restores a credential. One function for both directions:
+/// they differ only in a boolean, and splitting them invites the two from
+/// drifting apart.
+async fn cmd_token_suspend(
+    client: &Client,
+    base: &str,
+    id: u64,
+    suspended: bool,
+) -> Result<(), CliError> {
+    let url = format!("{base}/api/v1/tokens/{id}");
+    let response = client
+        .patch(&url)
+        .json(&json!({ "suspended": suspended }))
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&body, status, "updating token failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if !emit_json(&value) {
+        if suspended {
+            ok(format!(
+                "Token {id} suspended — restore it with `oxid token resume {id}`"
+            ));
+        } else {
+            ok(format!("Token {id} restored"));
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_token_create(
     client: &Client,
     base: &str,
     name: &str,
     projects: &[u64],
+    role: Option<&str>,
+    expires_in: Option<&str>,
 ) -> Result<(), CliError> {
     let url = format!("{base}/api/v1/tokens");
     let mut payload = json!({ "name": name });
     if !projects.is_empty() {
         payload["projects"] = json!(projects);
+    }
+    if let Some(role) = role {
+        payload["role"] = json!(role);
+    }
+    if let Some(expires_in) = expires_in {
+        payload["expires_in"] = json!(expires_in);
     }
     let response = client
         .post(&url)
@@ -1918,12 +2000,16 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
         return Ok(());
     }
     println!(
-        "{:<5} {:<24} {:<10} {:<12} CREATED",
-        "ID", "NAME", "STATUS", "SCOPES"
+        "{:<5} {:<20} {:<12} {:<11} {:<10} {:<12} EXPIRES",
+        "ID", "NAME", "ROLE", "STATUS", "SCOPES", "CREATED"
     );
     for token in tokens {
+        // Three states, not two: suspended is the reversible one, and
+        // showing it as "active" would hide why somebody's CI is failing.
         let status = if token["revoked"].as_bool().unwrap_or(false) {
             "revoked"
+        } else if token["suspended"].as_bool().unwrap_or(false) {
+            "suspended"
         } else {
             "active"
         };
@@ -1936,13 +2022,19 @@ async fn cmd_token_list(client: &Client, base: &str) -> Result<(), CliError> {
                 .join(","),
             None => "-".to_owned(),
         };
+        let expires = match token["expires_at"].as_str() {
+            Some(_) => format_occurred_at(&token["expires_at"]),
+            None => "never".to_owned(),
+        };
         println!(
-            "{:<5} {:<24} {:<10} {:<12} {}",
+            "{:<5} {:<20} {:<12} {:<11} {:<10} {:<12} {}",
             token["id"].as_u64().unwrap_or_default(),
             token["name"].as_str().unwrap_or("?"),
+            token["role"].as_str().unwrap_or("?"),
             status,
             scopes,
             format_occurred_at(&token["created_at"]),
+            expires,
         );
     }
     Ok(())
@@ -2765,7 +2857,7 @@ mod tests {
         let cli = Cli::try_parse_from(["oxid", "token", "create", "alice"]).unwrap();
         match cli.command {
             Command::Token {
-                action: TokenAction::Create { name, project },
+                action: TokenAction::Create { name, project, .. },
             } => {
                 assert_eq!(name, "alice");
                 assert!(project.is_empty(), "no --project flags means unscoped");
@@ -2786,7 +2878,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Token {
-                action: TokenAction::Create { name, project },
+                action: TokenAction::Create { name, project, .. },
             } => {
                 assert_eq!(name, "ci-bot");
                 assert_eq!(project, vec![1, 3]);

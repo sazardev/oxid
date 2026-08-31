@@ -17,7 +17,8 @@ use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::middleware::{AuthedAs, authorize_project};
+use crate::api::middleware::AuthedAs;
+use crate::api::middleware::authorize;
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -32,6 +33,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::access::Capability;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -60,7 +62,7 @@ pub async fn get_environment<
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
-    authorize_project(&authed, project_id)?;
+    authorize(&authed, Capability::Read, Some(project_id.0))?;
     let env = state
         .cp
         .find_environment(EnvironmentId(env_id))
@@ -78,7 +80,7 @@ pub async fn list_environments<
     authed: Option<Extension<AuthedAs>>,
     Query(query): Query<ListEnvironmentsQuery>,
 ) -> ApiResult<Json<Vec<Environment>>> {
-    authorize_project(&authed, ProjectId(id))?;
+    authorize(&authed, Capability::Read, Some(id))?;
     let envs = state.cp.list_environments(ProjectId(id)).await?;
     let envs = match query.branch {
         // The daemon keeps one row per historical deploy of a branch (audit

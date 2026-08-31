@@ -21,6 +21,7 @@ use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, OperatorIdentity, SqliteStore};
 use crate::request_context::current_request_id;
+use oxid_core::services::access::Role;
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
@@ -42,6 +43,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         &self,
         name: &str,
         scoped_projects: Option<Vec<u64>>,
+        role: Role,
+        expires_at: Option<i64>,
     ) -> Result<(u64, String), CpError> {
         // Normalize so equality checks downstream are value-based, and
         // reject the useless middle ground: an explicit-but-empty list is
@@ -64,12 +67,28 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             Some(Err(e)) => return Err(e),
             Some(Ok(ids)) => Some(ids),
         };
+        // An already-past expiry mints a credential that is dead on arrival.
+        // Almost always a unit mix-up (milliseconds for seconds), and the
+        // person it was issued to would be the one to discover it.
+        if let Some(at) = expires_at
+            && at <= OffsetDateTime::now_utc().unix_timestamp()
+        {
+            return Err(CpError::Validation(
+                "expiry is in the past — the token would never work".to_owned(),
+            ));
+        }
         let mut raw = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
         let raw_token = hex::encode(raw);
         let id = self
             .store
-            .create_api_token(name, &hash_token(&raw_token), scopes.as_deref())
+            .create_api_token(
+                name,
+                &hash_token(&raw_token),
+                scopes.as_deref(),
+                role,
+                expires_at,
+            )
             .await?;
         Ok((id, raw_token))
     }
@@ -87,6 +106,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .store
             .find_operator_by_token_hash(&hash_token(raw_token))
             .await?)
+    }
+
+    /// Suspends or restores a named token's access.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if no token has that id, and
+    /// [`CpError`] on storage failure.
+    pub async fn set_operator_suspended(&self, id: u64, suspended: bool) -> Result<(), CpError> {
+        if self.store.set_api_token_suspended(id, suspended).await? {
+            Ok(())
+        } else {
+            Err(CpError::NotFound(format!("token `{id}`")))
+        }
     }
 
     /// Lists every named token (revoked ones included), newest first.
