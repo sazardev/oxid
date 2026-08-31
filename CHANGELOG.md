@@ -82,6 +82,20 @@ is the breaking position.
   stage copied a binary path Cargo names after the package. Generated image
   sizes: Go 24.5MB, SPA and static 94.5MB, Rust 136MB, FastAPI 209MB, Nest
   215MB, Express 246MB.
+- **Monorepos are understood.** pnpm workspaces, a `workspaces` array in
+  the root `package.json`, and `lerna.json` are recognised, with Turborepo
+  and Nx reported on top. The deployable services are listed — a package
+  with a framework, a server dependency or a `start` script, as opposed to
+  a library other packages import — and zero-config registration points at
+  the first one, since a monorepo root usually builds nothing itself.
+
+  Building one is not the same as building a standalone project: its
+  dependencies include siblings and the lockfile resolving them is at the
+  root, so the Docker context becomes the repository and the generated
+  Dockerfile installs there, filtered to the target package (`--filter` for
+  pnpm, `--workspace` for npm, `yarn workspace` for yarn). Verified by
+  deploying a Turborepo whose service imports a sibling package: the import
+  resolves inside the container.
 - **The detected stack is tracked and shown**, as a dashboard tag with the
   evidence behind it (`Detected from package.json, @nestjs/core`), a column
   in `oxid ps`, and a `detected_stack` field on the project in the API.

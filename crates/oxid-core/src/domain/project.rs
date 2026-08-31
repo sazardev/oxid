@@ -38,6 +38,14 @@ pub struct Project {
     /// where a guess would be presumptuous.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detected_stack: Option<crate::services::stack::Stack>,
+    /// The workspace, when the repository holds several packages.
+    ///
+    /// Answers a different question from `detected_stack` — that one is
+    /// "what is this built with", this is "which of the several things in
+    /// here can be deployed" — and a repository can have either, both or
+    /// neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::services::stack::Monorepo>,
 }
 
 impl Project {
@@ -62,6 +70,7 @@ impl Project {
             repo_url,
             config,
             detected_stack: None,
+            workspace: None,
         })
     }
 
@@ -73,6 +82,13 @@ impl Project {
     #[must_use]
     pub fn with_detected_stack(mut self, stack: Option<crate::services::stack::Stack>) -> Self {
         self.detected_stack = stack;
+        self
+    }
+
+    /// Records the workspace a repository turned out to be.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: Option<crate::services::stack::Monorepo>) -> Self {
+        self.workspace = workspace;
         self
     }
 }

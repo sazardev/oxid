@@ -847,6 +847,10 @@ fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
             .detected_stack
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok()),
+        workspace: project
+            .workspace
+            .as_ref()
+            .and_then(|w| serde_json::to_string(w).ok()),
     }
 }
 
@@ -864,15 +868,16 @@ struct ProjectBinds<'a> {
     memory_limit_mb: Option<i64>,
     cpu_limit_millicores: Option<i64>,
     detected_stack: Option<String>,
+    workspace: Option<String>,
 }
 
 const PROJECT_COLUMNS: &str = "id, name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores, detected_stack";
+     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace";
 
 const PROJECT_COLUMNS_NO_ID: &str = "name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores, detected_stack";
+     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace";
 
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -919,9 +924,15 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
     // label, and losing a label must never make a project unloadable.
     let detected_stack: Option<String> = row.try_get("detected_stack").map_err(storage)?;
     let detected_stack = detected_stack.and_then(|json| serde_json::from_str(&json).ok());
+    let workspace: Option<String> = row.try_get("workspace").map_err(storage)?;
+    let workspace = workspace.and_then(|json| serde_json::from_str(&json).ok());
 
     Project::new(ProjectId(id), name, repo_url, config)
-        .map(|project| project.with_detected_stack(detected_stack))
+        .map(|project| {
+            project
+                .with_detected_stack(detected_stack)
+                .with_workspace(workspace)
+        })
         .map_err(|e| validation(&e))
 }
 
@@ -930,7 +941,7 @@ impl ProjectStore for SqliteStore {
         let binds = project_to_binds(project);
         let row = sqlx::query(&format!(
             "INSERT INTO projects ({PROJECT_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.name)
         .bind(binds.repo_url)
@@ -945,6 +956,7 @@ impl ProjectStore for SqliteStore {
         .bind(binds.memory_limit_mb)
         .bind(binds.cpu_limit_millicores)
         .bind(binds.detected_stack)
+        .bind(binds.workspace)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -995,7 +1007,7 @@ impl ProjectStore for SqliteStore {
             "UPDATE projects SET name = ?, base_domain = ?, pause_after_seconds = ?, \
              destroy_after_seconds = ?, port = ?, dockerfile = ?, build_context = ?, \
              on_start_json = ?, dependencies_json = ?, memory_limit_mb = ?, \
-             cpu_limit_millicores = ?, detected_stack = ? WHERE id = ?",
+             cpu_limit_millicores = ?, detected_stack = ?, workspace = ? WHERE id = ?",
         )
         .bind(binds.name)
         .bind(binds.base_domain)
@@ -1009,6 +1021,7 @@ impl ProjectStore for SqliteStore {
         .bind(binds.memory_limit_mb)
         .bind(binds.cpu_limit_millicores)
         .bind(binds.detected_stack)
+        .bind(binds.workspace)
         .bind(id_as_i64(project.id.0))
         .execute(&self.pool)
         .await

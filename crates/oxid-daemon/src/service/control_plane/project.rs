@@ -36,7 +36,8 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
 
         let parsed = config::parse_project(repo_dir)?;
         let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?
-            .with_detected_stack(parsed.stack);
+            .with_detected_stack(parsed.stack)
+            .with_workspace(parsed.monorepo);
         match ProjectStore::create(&self.store, &project).await {
             Ok(id) => {
                 project.id = id;
@@ -95,7 +96,8 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
 
         let parsed = config::parse_project(&cloned_dir)?;
         let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?
-            .with_detected_stack(parsed.stack);
+            .with_detected_stack(parsed.stack)
+            .with_workspace(parsed.monorepo);
         match ProjectStore::create(&self.store, &project).await {
             Ok(id) => {
                 project.id = id;

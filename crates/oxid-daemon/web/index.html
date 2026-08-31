@@ -413,6 +413,25 @@
               </div>
             </div>
             <p class="mono muted" x-text="currentProject().repo_url"></p>
+            <div class="card" x-show="currentProject().workspace">
+              <h2 x-text="t('project.workspaceTitle')"></h2>
+              <p class="muted" x-text="t('project.workspaceHint', {
+                kind: currentProject().workspace?.kind,
+                runner: currentProject().workspace?.task_runner ?? '—'
+              })"></p>
+              <ul class="workspace-list">
+                <template x-for="svc in currentProject().workspace?.deployable ?? []" :key="svc.path">
+                  <li>
+                    <code x-text="svc.path"></code>
+                    <span class="badge badge-stack" x-text="svc.framework"></span>
+                    <span class="muted mono" x-text="svc.name + ' :' + svc.port"></span>
+                    <span class="badge" x-show="svc.path === currentProject().config.build.context"
+                          x-text="t('project.workspaceActive')"></span>
+                  </li>
+                </template>
+              </ul>
+              <p class="muted" x-text="t('project.workspaceSwitch')"></p>
+            </div>
             <p class="muted" x-show="currentProject().detected_stack">
               <span class="badge badge-stack" x-text="stackLabel(currentProject().detected_stack)"></span>
               <span x-text="t('project.stackDetected', {

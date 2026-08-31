@@ -490,3 +490,168 @@ fn the_detected_runtime_version_is_the_one_the_image_is_built_on() {
         .dockerfile();
     assert!(default.contains("FROM node:22-alpine"), "{default}");
 }
+
+// ---------------------------------------------------------------------------
+// monorepos
+// ---------------------------------------------------------------------------
+
+/// The shape a modern JS monorepo actually has: a root that ships nothing,
+/// two deployable apps, and a shared library that is not one.
+fn turborepo() -> RepoManifest {
+    repo(&[
+        (
+            "package.json",
+            r#"{"name":"acme","private":true,"workspaces":["apps/*","packages/*"]}"#,
+        ),
+        ("package-lock.json", "{}"),
+        ("turbo.json", r#"{"tasks":{"build":{}}}"#),
+        (
+            "apps/api/package.json",
+            r#"{"name":"@acme/api","dependencies":{"@nestjs/core":"^10.0.0","@acme/shared":"workspace:*"}}"#,
+        ),
+        (
+            "apps/web/package.json",
+            r#"{"name":"@acme/web","dependencies":{"next":"14.2.0"}}"#,
+        ),
+        (
+            "packages/shared/package.json",
+            r#"{"name":"@acme/shared","main":"index.ts","devDependencies":{"typescript":"^5.4.0"}}"#,
+        ),
+    ])
+}
+
+#[test]
+fn a_turborepo_is_recognised_with_its_deployable_apps() {
+    let mono = detect_monorepo(&turborepo()).unwrap();
+
+    assert_eq!(mono.kind, WorkspaceKind::PackageJson);
+    assert_eq!(mono.task_runner.as_deref(), Some("turborepo"));
+
+    let paths: Vec<_> = mono.deployable.iter().map(|w| w.path.as_str()).collect();
+    // The shared library is a workspace member but not an environment:
+    // nothing starts it, other packages import it.
+    assert_eq!(paths, vec!["apps/api", "apps/web"]);
+
+    let api = &mono.deployable[0];
+    assert_eq!(api.framework, Framework::NestJs);
+    // The filter takes the package name, and it differs from the directory
+    // often enough that guessing would be wrong.
+    assert_eq!(api.name, "@acme/api");
+    assert_eq!(api.port, 3000);
+    assert_eq!(mono.deployable[1].framework, Framework::NextJs);
+}
+
+#[test]
+fn a_pnpm_workspace_is_recognised_by_its_own_declaration() {
+    let mono = detect_monorepo(&repo(&[
+        ("package.json", r#"{"name":"acme","private":true}"#),
+        ("pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n"),
+        ("pnpm-lock.yaml", ""),
+        (
+            "apps/api/package.json",
+            r#"{"name":"api","dependencies":{"fastify":"^4"}}"#,
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(mono.kind, WorkspaceKind::Pnpm);
+    assert_eq!(mono.deployable.len(), 1);
+}
+
+#[test]
+fn an_ordinary_repository_is_not_a_monorepo() {
+    assert!(detect_monorepo(&repo(&[("package.json", NEST_PACKAGE)])).is_none());
+    assert!(detect_monorepo(&repo(&[("go.mod", "module x\n\ngo 1.23\n")])).is_none());
+}
+
+#[test]
+fn a_workspace_build_installs_from_the_root_and_filters_to_the_target() {
+    // The failure this prevents: a member imports `@acme/shared`, whose
+    // resolution lives in the root lockfile. Installing from inside
+    // `apps/api` finds neither the sibling nor the lock, and the build dies
+    // on an import the developer can see working locally.
+    let mono = detect_monorepo(&turborepo()).unwrap();
+    let api = &mono.deployable[0];
+    let dockerfile = mono.dockerfile(api, Some("22"), PackageManager::Npm, true);
+
+    assert!(dockerfile.contains("WORKDIR /repo"), "{dockerfile}");
+    assert!(
+        dockerfile.contains("--workspace @acme/api"),
+        "the build is not scoped to the target package\n{dockerfile}"
+    );
+    // Manifests before source, or the install layer dies on every commit —
+    // which in a monorepo is where all the build time is.
+    let install = dockerfile.find("RUN npm ci").unwrap();
+    assert!(
+        install < dockerfile.find("COPY . .").unwrap(),
+        "{dockerfile}"
+    );
+    // The root manifests have to be in the image for the install to resolve
+    // anything at all.
+    assert!(
+        dockerfile.contains("COPY package.json *lock*"),
+        "{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY apps/api/package.json"),
+        "{dockerfile}"
+    );
+}
+
+#[test]
+fn each_workspace_manager_scopes_its_install_its_own_way() {
+    // Getting this wrong installs the whole monorepo or none of the
+    // siblings, and both fail in ways that point at the wrong thing.
+    let pnpm = detect_monorepo(&repo(&[
+        ("package.json", r#"{"name":"acme"}"#),
+        ("pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n"),
+        (
+            "apps/api/package.json",
+            r#"{"name":"@acme/api","dependencies":{"@nestjs/core":"^10"}}"#,
+        ),
+    ]))
+    .unwrap();
+    let df = pnpm.dockerfile(&pnpm.deployable[0], None, PackageManager::Pnpm, true);
+    // `...` is pnpm's "and everything it depends on" — without it the
+    // siblings are not installed.
+    assert!(df.contains("--filter @acme/api..."), "{df}");
+
+    let mono = detect_monorepo(&turborepo()).unwrap();
+    let yarn = mono.dockerfile(&mono.deployable[0], None, PackageManager::Yarn, true);
+    assert!(
+        yarn.contains("yarn workspace @acme/api run build"),
+        "{yarn}"
+    );
+}
+
+#[test]
+fn a_workspace_member_ships_the_tree_it_needs_to_run() {
+    // Learned by deploying one: copying `node_modules` plus the single
+    // package produced an image that started and died on MODULE_NOT_FOUND.
+    // A workspace links siblings into `node_modules` as symlinks pointing
+    // back at `packages/*`, so leaving those behind breaks an import the
+    // developer can see working locally.
+    let mono = detect_monorepo(&turborepo()).unwrap();
+    let api = mono.dockerfile(&mono.deployable[0], None, PackageManager::Npm, true);
+    assert!(api.contains("COPY --from=build /repo ./"), "{api}");
+    assert!(
+        api.contains("CMD [\"node\", \"apps/api/dist/main.js\"]"),
+        "{api}"
+    );
+
+    // A SPA is the exception: once built it is files, and needs neither
+    // Node nor the workspace.
+    let web = &mono.deployable[1];
+    let spa = Workspace {
+        framework: Framework::SinglePageApp,
+        ..web.clone()
+    };
+    let df = mono.dockerfile(&spa, None, PackageManager::Npm, true);
+    assert!(df.contains("FROM nginx:alpine"), "{df}");
+    assert!(
+        !df.split("FROM nginx:alpine")
+            .nth(1)
+            .unwrap()
+            .contains("node_modules"),
+        "{df}"
+    );
+}

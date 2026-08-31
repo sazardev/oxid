@@ -1,0 +1,11 @@
+-- The services a monorepo holds.
+--
+-- Stored beside `detected_stack` and for the same reason: the answer comes
+-- from files in a checkout the API has no business opening to serve a
+-- dashboard poll. Kept separate from `detected_stack` because it answers a
+-- different question — that one is "what is this built with", this is
+-- "which of the several things in here can be deployed", and a repository
+-- can have either, both or neither.
+--
+-- Null is the normal case: most repositories hold one package.
+ALTER TABLE projects ADD COLUMN workspace TEXT;

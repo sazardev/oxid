@@ -25,7 +25,7 @@ use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
 use crate::request_context::current_request_id;
 use oxid_core::services::gc::{self, GcAction};
-use oxid_core::services::stack::{RepoManifest, Stack, detect as detect_stack};
+use oxid_core::services::stack::{PackageManager, Stack, detect as detect_stack, detect_monorepo};
 use oxid_core::services::subdomain::subdomain_for;
 use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
@@ -441,7 +441,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         if target.exists() {
             return None;
         }
-        let stack = detect_stack(&read_context_manifest(context))?;
+        let stack = detect_stack(&crate::adapter::config::read_repo_manifest(context))?;
         match std::fs::write(&target, stack.dockerfile()) {
             Ok(()) => Some(stack),
             Err(e) => {
@@ -757,8 +757,30 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // that same working directory — without a private copy one branch
         // would build another branch's tree, silently and wrongly. The copy
         // costs about what tarring it costs, which the build pays anyway.
+        // A workspace member cannot be built from its own directory: its
+        // dependencies include siblings, and the lockfile that resolves
+        // them is at the repository root. So when `[build].context` points
+        // at a member of a monorepo, the *Docker* context becomes the root
+        // and the generated Dockerfile scopes the build to that package.
+        // Getting this wrong fails on an import the developer can see
+        // working locally, which is the worst kind of error to hand someone.
+        let repo_manifest = crate::adapter::config::read_repo_manifest(&repo_dir);
+        let workspace = detect_monorepo(&repo_manifest).and_then(|mono| {
+            let wanted = project.config.build.context.trim_matches('/');
+            mono.deployable
+                .iter()
+                .find(|w| w.path == wanted)
+                .cloned()
+                .map(|member| (mono, member))
+        });
+        let capture_context = if workspace.is_some() {
+            "."
+        } else {
+            project.config.build.context.as_str()
+        };
+
         let context = match self
-            .capture_build_context(&repo_dir, &project.config.build.context, env.id)
+            .capture_build_context(&repo_dir, capture_context, env.id)
             .await
         {
             Ok(context) => context,
@@ -785,8 +807,31 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // developer's checkout, so nothing appears in their `git status` and
         // committing their own Dockerfile silently takes over from the next
         // deploy onward.
-        let detected = Self::materialise_dockerfile(context.path(), &dockerfile);
-        if let Some(stack) = &detected {
+        if let Some((mono, member)) = &workspace {
+            let target = context.path().join(&dockerfile);
+            if !target.exists() {
+                let node = detect_stack(&repo_manifest);
+                let generated = mono.dockerfile(
+                    member,
+                    node.as_ref().and_then(|s| s.runtime_version.as_deref()),
+                    node.as_ref()
+                        .and_then(|s| s.package_manager)
+                        .unwrap_or(PackageManager::Npm),
+                    node.as_ref().is_some_and(|s| s.locked),
+                );
+                if let Err(e) = std::fs::write(&target, generated) {
+                    tracing::warn!(path = %target.display(), error = %e, "could not write the generated Dockerfile");
+                } else {
+                    tracing::info!(
+                        branch = %branch,
+                        package = %member.name,
+                        path = %member.path,
+                        framework = %member.framework.as_str(),
+                        "building one member of a workspace; generated a Dockerfile scoped to it"
+                    );
+                }
+            }
+        } else if let Some(stack) = Self::materialise_dockerfile(context.path(), &dockerfile) {
             tracing::info!(
                 branch = %branch,
                 stack = %stack.label(),
@@ -974,29 +1019,6 @@ impl Drop for BuildContext {
 }
 
 /// Recursive copy that preserves symlinks as symlinks.
-/// Describes a build context for stack detection. Same contract as the
-/// registration-time reader in `adapter::config`: root entries only, and
-/// only the manifests the domain asks to see.
-fn read_context_manifest(context: &Path) -> RepoManifest {
-    let mut manifest = RepoManifest::default();
-    let Ok(entries) = std::fs::read_dir(context) else {
-        return manifest;
-    };
-    for entry in entries.flatten() {
-        manifest
-            .entries
-            .push(entry.file_name().to_string_lossy().into_owned());
-    }
-    for name in RepoManifest::files_worth_reading() {
-        if manifest.entries.iter().any(|e| e == name)
-            && let Ok(body) = std::fs::read_to_string(context.join(name))
-        {
-            manifest.files.insert((*name).to_owned(), body);
-        }
-    }
-    manifest
-}
-
 fn copy_tree(source: &Path, target: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(target)?;
     for entry in std::fs::read_dir(source)? {

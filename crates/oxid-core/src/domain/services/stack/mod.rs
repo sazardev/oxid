@@ -69,7 +69,31 @@ impl RepoManifest {
             "pyproject.toml",
             "requirements.txt",
             "Cargo.toml",
+            // Workspace declarations. Which directories hold packages is
+            // stated in exactly one of these, and guessing at `apps/` and
+            // `packages/` instead would be wrong for every repository that
+            // named them something else.
+            "pnpm-workspace.yaml",
+            "turbo.json",
+            "nx.json",
+            "lerna.json",
         ]
+    }
+
+    /// The directories a workspace's members are conventionally under.
+    ///
+    /// Used only to bound what the adapter walks: the authoritative list of
+    /// members comes from the workspace declaration, and this is what stops
+    /// a repository being trawled to find it.
+    #[must_use]
+    pub fn workspace_roots() -> &'static [&'static str] {
+        &["apps", "packages", "services", "libs"]
+    }
+
+    /// A member's own `package.json`, by workspace-relative directory.
+    #[must_use]
+    pub fn member_package(&self, dir: &str) -> Option<&str> {
+        self.read(&format!("{dir}/package.json"))
     }
 }
 
@@ -332,6 +356,179 @@ impl Stack {
         }
         label
     }
+}
+
+/// How a repository declares that it holds more than one package.
+///
+/// Which one is in use changes the install command, not just the label:
+/// pnpm needs `--filter`, npm and yarn need `--workspace`, and installing a
+/// workspace member as if it were a standalone project misses every
+/// dependency it has on a sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    /// `pnpm-workspace.yaml`.
+    Pnpm,
+    /// A `workspaces` array in the root `package.json` — npm, yarn and bun
+    /// all read the same field.
+    PackageJson,
+    /// `lerna.json`, which predates the others and still exists.
+    Lerna,
+}
+
+/// One deployable package inside a monorepo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workspace {
+    /// Path from the repository root, e.g. `apps/api`.
+    pub path: String,
+    /// The package's own name, which is what `--filter` takes.
+    pub name: String,
+    /// What that package is, detected the same way a standalone repository
+    /// would be.
+    pub framework: Framework,
+    pub port: u16,
+}
+
+/// A repository holding several packages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Monorepo {
+    pub kind: WorkspaceKind,
+    /// Present when the repository also uses a task runner on top. It does
+    /// not change the build, but it is worth reporting: it tells an
+    /// operator the repository has a build graph, and that a member may
+    /// depend on siblings being built first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_runner: Option<String>,
+    /// Members that look deployable — something that serves traffic, as
+    /// opposed to a shared library nobody runs on its own.
+    pub deployable: Vec<Workspace>,
+}
+
+/// Detects a JavaScript monorepo and the deployable packages in it.
+///
+/// Returns `None` for an ordinary single-package repository, which is what
+/// most repositories are.
+#[must_use]
+pub fn detect_monorepo(manifest: &RepoManifest) -> Option<Monorepo> {
+    let root_package = manifest.read("package.json");
+
+    let kind = if manifest.has("pnpm-workspace.yaml") {
+        WorkspaceKind::Pnpm
+    } else if root_package.is_some_and(|p| p.contains("\"workspaces\"")) {
+        WorkspaceKind::PackageJson
+    } else if manifest.has("lerna.json") {
+        WorkspaceKind::Lerna
+    } else {
+        return None;
+    };
+
+    // Reported, not acted on. Turborepo and Nx orchestrate builds; the
+    // container still installs and builds with the package manager
+    // underneath, so this changes what an operator is told rather than what
+    // is run.
+    let task_runner = if manifest.has("turbo.json") {
+        Some("turborepo".to_owned())
+    } else if manifest.has("nx.json") {
+        Some("nx".to_owned())
+    } else {
+        None
+    };
+
+    // Every path with its own `package.json` is a member. The workspace
+    // globs are not parsed: a glob language (`packages/**`, negations,
+    // `!packages/private-*`) is a lot of machinery to arrive at the same
+    // answer that "has a package.json" gives directly, and the adapter has
+    // already bounded where it looked.
+    let mut deployable = Vec::new();
+    for entry in &manifest.entries {
+        let Some(dir) = entry.strip_suffix("/package.json") else {
+            continue;
+        };
+        if dir.is_empty() || !entry.contains('/') {
+            continue;
+        }
+        let Some(package) = manifest.member_package(dir) else {
+            continue;
+        };
+        let Some(stack) = detect_node(&RepoManifest {
+            entries: vec!["package.json".to_owned()],
+            files: [("package.json".to_owned(), package.to_owned())]
+                .into_iter()
+                .collect(),
+        }) else {
+            continue;
+        };
+        if !is_deployable(package, stack.framework) {
+            continue;
+        }
+        deployable.push(Workspace {
+            path: dir.to_owned(),
+            name: package_name(package).unwrap_or_else(|| dir.to_owned()),
+            framework: stack.framework,
+            port: stack.port,
+        });
+    }
+    deployable.sort_by(|a, b| a.path.cmp(&b.path));
+
+    Some(Monorepo {
+        kind,
+        task_runner,
+        deployable,
+    })
+}
+
+/// Whether a workspace member is something to deploy or something other
+/// packages import.
+///
+/// The distinction matters because a monorepo is mostly libraries: listing
+/// `packages/shared` as a deployable environment sends an operator to
+/// register something that has nothing to serve.
+///
+/// Three things make a package deployable, and a start script alone is not
+/// enough — a Fastify service whose entry point is `node src/index.js` in a
+/// Compose file, with no `start` script, is still a service. What is
+/// conclusive is depending on something that listens.
+/// Packages whose presence means the member listens on a port, and so
+/// is an environment rather than a library other packages import.
+const SERVERS: &[&str] = &[
+    "express",
+    "fastify",
+    "koa",
+    "@hapi/hapi",
+    "restify",
+    "hono",
+    "h3",
+    "@nestjs/platform-express",
+    "apollo-server",
+    "@apollo/server",
+    "graphql-yoga",
+    "socket.io",
+];
+
+fn is_deployable(package_json: &str, framework: Framework) -> bool {
+    // A recognised framework is a server by definition.
+    if !matches!(framework, Framework::NodeServer | Framework::None) {
+        return true;
+    }
+    // Something that listens on a port.
+    if SERVERS
+        .iter()
+        .any(|s| package_json.contains(&format!("\"{s}\"")))
+    {
+        return true;
+    }
+    // Or something whose author says how to start it.
+    package_json.contains("\"start\"")
+}
+
+/// The `name` field of a `package.json`, which is what a workspace filter
+/// takes — the directory name and the package name differ often enough
+/// (`apps/api` holding `@acme/billing-api`) that guessing is wrong.
+fn package_name(package_json: &str) -> Option<String> {
+    let rest = package_json.split("\"name\"").nth(1)?;
+    let value = rest.split(':').nth(1)?;
+    let name = value.split('"').nth(1)?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Reads `manifest` and decides what it is.
@@ -657,6 +854,141 @@ fn detect_static(manifest: &RepoManifest) -> Option<Stack> {
 // ---------------------------------------------------------------------------
 // Containerising
 // ---------------------------------------------------------------------------
+
+impl Monorepo {
+    /// A Dockerfile that builds one member of the workspace.
+    ///
+    /// The reason this cannot be the ordinary single-package Dockerfile:
+    /// a workspace member's dependencies are not all in its own
+    /// `package.json`. It imports siblings (`@acme/shared`), and the
+    /// lockfile that resolves them lives at the repository root. Installing
+    /// from inside `apps/api` finds neither — the build fails on an import
+    /// the developer can see working locally, which is the worst kind of
+    /// failure to hand someone.
+    ///
+    /// So the build context is the whole repository and the install runs at
+    /// the root, filtered to the target and the siblings it needs. Only the
+    /// manifests are copied before installing, so the layer survives every
+    /// commit that does not change a dependency — which in a monorepo is
+    /// most of them, and where the time goes.
+    #[must_use]
+    pub fn dockerfile(
+        &self,
+        member: &Workspace,
+        node_version: Option<&str>,
+        pm: PackageManager,
+        locked: bool,
+    ) -> String {
+        let base = format!("node:{}-alpine", node_version.unwrap_or("22"));
+        let path = &member.path;
+        let name = &member.name;
+        let runner = self
+            .task_runner
+            .as_deref()
+            .map_or(String::new(), |r| format!(", orchestrated by {r}"));
+
+        // Each manager scopes an install differently, and getting it wrong
+        // either installs the entire monorepo or none of the siblings.
+        let (install, build) = match self.kind {
+            WorkspaceKind::Pnpm => (
+                format!(
+                    "corepack enable && pnpm install {} --filter {name}...",
+                    if locked { "--frozen-lockfile" } else { "" }
+                ),
+                format!("corepack enable && pnpm --filter {name} run build"),
+            ),
+            _ => match pm {
+                PackageManager::Yarn => (
+                    format!(
+                        "corepack enable && yarn install{}",
+                        if locked { " --immutable" } else { "" }
+                    ),
+                    format!("corepack enable && yarn workspace {name} run build"),
+                ),
+                PackageManager::Bun => (
+                    "bun install".to_owned(),
+                    format!("bun run --filter {name} build"),
+                ),
+                _ => (
+                    format!("npm {}", if locked { "ci" } else { "install" }),
+                    format!("npm run build --workspace {name}"),
+                ),
+            },
+        };
+
+        // Nest and Next put their output in different places, and a SPA has
+        // no server at all — the same three shapes as a standalone project,
+        // resolved against the member's directory.
+        let (final_stage, cmd) = match member.framework {
+            Framework::SinglePageApp => (
+                format!(
+                    "FROM nginx:alpine\n\
+                     COPY --from=build /repo/{path}/dist* /repo/{path}/build* /usr/share/nginx/html/\n"
+                ),
+                String::new(),
+            ),
+            Framework::NextJs => (
+                format!(
+                    "FROM {base}\n\
+                     WORKDIR /app\n\
+                     ENV NODE_ENV=production\n\
+                     # Needs `output: \"standalone\"` in next.config.js, which in a\n\
+                     # workspace also emits the siblings it traced.\n\
+                     COPY --from=build /repo/{path}/.next/standalone ./\n\
+                     COPY --from=build /repo/{path}/.next/static ./{path}/.next/static\n"
+                ),
+                format!("CMD [\"node\", \"{path}/server.js\"]\n"),
+            ),
+            _ => (
+                format!(
+                    "FROM {base}\n\
+                     WORKDIR /app\n\
+                     ENV NODE_ENV=production\n\
+                     # The whole built tree, deliberately.\n\
+                     #\n\
+                     # Copying `node_modules` plus this one package looks\n\
+                     # tighter and does not work: a workspace links siblings\n\
+                     # into `node_modules` as symlinks pointing back at\n\
+                     # `packages/*`, so leaving those behind produces an image\n\
+                     # that starts and dies on MODULE_NOT_FOUND for an import\n\
+                     # the developer can see working locally. Which packages a\n\
+                     # member links to is a question only the resolver can\n\
+                     # answer, so the answer is to carry the tree.\n\
+                     COPY --from=build /repo ./\n"
+                ),
+                format!("CMD [\"node\", \"{path}/dist/main.js\"]\n"),
+            ),
+        };
+
+        format!(
+            "# Generated by Oxid for `{name}` ({path}) in a {kind} workspace{runner}.\n\
+             #\n\
+             # The context is the repository root, not this package: its\n\
+             # dependencies include siblings, and the lockfile that resolves\n\
+             # them is at the root. Commit a `Dockerfile` and Oxid uses it.\n\
+             \n\
+             FROM {base} AS build\n\
+             WORKDIR /repo\n\
+             # Manifests first, so the install layer survives every commit\n\
+             # that does not change a dependency.\n\
+             COPY package.json *lock* pnpm-workspace.yaml* ./\n\
+             COPY {path}/package.json {path}/\n\
+             RUN {install}\n\
+             COPY . .\n\
+             RUN {build}\n\
+             \n\
+             {final_stage}\
+             EXPOSE {port}\n\
+             {cmd}",
+            kind = match self.kind {
+                WorkspaceKind::Pnpm => "pnpm",
+                WorkspaceKind::PackageJson => "npm/yarn/bun",
+                WorkspaceKind::Lerna => "lerna",
+            },
+            port = member.port,
+        )
+    }
+}
 
 impl Stack {
     /// A Dockerfile for this stack.

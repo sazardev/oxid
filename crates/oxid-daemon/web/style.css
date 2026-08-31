@@ -461,6 +461,21 @@ h2 {
 
 /* A detected stack is a guess Oxid made, not a fact the project stated —
    the muted treatment says so without needing a caption. */
+.workspace-list {
+  list-style: none;
+  padding: 0;
+  margin: var(--gap-2) 0;
+}
+
+.workspace-list li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  align-items: center;
+  padding: var(--gap-2) 0;
+  border-bottom: 1px solid var(--border);
+}
+
 .badge-stack {
   border-color: var(--ash-gray);
   color: var(--ash-gray);

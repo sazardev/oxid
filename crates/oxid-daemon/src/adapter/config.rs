@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use oxid_core::services::stack::{RepoManifest, Stack, detect};
+use oxid_core::services::stack::{Monorepo, RepoManifest, Stack, detect, detect_monorepo};
 use oxid_core::{BuildConfig, Dependency, DomainError, PoolKind, ProjectConfig, Ttl};
 
 /// A parsed `oxid.toml`, ready for [`oxid_core::Project::new`].
@@ -26,6 +26,13 @@ pub struct ParsedProject {
     /// answered for itself — an `oxid.toml`, a Compose file or a
     /// `Dockerfile` — and nothing was inferred.
     pub stack: Option<Stack>,
+    /// The workspace, when the repository holds several packages.
+    ///
+    /// Detected even when the repository has its own `oxid.toml` or
+    /// `Dockerfile`: which services live in a monorepo is worth telling an
+    /// operator regardless of who wrote the build, and it is what makes
+    /// `[build].context` a choice rather than a guess.
+    pub monorepo: Option<Monorepo>,
 }
 
 /// Errors raised while reading or interpreting `oxid.toml`.
@@ -179,6 +186,7 @@ impl Config {
             name,
             config,
             stack: None,
+            monorepo: None,
         })
     }
 }
@@ -238,9 +246,17 @@ const DEFAULT_ZERO_CONFIG_PORT: u16 = 8080;
 /// Returns [`ConfigError::NoConfigFound`] if none of the three exist, plus
 /// whatever [`parse_file`]/Compose parsing would return for a malformed one.
 pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
+    // Read once, used by every branch below: which services a monorepo
+    // holds is worth reporting whether or not Oxid had to guess the build.
+    let manifest = read_repo_manifest(repo_dir);
+    let monorepo = detect_monorepo(&manifest);
+
     let toml_path = repo_dir.join("oxid.toml");
     if toml_path.exists() {
-        return parse_file(toml_path);
+        return parse_file(toml_path).map(|mut parsed| {
+            parsed.monorepo = monorepo;
+            parsed
+        });
     }
 
     let name = derive_project_name(repo_dir);
@@ -260,22 +276,45 @@ pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
                     read_exposed_port(&repo_dir.join(&service.context).join(&service.dockerfile))
                 })
                 .unwrap_or(DEFAULT_ZERO_CONFIG_PORT);
-            return zero_config_project(name, Some(service.dockerfile), service.context, port);
+            return zero_config_project(name, Some(service.dockerfile), service.context, port).map(
+                |mut parsed| {
+                    parsed.monorepo = monorepo;
+                    parsed
+                },
+            );
         }
     }
 
     let dockerfile_path = repo_dir.join("Dockerfile");
     if dockerfile_path.exists() {
         let port = read_exposed_port(&dockerfile_path).unwrap_or(DEFAULT_ZERO_CONFIG_PORT);
-        return zero_config_project(name, None, DEFAULT_CONTEXT.to_owned(), port);
+        return zero_config_project(name, None, DEFAULT_CONTEXT.to_owned(), port).map(
+            |mut parsed| {
+                parsed.monorepo = monorepo;
+                parsed
+            },
+        );
     }
 
     // Last: work out what this is. Deliberately after every explicit
     // answer, so detection only ever fills a gap — a committed Dockerfile
     // is a decision someone made and is never second-guessed.
-    if let Some(stack) = detect(&read_manifest(repo_dir)) {
+    // A monorepo root usually builds nothing itself. Pointing the default
+    // context at the first deployable service is a far better starting
+    // guess than the root, which typically has no app in it at all — and
+    // the operator sees which one was chosen and can name another.
+    if let Some(mono) = &monorepo
+        && let Some(first) = mono.deployable.first()
+    {
+        let mut parsed = zero_config_project(name, None, first.path.clone(), first.port)?;
+        parsed.monorepo = monorepo;
+        return Ok(parsed);
+    }
+
+    if let Some(stack) = detect(&manifest) {
         let mut parsed = zero_config_project(name, None, DEFAULT_CONTEXT.to_owned(), stack.port)?;
         parsed.stack = Some(stack);
+        parsed.monorepo = monorepo;
         return Ok(parsed);
     }
 
@@ -284,16 +323,17 @@ pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
     })
 }
 
-/// Describes `repo_dir` for [`detect`].
+/// Describes a repository for [`detect`] and [`detect_monorepo`].
 ///
-/// Only the root is listed and only the manifests the domain asks for are
-/// opened — a repository is never trawled, and a large one costs a single
-/// `read_dir` plus a handful of small reads. Unreadable files are simply
-/// absent: detection treats "cannot read" and "not there" the same way, and
-/// neither is worth failing a deploy over.
-fn read_manifest(repo_dir: &Path) -> RepoManifest {
+/// Bounded on purpose. The root is listed, plus one level inside each
+/// conventional workspace directory — enough to find `apps/api/package.json`
+/// without walking a repository that may hold a hundred thousand files. The
+/// authoritative member list comes from those `package.json` files
+/// themselves, so nothing is missed that Oxid could act on.
+#[must_use]
+pub fn read_repo_manifest(root: &Path) -> RepoManifest {
     let mut manifest = RepoManifest::default();
-    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return manifest;
     };
     for entry in entries.flatten() {
@@ -303,9 +343,28 @@ fn read_manifest(repo_dir: &Path) -> RepoManifest {
     }
     for name in RepoManifest::files_worth_reading() {
         if manifest.entries.iter().any(|e| e == name)
-            && let Ok(body) = std::fs::read_to_string(repo_dir.join(name))
+            && let Ok(body) = std::fs::read_to_string(root.join(name))
         {
             manifest.files.insert((*name).to_owned(), body);
+        }
+    }
+
+    // One level into `apps/`, `packages/` and friends, for the member
+    // manifests a monorepo is described by.
+    for group in RepoManifest::workspace_roots() {
+        if !manifest.entries.iter().any(|e| e == group) {
+            continue;
+        }
+        let Ok(members) = std::fs::read_dir(root.join(group)) else {
+            continue;
+        };
+        for member in members.flatten() {
+            let dir = member.file_name().to_string_lossy().into_owned();
+            let package = format!("{group}/{dir}/package.json");
+            if let Ok(body) = std::fs::read_to_string(root.join(&package)) {
+                manifest.entries.push(package.clone());
+                manifest.files.insert(package, body);
+            }
         }
     }
     manifest
@@ -339,6 +398,7 @@ fn zero_config_project(
         name,
         config,
         stack: None,
+        monorepo: None,
     })
 }
 

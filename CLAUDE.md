@@ -131,6 +131,37 @@ The result is stored on the project (`detected_stack`, migration `0013`) and
 shown as a tag in the dashboard and an `oxid ps` column. Null is the normal
 case: the project answered for itself.
 
+### Monorepos
+
+`detect_monorepo` recognises pnpm workspaces, a `workspaces` array in the
+root `package.json` (npm/yarn/bun) and `lerna.json`, reporting Turborepo or
+Nx on top when present. Members with their own `package.json` are listed;
+one counts as *deployable* if it has a recognised framework, depends on
+something that listens (Express, Fastify, Hono, …) or declares a `start`
+script — otherwise it is a library other packages import, and listing it
+would send an operator to register something with nothing to serve.
+
+Three things are load-bearing:
+
+- **A workspace member builds from the repository root**, not its own
+  directory. Its dependencies include siblings, and the lockfile resolving
+  them is at the root; `deploy_at` switches the Docker context to `.` when
+  `[build].context` names a member, and generates a Dockerfile that installs
+  at the root filtered to that package.
+- **The runtime stage carries the whole built tree.** Copying
+  `node_modules` plus the one package looks tighter and produces an image
+  that starts and dies on `MODULE_NOT_FOUND`: a workspace links siblings in
+  as symlinks pointing back at `packages/*`. Found by deploying one.
+- **Zero-config points at the first deployable service**, since a monorepo
+  root usually builds nothing. The dashboard lists every service with the
+  active one marked, so changing it is a `[build].context` edit rather than
+  a guess.
+
+Workspace globs are deliberately not parsed: "has a `package.json`" reaches
+the same answer without a glob language, and `adapter::config::read_repo_manifest`
+already bounds the walk to the root plus one level inside `apps/`,
+`packages/`, `services/` and `libs/`.
+
 ## Dashboard
 
 Embedded in the binary via `include_str!` — no build step, no bundler, and
