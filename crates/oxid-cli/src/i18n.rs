@@ -189,6 +189,7 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "doctor.capacity" => "Docker capacity: {cpus} CPU(s), {memory} GiB memory, {running} env(s) running",
         "doctor.noInfra" => "Could not fetch infra status ({error}) — the daemon may predate `/api/v1/infra/status`; upgrade it to enable this check",
         "doctor.noStats" => "Could not fetch capacity stats ({error}) — the daemon may predate `/api/v1/stats`; upgrade it to enable this check",
+        "doctor.scopedNoNode" => "Node-wide checks (capacity, infra) are not available to a project-scoped token — this is expected, and everything above is what matters for your projects",
         // -- infra ------------------------------------------------------------------------
         "infra.networkExists" => "Docker network `{network}` exists",
         "infra.networkMissing" => "Docker network `{network}` does not exist",
@@ -279,6 +280,7 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "doctor.capacity" => "Capacidad de Docker: {cpus} CPU(s), {memory} GiB de memoria, {running} entorno(s) corriendo",
         "doctor.noInfra" => "No se pudo obtener el estado de la infraestructura ({error}) — puede que el daemon sea anterior a `/api/v1/infra/status`; actualízalo para habilitar esta comprobación",
         "doctor.noStats" => "No se pudieron obtener las estadísticas de capacidad ({error}) — puede que el daemon sea anterior a `/api/v1/stats`; actualízalo para habilitar esta comprobación",
+        "doctor.scopedNoNode" => "Las comprobaciones de nodo (capacidad, infraestructura) no están disponibles para un token con alcance de proyecto — es lo esperado, y lo de arriba es lo que importa para tus proyectos",
         // -- infra ------------------------------------------------------------------------
         "infra.networkExists" => "La red de Docker `{network}` existe",
         "infra.networkMissing" => "La red de Docker `{network}` no existe",

@@ -37,8 +37,21 @@ pub(crate) fn resolved_container_name(project: &Project, env: &Environment) -> S
         .unwrap_or_else(|| container_name(project, &env.branch.name))
 }
 
+/// The image tag a branch's build produces.
+///
+/// Lowercased in full, because Docker refuses any reference that is not:
+/// `oxid/appB/JIRA-123` comes back as `invalid reference format: repository
+/// name must be lowercase` and the deploy fails outright. Ticket-prefixed
+/// branches (`JIRA-123`, `ABC-456-fix`) are among the most common naming
+/// schemes there is, so this was every deploy of those branches failing on
+/// a message that says nothing about branch names.
+///
+/// Two branches differing only in case therefore share an image tag. That
+/// is not avoidable — Docker has no case-sensitive alternative — and costs
+/// nothing in practice: every deploy rebuilds its image, and a running
+/// container holds its image by id, so a retag never disturbs it.
 pub(crate) fn image_name(project: &Project, branch: &BranchName) -> String {
-    format!("oxid/{}/{}", project.name, sanitize_label(branch))
+    format!("oxid/{}/{}", project.name, sanitize_label(branch)).to_ascii_lowercase()
 }
 
 pub(crate) fn sanitize_label(branch: &BranchName) -> String {
@@ -79,4 +92,46 @@ pub(crate) fn lowest_free_index(
     capacity: u32,
 ) -> Option<u32> {
     (0..capacity).find(|i| !used.contains(i))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxid_core::{BuildConfig, ProjectConfig, ProjectId, RepoUrl, Ttl};
+
+    fn project(name: &str) -> Project {
+        let config = ProjectConfig::new(
+            "example.dev",
+            Ttl::parse("30m").unwrap(),
+            Ttl::parse("7d").unwrap(),
+            8080,
+            BuildConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        Project::new(
+            ProjectId(1),
+            name.to_owned(),
+            RepoUrl::parse("https://example.com/org/repo.git").unwrap(),
+            config,
+        )
+        .unwrap()
+    }
+
+    /// Docker rejects any reference that is not lowercase, so a
+    /// ticket-prefixed branch used to fail every deploy with
+    /// `invalid reference format` — a message that never mentions branches.
+    #[test]
+    fn image_names_are_lowercase_whatever_the_branch_is_called() {
+        let branch = BranchName::parse("JIRA-123").unwrap();
+        let name = image_name(&project("appB"), &branch);
+        assert_eq!(name, "oxid/appb/jira-123");
+        assert!(!name.chars().any(char::is_uppercase), "{name}");
+    }
+
+    #[test]
+    fn an_uppercase_project_name_is_lowercased_too() {
+        let branch = BranchName::parse("main").unwrap();
+        assert_eq!(image_name(&project("MyApp"), &branch), "oxid/myapp/main");
+    }
 }

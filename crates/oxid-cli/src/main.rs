@@ -902,6 +902,23 @@ async fn try_register(client: &Client, base: &str, body: Value) -> Result<Value,
 }
 
 async fn get_json(client: &Client, url: String) -> Result<Value, CliError> {
+    get_json_inner(client, url, true).await
+}
+
+/// Like [`get_json`], but does not print the daemon's rejection on the way
+/// out — for a caller that expects the failure and reports it in its own
+/// words.
+///
+/// `doctor` is the caller this exists for. Its node-wide probes legitimately
+/// fail for a project-scoped token, and it already says so gently; without
+/// this the raw `403 Forbidden` was printed first, so a developer's very
+/// first command against a shared daemon opened with two red errors about
+/// something working exactly as designed.
+async fn get_json_quiet(client: &Client, url: String) -> Result<Value, CliError> {
+    get_json_inner(client, url, false).await
+}
+
+async fn get_json_inner(client: &Client, url: String, report: bool) -> Result<Value, CliError> {
     let response = client
         .get(&url)
         .send()
@@ -913,7 +930,17 @@ async fn get_json(client: &Client, url: String) -> Result<Value, CliError> {
         .await
         .map_err(|e| format!("cannot read daemon response: {e}"))?;
     if !status.is_success() {
-        return Err(response_error(&body, status, "request failed"));
+        if report {
+            return Err(response_error(&body, status, "request failed"));
+        }
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| body.clone());
+        return Err(CliError::new(
+            format!("{status}: {message}"),
+            classify_status(status),
+        ));
     }
     serde_json::from_str(&body).map_err(|e| format!("invalid daemon response: {e}").into())
 }
@@ -2032,15 +2059,15 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
     // them, so their failure never fails `doctor` outright — they're
     // capacity/config diagnostics, not a correctness gate.
     let node_stats = if auth_ok {
-        match get_json(client, format!("{base}/api/v1/stats")).await {
+        match get_json_quiet(client, format!("{base}/api/v1/stats")).await {
             Ok(node_stats) => Some(Ok(node_stats)),
-            Err(err) => Some(Err(err.message)),
+            Err(err) => Some(Err(err)),
         }
     } else {
         None
     };
     let infra = if auth_ok {
-        Some(get_json(client, format!("{base}/api/v1/infra/status")).await)
+        Some(get_json_quiet(client, format!("{base}/api/v1/infra/status")).await)
     } else {
         None
     };
@@ -2054,7 +2081,7 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
         "auth": auth_status,
         "capacity": node_stats.as_ref().map(|c| match c {
             Ok(node_stats) => node_stats.clone(),
-            Err(e) => json!({ "error": e }),
+            Err(e) => json!({ "error": e.message }),
         }),
         "infra": infra.as_ref().map(|r| match r {
             Ok(value) => value.clone(),
@@ -2077,6 +2104,10 @@ async fn cmd_doctor(client: &Client, base: &str) -> Result<(), CliError> {
                  DISABLED (no idle auto-pause; environments run until manually paused/destroyed). \
                  Run `oxid infra setup` on the host to enable the supported Traefik topology",
             ),
+            // Already explained by the capacity line above: a scoped token
+            // is refused every node-wide check, and saying so twice reads
+            // like two separate problems.
+            Some(Err(err)) if err.code == EXIT_UNAUTHORIZED => {}
             Some(Err(err)) => bg(tf("doctor.noInfra", &[("error", &err.message)])),
             None => {}
         }
@@ -2097,7 +2128,7 @@ fn print_doctor_report(
     version_mismatch: bool,
     latency: std::time::Duration,
     auth_ok: bool,
-    node_stats: Option<&Result<Value, String>>,
+    node_stats: Option<&Result<Value, CliError>>,
 ) {
     ok(tf(
         "doctor.reachable",
@@ -2127,7 +2158,8 @@ fn print_doctor_report(
     }
     match node_stats {
         Some(Ok(node_stats)) => print_node_stats(node_stats),
-        Some(Err(message)) => bg(tf("doctor.noStats", &[("error", message)])),
+        Some(Err(err)) if err.code == EXIT_UNAUTHORIZED => bg(t("doctor.scopedNoNode")),
+        Some(Err(err)) => bg(tf("doctor.noStats", &[("error", &err.message)])),
         None => {}
     }
 }

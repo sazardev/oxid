@@ -6,6 +6,26 @@ is the breaking position.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A branch with an uppercase letter could not be deployed at all.** The
+  image tag is built from the project and branch name, and Docker refuses any
+  reference that is not lowercase — so `JIRA-123`, `ABC-456-fix` and every
+  other ticket-prefixed branch failed with `invalid reference format:
+  repository name must be lowercase`, a message that never mentions branch
+  names. Ticket prefixes are among the most common branch naming schemes
+  there is. The tag is now lowercased in full. Two branches differing only in
+  case share a tag as a result, which Docker leaves no way to avoid and which
+  costs nothing: every deploy rebuilds its image, and a running container
+  holds its image by id.
+- `oxid doctor` opened with two raw `403 Forbidden` errors when run with a
+  project-scoped token. Its node-wide probes (capacity, infra) are refused
+  for such a token *by design*, and doctor already reported that gently — but
+  the underlying request printed the rejection on its way out, so a
+  developer's first command against a shared daemon looked like a failure.
+  The probes are now quiet, and the explanation names the real reason instead
+  of suggesting the daemon is out of date.
+
 ### Added
 
 - **`[deploy]` in `oxid.toml`: which branches a push actually deploys.** Every
