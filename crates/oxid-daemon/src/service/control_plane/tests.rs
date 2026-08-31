@@ -91,6 +91,16 @@ struct FakeOci {
 }
 
 impl ContainerPort for FakeOci {
+    async fn traefik_runtime(
+        &self,
+        _name: &str,
+    ) -> Result<Option<oxid_core::services::tls::TraefikRuntime>, OciError> {
+        Ok(None)
+    }
+
+    async fn ensure_volume(&self, _name: &str) -> Result<(), OciError> {
+        Ok(())
+    }
     async fn pull_image(&self, image: &str) -> Result<(), OciError> {
         self.calls.lock().unwrap().push(format!("pull:{image}"));
         let _ = image;

@@ -18,7 +18,9 @@ pub use audit::AuditEvent;
 pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
-pub use infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
+pub use infra::{
+    AcmeChallenge, AcmeConfig, NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus,
+};
 pub use ports::{
     AuditFilter, AuditStore, BuildReport, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
     ContainerStatus, EnvironmentStore, GitError, GitPort, HostCapacity, LogStream, OciError,

@@ -135,6 +135,8 @@
 
 use std::path::PathBuf;
 
+use oxid_core::services::tls;
+use oxid_core::{AcmeChallenge, AcmeConfig, TraefikSpec};
 use oxid_daemon::ControlPlane;
 use oxid_daemon::adapter::crypto::Cipher;
 use oxid_daemon::adapter::git::GitClient;
@@ -196,6 +198,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|&p| p > 0)
         {
             cp = cp.with_traefik_http_port(port);
+        }
+        if let Some((acme, https_port)) = acme_from_env(cp.traefik_http_port())? {
+            cp = cp.with_acme(acme, https_port);
         }
     }
     let postgres_url = std::env::var("OXID_POSTGRES_URL").ok();
@@ -464,6 +469,76 @@ fn bind_is_loopback(addr: &str) -> bool {
 /// Resolves the two control-plane credentials, honoring explicit env values
 /// first: `(webhook_secret, api_token, auto_token)`.
 ///
+/// Reads the ACME configuration, or `None` when certificates are not
+/// configured at all.
+///
+/// Validates before returning, because every way this can be wrong produces
+/// a Traefik that looks healthy and serves a self-signed certificate: an
+/// HTTP-01 challenge on a port other than 80 is never validated, and a
+/// DNS-01 provider with no credentials cannot answer. Both are far cheaper
+/// to refuse at startup than to diagnose from a browser warning.
+///
+/// # Errors
+/// A message naming what to fix, when ACME is configured but cannot work.
+fn acme_from_env(
+    traefik_http_port: u16,
+) -> Result<Option<(AcmeConfig, u16)>, Box<dyn std::error::Error>> {
+    let Ok(email) = std::env::var("OXID_ACME_EMAIL") else {
+        return Ok(None);
+    };
+
+    // DNS-01 whenever a provider is named. It is the recommended shape: one
+    // wildcard covers every branch that will ever exist, it needs no inbound
+    // reachability, and it sidesteps the per-branch certificate that runs
+    // into Let's Encrypt's rate limit on a repository with many branches.
+    let challenge = match std::env::var("OXID_ACME_DNS_PROVIDER") {
+        Ok(provider) if !provider.trim().is_empty() => AcmeChallenge::Dns01 {
+            provider,
+            env_keys: std::env::var("OXID_ACME_DNS_ENV")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        },
+        _ => AcmeChallenge::Http01,
+    };
+
+    let acme = AcmeConfig {
+        email,
+        challenge,
+        // `staging` is an alias rather than a URL because the full one is
+        // long, easy to typo, and getting it wrong means burning production
+        // rate limits — which is the one mistake this flag exists to avoid.
+        ca_directory: match std::env::var("OXID_ACME_CA").ok().as_deref() {
+            None | Some("production") => None,
+            Some("staging") => {
+                Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_owned())
+            }
+            Some(url) => Some(url.to_owned()),
+        },
+        storage_volume: std::env::var("OXID_ACME_STORAGE")
+            .unwrap_or_else(|_| "oxid-acme".to_owned()),
+        resolver_name: "oxid".to_owned(),
+        http_redirect: std::env::var("OXID_ACME_HTTP_REDIRECT").as_deref() != Ok("0"),
+    };
+    let https_port = std::env::var("OXID_TRAEFIK_HTTPS_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(443);
+
+    let spec = TraefikSpec {
+        http_port: traefik_http_port,
+        ..TraefikSpec::new("unused-for-validation")
+    }
+    .with_acme(acme.clone(), https_port);
+    tls::validate(&spec).map_err(|e| e.describe())?;
+
+    Ok(Some((acme, https_port)))
+}
+
 /// With `OXID_AUTO_TOKEN=1` any credential that wasn't supplied is generated
 /// and persisted (see [`credential`]) — the zero-config path the shipped
 /// `docker-compose.yml` takes. Without the flag both fall back to plain env

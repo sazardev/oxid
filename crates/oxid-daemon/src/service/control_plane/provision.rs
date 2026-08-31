@@ -117,7 +117,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             ("oxid.branch".to_owned(), branch.to_string()),
             ("oxid.url".to_owned(), url.clone()),
         ]);
-        labels.extend(self.traefik_labels(&name, &url, project.config.port));
+        labels.extend(self.traefik_labels(
+            &name,
+            &url,
+            project.config.port,
+            &project.config.base_domain,
+        ));
         let spec = ContainerSpec {
             name: name.clone(),
             image,

@@ -19,9 +19,12 @@ use bollard::models::{
 use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use bytes::Bytes;
 use futures_util::StreamExt;
+use oxid_core::services::tls::{
+    ACME_MOUNT, TraefikRuntime, WEBSECURE_ENTRYPOINT_PORT, traefik_cmd,
+};
 use oxid_core::{
-    BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus, HostCapacity, LogStream,
-    NetworkStatus, OciError, SelfWiringStatus, TraefikSpec, TraefikStatus,
+    AcmeChallenge, BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus,
+    HostCapacity, LogStream, NetworkStatus, OciError, SelfWiringStatus, TraefikSpec, TraefikStatus,
 };
 
 /// Backed by a Docker connection (default socket).
@@ -548,6 +551,59 @@ impl ContainerPort for DockerClient {
         }
     }
 
+    async fn traefik_runtime(&self, name: &str) -> Result<Option<TraefikRuntime>, OciError> {
+        let inspect = match self.docker.inspect_container(name, None).await {
+            Ok(inspect) => inspect,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(e) => return Err(map_err(e)),
+        };
+        // Published *host* ports, which is what the spec names — the
+        // container side is fixed at 80/443.
+        let published_ports = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|n| n.ports.as_ref())
+            .map(|ports| {
+                ports
+                    .values()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|b| b.host_port.as_ref()?.parse::<u16>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(TraefikRuntime {
+            cmd: inspect
+                .config
+                .as_ref()
+                .and_then(|c| c.cmd.clone())
+                .unwrap_or_default(),
+            published_ports,
+            mount_targets: inspect
+                .mounts
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.destination)
+                .collect(),
+        }))
+    }
+
+    async fn ensure_volume(&self, name: &str) -> Result<(), OciError> {
+        // Docker's volume create is idempotent: an existing volume comes
+        // back unchanged rather than erroring, so there is nothing to
+        // check first.
+        self.docker
+            .create_volume(bollard::volume::CreateVolumeOptions {
+                name: name.to_owned(),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(map_err)
+    }
+
     async fn self_wiring_status(&self, network: &str) -> Result<SelfWiringStatus, OciError> {
         // Docker sets `HOSTNAME` to the short container id by default when
         // nothing overrides it — the same trick `docker inspect $HOSTNAME`
@@ -641,6 +697,48 @@ impl DockerClient {
             }]),
         );
 
+        // TLS: a second entrypoint, its own published port, and a place to
+        // keep the certificates.
+        let mut binds = vec![format!(
+            "{}:/var/run/docker.sock:ro",
+            spec.docker_socket_path
+        )];
+        let mut env = vec!["DOCKER_API_VERSION=1.41".to_owned()];
+        if let Some(https_port) = spec.https_port {
+            let https_key = format!("{WEBSECURE_ENTRYPOINT_PORT}/tcp");
+            #[allow(clippy::zero_sized_map_values)]
+            exposed_ports.insert(https_key.clone(), HashMap::<(), ()>::new());
+            port_bindings.insert(
+                https_key,
+                Some(vec![PortBinding {
+                    host_ip: Some("0.0.0.0".to_owned()),
+                    host_port: Some(https_port.to_string()),
+                }]),
+            );
+        }
+        if let Some(acme) = spec.acme.as_ref() {
+            // A named volume, never a host path: Traefik refuses to start
+            // when `acme.json` is not 0600, and a bind mount an operator
+            // created is almost always 0644.
+            binds.push(format!("{}:{ACME_MOUNT}", acme.storage_volume));
+            if let AcmeChallenge::Dns01 { env_keys, .. } = &acme.challenge {
+                // Only the *names* travel through the domain; the values are
+                // read from this daemon's own environment here, at the last
+                // possible moment, so a credential is never held in a struct
+                // that could be serialized into a response or a log.
+                for key in env_keys {
+                    match std::env::var(key) {
+                        Ok(value) => env.push(format!("{key}={value}")),
+                        Err(_) => {
+                            return Err(OciError::Failure(format!(
+                                "the DNS-01 challenge needs `{key}`, which is not set on this                                  daemon — set it, or drop it from OXID_ACME_DNS_ENV"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         let config = Config {
             image: Some(spec.image.clone()),
             exposed_ports: Some(exposed_ports),
@@ -649,29 +747,15 @@ impl DockerClient {
             // compose file must get the same working proxy, and these flags
             // are what make wake-on-request work at all rather than merely
             // faster. See the comments there for the measurements.
-            cmd: Some(vec![
-                "--providers.docker=true".to_owned(),
-                format!("--providers.docker.network={}", spec.network),
-                "--providers.docker.exposedbydefault=false".to_owned(),
-                // Config reloads are batched; the 2s default dominates every
-                // wake, since a branch's route only comes back on a reload.
-                "--providers.providersThrottleDuration=100ms".to_owned(),
-                format!("--entrypoints.web.address=:{TRAEFIK_ENTRYPOINT_PORT}"),
-                // A sleeping branch's container black-holes rather than
-                // refusing, so these two timeouts are what turn a request to
-                // it into the 5xx the `errors` middleware forwards to
-                // `/api/v1/wake`. Without them the request hangs on Docker's
-                // default instead, and wake-on-request never fires.
-                "--serversTransport.forwardingTimeouts.dialTimeout=500ms".to_owned(),
-                "--serversTransport.forwardingTimeouts.responseHeaderTimeout=5s".to_owned(),
-            ]),
-            env: Some(vec!["DOCKER_API_VERSION=1.41".to_owned()]),
+            // Generated by `oxid_core::services::tls::traefik_cmd`, which
+            // is also what `infra status` compares the running container
+            // against. Two hand-maintained lists is how a Traefik ends up
+            // running without the flags an operator thinks it has.
+            cmd: Some(traefik_cmd(spec)),
+            env: Some(env),
             host_config: Some(HostConfig {
                 port_bindings: Some(port_bindings),
-                binds: Some(vec![format!(
-                    "{}:/var/run/docker.sock:ro",
-                    spec.docker_socket_path
-                )]),
+                binds: Some(binds),
                 // Same rationale as environment containers (see `run`):
                 // Traefik should come back on its own after a crash or host
                 // reboot without anyone noticing.
@@ -1167,6 +1251,93 @@ mod tests {
         );
     }
 
+    /// A Traefik with certificates configured must actually start, and its
+    /// argv and mounts must match what `traefik_drift` will later compare
+    /// against — otherwise `infra status` reports drift on a container Oxid
+    /// itself just created.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn a_traefik_with_acme_starts_and_reports_no_drift_against_its_own_spec() {
+        use oxid_core::services::tls::{TraefikRuntime, traefik_drift};
+        use oxid_core::{AcmeChallenge, AcmeConfig};
+
+        let client = DockerClient::connect().unwrap();
+        let network = "oxid-test-acme-net";
+        let container_name = "oxid-test-acme-traefik";
+        let volume = "oxid-test-acme-store";
+
+        let _ = client.remove(container_name).await;
+        let _ = client.docker.remove_network(network).await;
+
+        client.ensure_network(network).await.unwrap();
+        let spec = TraefikSpec {
+            network: network.to_owned(),
+            container_name: container_name.to_owned(),
+            http_port: 18_081,
+            ..TraefikSpec::new(network)
+        }
+        .with_acme(
+            AcmeConfig {
+                email: "ops@example.com".to_owned(),
+                // HTTP-01 deliberately: it needs no credentials, so this
+                // test asserts the container shape without depending on
+                // the daemon's environment. The DNS-01 argv is covered by
+                // the pure tests in `oxid_core::services::tls`.
+                challenge: AcmeChallenge::Http01,
+                // Staging: this test must never touch production rate
+                // limits, and it never completes a challenge anyway.
+                ca_directory: Some(
+                    "https://acme-staging-v02.api.letsencrypt.org/directory".to_owned(),
+                ),
+                storage_volume: volume.to_owned(),
+                resolver_name: "oxid".to_owned(),
+                http_redirect: true,
+            },
+            18_443,
+        );
+
+        assert_eq!(
+            client.ensure_traefik(spec.clone()).await.unwrap(),
+            TraefikStatus::Created
+        );
+        assert_eq!(
+            client.container_status(container_name).await.unwrap(),
+            ContainerStatus::Running,
+            "a Traefik configured for TLS must actually start"
+        );
+
+        // What `infra status` will compare: the container Oxid just made
+        // must satisfy the spec Oxid made it from.
+        let inspect = client
+            .docker
+            .inspect_container(container_name, None)
+            .await
+            .unwrap();
+        let actual = TraefikRuntime {
+            cmd: inspect
+                .config
+                .as_ref()
+                .and_then(|c| c.cmd.clone())
+                .unwrap_or_default(),
+            published_ports: vec![spec.http_port, spec.https_port.unwrap()],
+            mount_targets: inspect
+                .mounts
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.destination)
+                .collect(),
+        };
+        assert!(
+            traefik_drift(&spec, &actual).is_empty(),
+            "a freshly created Traefik must not report drift: {:?}",
+            traefik_drift(&spec, &actual)
+        );
+
+        let _ = client.remove(container_name).await;
+        let _ = client.docker.remove_network(network).await;
+        let _ = client.docker.remove_volume(volume, None).await;
+    }
+
     /// Exercises `ensure_network`/`ensure_traefik`/`network_exists` against
     /// a real Docker daemon, asserting the idempotency `oxid infra setup`
     /// depends on: running either twice in a row must be a no-op the second
@@ -1198,6 +1369,8 @@ mod tests {
             container_name: container_name.to_owned(),
             http_port: 18_080,
             docker_socket_path: "/var/run/docker.sock".to_owned(),
+            https_port: None,
+            acme: None,
         };
 
         let first_traefik = client.ensure_traefik(spec.clone()).await.unwrap();

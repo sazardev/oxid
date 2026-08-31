@@ -19,6 +19,7 @@ use crate::domain::environment::{Environment, EnvironmentId};
 use crate::domain::infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
 use crate::domain::project::{Project, ProjectId};
 use crate::domain::secret_context::{EnvVarScope, SecretContext, SecretValue};
+use crate::domain::services::tls::TraefikRuntime;
 use crate::domain::state::EnvironmentState;
 use crate::domain::value_objects::RepoUrl;
 
@@ -562,4 +563,22 @@ pub trait ContainerPort {
     /// "container not found", which is reported as
     /// [`SelfWiringStatus::Unknown`] rather than an error.
     async fn self_wiring_status(&self, network: &str) -> Result<SelfWiringStatus, OciError>;
+
+    /// What the named Traefik container is actually running with, or `None`
+    /// when it does not exist.
+    ///
+    /// Exists so `oxid infra status` can compare the running proxy against
+    /// the one Oxid would create. Without it the check could only ask
+    /// whether a container by that name existed, which reported a Traefik
+    /// missing every TLS flag as healthy.
+    ///
+    /// # Errors
+    /// Any container-runtime failure other than "not found".
+    async fn traefik_runtime(&self, name: &str) -> Result<Option<TraefikRuntime>, OciError>;
+
+    /// Creates a Docker volume if it does not exist.
+    ///
+    /// # Errors
+    /// Any container-runtime failure.
+    async fn ensure_volume(&self, name: &str) -> Result<(), OciError>;
 }

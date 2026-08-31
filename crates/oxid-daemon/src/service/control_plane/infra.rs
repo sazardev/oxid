@@ -83,12 +83,39 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?;
         let self_wiring = self.oci.self_wiring_status(network).await?;
 
+        // Whether the running Traefik still matches the one Oxid would
+        // create. This check used to be "does a container by that name
+        // exist", which reported a proxy missing every TLS flag as healthy
+        // — the operator saw a green status and a browser warning.
+        let drift = match self.oci.traefik_runtime(&traefik_spec.container_name).await {
+            Ok(Some(actual)) => oxid_core::services::tls::traefik_drift(&traefik_spec, &actual)
+                .into_iter()
+                .map(|d| d.describe())
+                .collect(),
+            // A Traefik that is not there is already reported by
+            // `traefik_status`; saying it twice helps nobody.
+            Ok(None) => Vec::new(),
+            // Inspection failing is not the same as drift, and must not be
+            // reported as if the proxy were misconfigured.
+            Err(e) => {
+                tracing::debug!(error = %e, "could not inspect traefik for drift");
+                Vec::new()
+            }
+        };
+
         Ok(InfraStatus::new(
             network.to_owned(),
             network_exists,
             traefik_status,
             self.traefik_http_port(),
             self_wiring,
+        )
+        .with_tls(
+            traefik_spec
+                .acme
+                .as_ref()
+                .map(|a| if a.is_wildcard() { "dns-01" } else { "http-01" }.to_owned()),
+            drift,
         ))
     }
 
@@ -118,10 +145,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let network_status = self.oci.ensure_network(&network).await?;
         tracing::info!(network = %network, ?network_status, "network ensured");
 
-        let traefik_status = self
-            .oci
-            .ensure_traefik(self.traefik_spec(network.clone()))
-            .await?;
+        let spec = self.traefik_spec(network.clone());
+        if let Some(acme) = spec.acme.as_ref() {
+            // Before Traefik, not after: it needs somewhere to keep
+            // `acme.json` the moment it starts, and a volume created later
+            // would leave the first certificates in the container's own
+            // writable layer, to be lost on the next recreate.
+            self.oci.ensure_volume(&acme.storage_volume).await?;
+            tracing::info!(volume = %acme.storage_volume, "acme store ensured");
+        }
+
+        let traefik_status = self.oci.ensure_traefik(spec).await?;
         tracing::info!(?traefik_status, "traefik ensured");
 
         self.infra_status().await
@@ -131,9 +165,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// host port applied. Built in one place so `infra_status` and
     /// `infra_bootstrap` can never disagree about which container they mean.
     fn traefik_spec(&self, network: String) -> TraefikSpec {
-        TraefikSpec {
+        let spec = TraefikSpec {
             http_port: self.traefik_http_port(),
             ..TraefikSpec::new(network)
+        };
+        match self.acme.as_ref() {
+            Some((acme, https_port)) => spec.with_acme(acme.clone(), *https_port),
+            None => spec,
         }
     }
 
@@ -150,6 +188,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         name: &str,
         url: &str,
         container_port: u16,
+        base_domain: &str,
     ) -> BTreeMap<String, String> {
         let Some(network) = &self.docker_network else {
             return BTreeMap::new();
@@ -226,5 +265,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 "/api/v1/wake".to_owned(),
             ),
         ])
+        .into_iter()
+        // TLS last: it *overrides* `entrypoints` (web → websecure) and adds
+        // the resolver, so merging in this order is what lets a plain
+        // install keep exactly the label set it has today while a TLS one
+        // gets the secure entrypoint without a second copy of the rules.
+        .chain(oxid_core::services::tls::router_tls_labels(
+            name,
+            base_domain,
+            &self.traefik_spec(network.clone()),
+        ))
+        .collect()
     }
 }

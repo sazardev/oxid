@@ -5,4 +5,5 @@ pub mod branch_filter;
 pub mod gc;
 pub mod stack;
 pub mod subdomain;
+pub mod tls;
 pub mod var_resolution;

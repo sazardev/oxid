@@ -40,6 +40,81 @@ pub struct TraefikSpec {
     /// Path to the Docker socket, mounted read-only into the container so
     /// Traefik's Docker provider can watch for label changes.
     pub docker_socket_path: String,
+    /// Host port Traefik's `websecure` entrypoint is published on, when TLS
+    /// is configured. `None` keeps Traefik HTTP-only, which is what every
+    /// install without [`Self::acme`] gets.
+    #[serde(default)]
+    pub https_port: Option<u16>,
+    /// Automatic certificates, or `None` for plain HTTP.
+    #[serde(default)]
+    pub acme: Option<AcmeConfig>,
+}
+
+/// How ACME proves the operator controls the domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcmeChallenge {
+    /// Let's Encrypt fetches a token over plain HTTP on port 80. Needs no
+    /// credentials, needs the host publicly reachable, and issues **one
+    /// certificate per branch** — which runs into the rate limit (50 new
+    /// certificates per registered domain per week) on any repository with
+    /// a lot of live branches.
+    Http01,
+    /// A TXT record proves control of the whole domain, so a single
+    /// wildcard covers every branch that will ever exist and the host needs
+    /// no inbound reachability at all. Needs credentials for the DNS
+    /// provider.
+    Dns01 {
+        /// lego provider code, e.g. `cloudflare`, `route53`, `digitalocean`.
+        provider: String,
+        /// Names — never values — of the environment variables the provider
+        /// needs. The adapter resolves each against the daemon's own
+        /// environment when it creates the container, so a credential never
+        /// enters this struct, is never serialized, and can never surface in
+        /// an API response or a log field.
+        env_keys: Vec<String>,
+    },
+}
+
+/// Automatic certificate configuration for deployed environments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcmeConfig {
+    /// Contact address Let's Encrypt sends expiry warnings to.
+    pub email: String,
+    /// How control of the domain is proven.
+    pub challenge: AcmeChallenge,
+    /// ACME directory URL, or `None` for Let's Encrypt production. Point it
+    /// at staging while setting this up — production rate limits are
+    /// unforgiving and staging's are not.
+    #[serde(default)]
+    pub ca_directory: Option<String>,
+    /// Docker volume holding `acme.json`.
+    ///
+    /// A **named volume**, not a host bind mount, and deliberately: Traefik
+    /// refuses to start when `acme.json` is not `0600`, and a bind mount
+    /// created by an operator is almost always `0644`. That is the single
+    /// most common way ACME-on-Traefik fails, and a named volume cannot
+    /// have it.
+    pub storage_volume: String,
+    /// Name of the certificate resolver, referenced by every router label.
+    pub resolver_name: String,
+    /// Whether Traefik redirects `web` to `websecure`.
+    pub http_redirect: bool,
+}
+
+impl AcmeConfig {
+    /// The wildcard that covers every branch of `base_domain`, for DNS-01.
+    #[must_use]
+    pub fn wildcard_for(base_domain: &str) -> String {
+        format!("*.{base_domain}")
+    }
+
+    /// Whether this configuration yields one certificate covering every
+    /// branch (DNS-01) rather than one per branch (HTTP-01).
+    #[must_use]
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self.challenge, AcmeChallenge::Dns01 { .. })
+    }
 }
 
 impl TraefikSpec {
@@ -61,7 +136,20 @@ impl TraefikSpec {
             container_name: "oxid-traefik".to_owned(),
             http_port: 80,
             docker_socket_path: "/var/run/docker.sock".to_owned(),
+            // HTTP-only, exactly as before ACME existed. Every install that
+            // does not configure certificates keeps byte-for-byte today's
+            // Traefik.
+            https_port: None,
+            acme: None,
         }
+    }
+
+    /// Returns this spec with automatic certificates enabled.
+    #[must_use]
+    pub fn with_acme(mut self, acme: AcmeConfig, https_port: u16) -> Self {
+        self.acme = Some(acme);
+        self.https_port = Some(https_port);
+        self
     }
 }
 

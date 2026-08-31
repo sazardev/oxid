@@ -88,6 +88,14 @@ pub struct InfraStatus {
     /// labeled for wake-on-request — detection only, see
     /// [`SelfWiringStatus`].
     pub self_wiring: SelfWiringStatus,
+    /// Which ACME challenge is configured (`dns-01`/`http-01`), or `None`
+    /// when environments are served over plain HTTP.
+    #[serde(default)]
+    pub acme_challenge: Option<String>,
+    /// Ways the running Traefik does not match the one Oxid would create,
+    /// already phrased for a person. Empty is the healthy case.
+    #[serde(default)]
+    pub traefik_drift: Vec<String>,
     /// [`SelfWiringStatus::is_fully_wired`], flattened for consumers that
     /// want the verdict rather than the evidence.
     ///
@@ -103,6 +111,16 @@ pub struct InfraStatus {
 }
 
 impl InfraStatus {
+    /// Attaches the TLS verdict, and folds any drift into `next_steps` so
+    /// it reaches every consumer that already reads them — the CLI, the
+    /// dashboard and `oxid doctor` — without each learning a new field.
+    pub(crate) fn with_tls(mut self, acme_challenge: Option<String>, drift: Vec<String>) -> Self {
+        self.next_steps.extend(drift.iter().cloned());
+        self.acme_challenge = acme_challenge;
+        self.traefik_drift = drift;
+        self
+    }
+
     pub(crate) fn new(
         network: String,
         network_exists: bool,
@@ -154,6 +172,10 @@ impl InfraStatus {
             self_wiring_ok: self_wiring.is_fully_wired(),
             self_wiring,
             next_steps,
+            // Filled by `with_tls`; plain HTTP with no drift is the shape
+            // every install without certificates keeps.
+            acme_challenge: None,
+            traefik_drift: Vec::new(),
         }
     }
 }

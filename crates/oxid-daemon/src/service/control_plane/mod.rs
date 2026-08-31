@@ -79,6 +79,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// whose 80 is already taken by another proxy could otherwise never run
     /// the bootstrap at all.
     traefik_http_port: u16,
+    /// Automatic certificates for deployed environments, and the host port
+    /// their `websecure` entrypoint is published on. `None` keeps every
+    /// route on plain HTTP, which is what an install that never configured
+    /// ACME gets.
+    acme: Option<(oxid_core::AcmeConfig, u16)>,
     /// Serializes every state-mutating lifecycle operation on environments —
     /// `deploy`, `pause`, `wake`, `destroy`, and each action a GC `sweep`
     /// applies — across every project. `Arc`-wrapped because `ControlPlane`
@@ -199,6 +204,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             docker_network: None,
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
             traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
+            acme: None,
             lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
             deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             deploy_concurrency: default_deploy_concurrency(),
@@ -238,6 +244,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self.docker_network = Some(network.into());
         self.daemon_url = daemon_url.into();
         self
+    }
+
+    /// Enables automatic certificates for deployed environments.
+    #[must_use]
+    pub fn with_acme(mut self, acme: oxid_core::AcmeConfig, https_port: u16) -> Self {
+        self.acme = Some((acme, https_port));
+        self
+    }
+
+    /// The scheme deployed environments are reachable on, for anything that
+    /// renders a URL. Derived from whether certificates are configured, so
+    /// the CLI and the dashboard cannot disagree with the proxy.
+    #[must_use]
+    pub const fn routing_scheme(&self) -> &'static str {
+        if self.acme.is_some() { "https" } else { "http" }
     }
 
     /// Sets the host port the built-in Traefik publishes on
