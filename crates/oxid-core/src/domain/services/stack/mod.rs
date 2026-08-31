@@ -69,6 +69,11 @@ impl RepoManifest {
             "pyproject.toml",
             "requirements.txt",
             "Cargo.toml",
+            "composer.json",
+            "Gemfile",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
             // Workspace declarations. Which directories hold packages is
             // stated in exactly one of these, and guessing at `apps/` and
             // `packages/` instead would be wrong for every repository that
@@ -105,6 +110,14 @@ pub enum Runtime {
     Go,
     Python,
     Rust,
+    /// PHP, which by share of the running web is not a legacy concern.
+    Php,
+    Ruby,
+    /// The JVM. Detected from a build file, since the source layout of a
+    /// Maven project and a Gradle one are the same.
+    Java,
+    #[serde(rename = "dotnet")]
+    DotNet,
     /// Nothing to run: HTML and assets, served as files.
     Static,
 }
@@ -117,6 +130,10 @@ impl Runtime {
             Self::Go => "go",
             Self::Python => "python",
             Self::Rust => "rust",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Java => "java",
+            Self::DotNet => "dotnet",
             Self::Static => "static",
         }
     }
@@ -248,6 +265,17 @@ pub enum Framework {
     NestJs,
     #[serde(rename = "nextjs")]
     NextJs,
+    // The meta-frameworks. Each builds to a server entry point in its own
+    // place, which is the whole reason they cannot share `NodeServer`'s
+    // Dockerfile.
+    #[serde(rename = "nuxt")]
+    Nuxt,
+    #[serde(rename = "sveltekit")]
+    SvelteKit,
+    #[serde(rename = "astro")]
+    Astro,
+    #[serde(rename = "remix")]
+    Remix,
     /// Vite, Create React App, Angular — anything that builds to static
     /// files and needs a server only to hand them out.
     #[serde(rename = "spa")]
@@ -277,6 +305,16 @@ pub enum Framework {
     /// A Rust binary with no framework Oxid recognises.
     #[serde(rename = "rust-server")]
     RustServer,
+    #[serde(rename = "laravel")]
+    Laravel,
+    #[serde(rename = "symfony")]
+    Symfony,
+    #[serde(rename = "rails")]
+    Rails,
+    #[serde(rename = "spring-boot")]
+    SpringBoot,
+    #[serde(rename = "aspnet")]
+    AspNet,
     #[serde(rename = "none")]
     None,
 }
@@ -287,6 +325,10 @@ impl Framework {
         match self {
             Self::NestJs => "nestjs",
             Self::NextJs => "nextjs",
+            Self::Nuxt => "nuxt",
+            Self::SvelteKit => "sveltekit",
+            Self::Astro => "astro",
+            Self::Remix => "remix",
             Self::SinglePageApp => "spa",
             Self::NodeServer => "node-server",
             Self::Fiber => "fiber",
@@ -299,6 +341,11 @@ impl Framework {
             Self::Axum => "axum",
             Self::Actix => "actix",
             Self::RustServer => "rust-server",
+            Self::Laravel => "laravel",
+            Self::Symfony => "symfony",
+            Self::Rails => "rails",
+            Self::SpringBoot => "spring-boot",
+            Self::AspNet => "aspnet",
             Self::None => "none",
         }
     }
@@ -308,9 +355,20 @@ impl Framework {
     #[must_use]
     fn default_port(self) -> u16 {
         match self {
-            Self::NestJs | Self::NextJs | Self::NodeServer => 3000,
+            // Each of these is the framework's own documented default, not
+            // a preference of Oxid's.
+            Self::NestJs
+            | Self::NextJs
+            | Self::Nuxt
+            | Self::SvelteKit
+            | Self::Remix
+            | Self::NodeServer
+            | Self::Rails => 3000,
+            Self::Astro => 4321,
             Self::SinglePageApp => 80,
-            Self::FastApi | Self::Flask | Self::Django => 8000,
+            Self::FastApi | Self::Flask | Self::Django | Self::Laravel | Self::Symfony => 8000,
+            // Go, Rust, Spring Boot and ASP.NET all conventionally use
+            // 8080, and so does an unrecognised server.
             _ => 8080,
         }
     }
@@ -565,7 +623,206 @@ pub fn detect(manifest: &RepoManifest) -> Option<Stack> {
         .or_else(|| detect_go(manifest))
         .or_else(|| detect_python(manifest))
         .or_else(|| detect_rust(manifest))
+        .or_else(|| detect_php(manifest))
+        .or_else(|| detect_ruby(manifest))
+        .or_else(|| detect_java(manifest))
+        .or_else(|| detect_dotnet(manifest))
+        // Last, because a repository of almost any of the above also has an
+        // `index.html` somewhere.
         .or_else(|| detect_static(manifest))
+}
+
+// ---------------------------------------------------------------------------
+// PHP
+// ---------------------------------------------------------------------------
+
+fn detect_php(manifest: &RepoManifest) -> Option<Stack> {
+    let composer = manifest.read("composer.json")?;
+    let mut evidence = vec!["composer.json".to_owned()];
+
+    let framework = if composer.contains("laravel/framework") {
+        evidence.push("laravel/framework".to_owned());
+        Framework::Laravel
+    } else if composer.contains("symfony/framework-bundle") {
+        evidence.push("symfony/framework-bundle".to_owned());
+        Framework::Symfony
+    } else {
+        Framework::None
+    };
+
+    // `require.php` is a constraint like `^8.2`, and the lower bound is the
+    // safe reading — building on a version below what the project asks for
+    // fails, building above it usually does not.
+    let runtime_version = composer.split("\"php\"").nth(1).and_then(|rest| {
+        let spec = rest.split('"').nth(1)?;
+        let v: String = spec
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        (!v.is_empty()).then_some(v)
+    });
+
+    Some(Stack {
+        runtime: Runtime::Php,
+        framework,
+        runtime_version,
+        package_manager: None,
+        locked: manifest.has("composer.lock"),
+        build_target: None,
+        port: framework.default_port(),
+        confidence: if framework == Framework::None {
+            Confidence::Likely
+        } else {
+            Confidence::Certain
+        },
+        evidence,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Ruby
+// ---------------------------------------------------------------------------
+
+fn detect_ruby(manifest: &RepoManifest) -> Option<Stack> {
+    let gemfile = manifest.read("Gemfile")?;
+    let mut evidence = vec!["Gemfile".to_owned()];
+
+    let framework = if gemfile.contains("\"rails\"") || gemfile.contains("'rails'") {
+        evidence.push("rails".to_owned());
+        Framework::Rails
+    } else {
+        Framework::None
+    };
+    if framework == Framework::None {
+        // A Gemfile alone describes a library or a script as often as a
+        // web application, and there is nothing to serve either way.
+        return None;
+    }
+
+    let runtime_version = gemfile.split("ruby ").nth(1).and_then(|rest| {
+        let v = rest.trim_start().trim_start_matches(['"', '\'']);
+        let v: String = v
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        (!v.is_empty()).then_some(v)
+    });
+
+    Some(Stack {
+        runtime: Runtime::Ruby,
+        framework,
+        runtime_version,
+        package_manager: None,
+        locked: manifest.has("Gemfile.lock"),
+        build_target: None,
+        port: framework.default_port(),
+        confidence: Confidence::Certain,
+        evidence,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// JVM
+// ---------------------------------------------------------------------------
+
+fn detect_java(manifest: &RepoManifest) -> Option<Stack> {
+    // Maven first: a project with both is a Maven project with a Gradle
+    // file someone left behind more often than the reverse.
+    let (source, build_file) = ["pom.xml", "build.gradle", "build.gradle.kts"]
+        .into_iter()
+        .find_map(|name| manifest.read(name).map(|body| (name, body)))?;
+    let mut evidence = vec![source.to_owned()];
+
+    // Two spellings for the same thing: Maven's artifacts are
+    // `spring-boot-starter-*`, while Gradle's plugin id is
+    // `org.springframework.boot`. Matching only one silently misses every
+    // project built with the other.
+    let framework =
+        if build_file.contains("spring-boot") || build_file.contains("org.springframework.boot") {
+            evidence.push("spring-boot".to_owned());
+            Framework::SpringBoot
+        } else {
+            Framework::None
+        };
+    if framework == Framework::None {
+        // A JVM build file with no web framework is a library or a CLI.
+        return None;
+    }
+
+    // Maven and Gradle differ in every command, so which one is in use is
+    // part of the answer rather than a detail.
+    let build_target = Some(
+        if source == "pom.xml" {
+            "maven"
+        } else {
+            "gradle"
+        }
+        .to_owned(),
+    );
+
+    Some(Stack {
+        runtime: Runtime::Java,
+        framework,
+        runtime_version: java_version(build_file),
+        package_manager: None,
+        locked: false,
+        build_target,
+        port: 8080,
+        confidence: Confidence::Certain,
+        evidence,
+    })
+}
+
+/// The JDK release a build file targets, from Maven's `<java.version>` or
+/// Gradle's `JavaLanguageVersion.of(N)` / `sourceCompatibility`.
+fn java_version(build_file: &str) -> Option<String> {
+    for marker in [
+        "<java.version>",
+        "JavaLanguageVersion.of(",
+        "sourceCompatibility",
+    ] {
+        if let Some(rest) = build_file.split(marker).nth(1) {
+            let v: String = rest
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// .NET
+// ---------------------------------------------------------------------------
+
+fn detect_dotnet(manifest: &RepoManifest) -> Option<Stack> {
+    // A `.csproj` names itself after the assembly, and the file's own name
+    // is what `dotnet publish` produces — so which one it is matters.
+    let project = manifest
+        .entries
+        .iter()
+        .find(|e| e.ends_with(".csproj") && !e.contains('/'))?;
+    let name = project.trim_end_matches(".csproj").to_owned();
+
+    Some(Stack {
+        runtime: Runtime::DotNet,
+        framework: Framework::AspNet,
+        runtime_version: None,
+        package_manager: None,
+        locked: false,
+        build_target: Some(name),
+        port: 8080,
+        // The project file was found but not read: whether it is a web app
+        // or a class library is in its contents, and a class library would
+        // build and then have nothing to serve.
+        confidence: Confidence::Likely,
+        evidence: vec![project.clone()],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -587,12 +844,35 @@ fn detect_node(manifest: &RepoManifest) -> Option<Stack> {
     // Next.js app.
     let has_dep = |name: &str| package_json.contains(&format!("\"{name}\""));
 
+    // Order matters: a Nuxt app has `vite` too, and a SvelteKit app has
+    // `svelte`. The most specific claim wins, and each of these is a
+    // dependency the project could not have by accident.
     let framework = if has_dep("@nestjs/core") {
         evidence.push("@nestjs/core".to_owned());
         Framework::NestJs
     } else if has_dep("next") {
         evidence.push("next".to_owned());
         Framework::NextJs
+    } else if has_dep("nuxt") {
+        evidence.push("nuxt".to_owned());
+        Framework::Nuxt
+    } else if has_dep("@sveltejs/kit") {
+        evidence.push("@sveltejs/kit".to_owned());
+        Framework::SvelteKit
+    } else if has_dep("@remix-run/node") || has_dep("@remix-run/serve") {
+        evidence.push("@remix-run/node".to_owned());
+        Framework::Remix
+    } else if has_dep("astro") {
+        evidence.push("astro".to_owned());
+        // Astro is static unless something adds a server adapter, and the
+        // two need entirely different images — one is nginx, the other is
+        // a Node process.
+        if has_dep("@astrojs/node") {
+            evidence.push("@astrojs/node".to_owned());
+            Framework::Astro
+        } else {
+            Framework::SinglePageApp
+        }
     } else if has_dep("vite") || has_dep("react-scripts") || has_dep("@angular/core") {
         evidence.push(
             if has_dep("vite") {
@@ -1035,6 +1315,10 @@ impl Stack {
             Runtime::Go => self.go_dockerfile(),
             Runtime::Python => self.python_dockerfile(),
             Runtime::Rust => self.rust_dockerfile(),
+            Runtime::Php => self.php_dockerfile(),
+            Runtime::Ruby => self.ruby_dockerfile(),
+            Runtime::Java => self.java_dockerfile(),
+            Runtime::DotNet => self.dotnet_dockerfile(),
             Runtime::Static => Self::static_dockerfile(),
         }
     }
@@ -1071,6 +1355,25 @@ impl Stack {
                 self.runtime_version.as_deref().unwrap_or("3.12")
             )],
             Runtime::Rust => vec!["rust:1-slim".to_owned(), "debian:stable-slim".to_owned()],
+            Runtime::Php => vec![format!(
+                "php:{}-cli",
+                self.runtime_version.as_deref().unwrap_or("8.3")
+            )],
+            Runtime::Ruby => vec![format!(
+                "ruby:{}-slim",
+                self.runtime_version.as_deref().unwrap_or("3.3")
+            )],
+            Runtime::Java => {
+                let v = self.runtime_version.as_deref().unwrap_or("21");
+                vec![
+                    format!("eclipse-temurin:{v}-jdk"),
+                    format!("eclipse-temurin:{v}-jre"),
+                ]
+            }
+            Runtime::DotNet => vec![
+                "mcr.microsoft.com/dotnet/sdk:8.0".to_owned(),
+                "mcr.microsoft.com/dotnet/aspnet:8.0".to_owned(),
+            ],
             Runtime::Static => vec!["nginx:alpine".to_owned()],
         }
     }
@@ -1190,6 +1493,12 @@ impl Stack {
                 build = pm.run("build"),
                 prod_install = pm.prod_install(self.locked),
             ),
+            // The meta-frameworks: each builds a Node server and leaves it
+            // somewhere different. Split out because the shapes differ
+            // enough that inlining them buried the ordinary cases.
+            Framework::Nuxt | Framework::SvelteKit | Framework::Astro | Framework::Remix => {
+                self.meta_framework_dockerfile(pm, &base, &header)
+            }
             // A plain server: it may or may not have a build step, so the
             // start script is what runs and the build is left to the
             // developer to add if they need one.
@@ -1357,6 +1666,197 @@ impl Stack {
              CMD [\"/app\"]\n",
             header = self.header(),
             binary = self.build_target.as_deref().unwrap_or("app"),
+            port = self.port,
+        )
+    }
+
+    /// A Node meta-framework: builds a server and leaves it somewhere of
+    /// its own choosing.
+    ///
+    /// None of these output paths are guessable, and getting one wrong
+    /// fails at the end of a slow build with a path nobody in the project
+    /// ever wrote.
+    fn meta_framework_dockerfile(&self, pm: PackageManager, base: &str, header: &str) -> String {
+        let (output, entry) = match self.framework {
+            // Nitro's output is self-contained: it bundles its own
+            // dependencies, so the runtime stage needs nothing else.
+            Framework::Nuxt => (".output", ".output/server/index.mjs"),
+            // `adapter-node` emits `build/`, and unlike Nitro it
+            // expects `node_modules` to still be there.
+            Framework::SvelteKit => ("build", "build/index.js"),
+            Framework::Astro => ("dist", "dist/server/entry.mjs"),
+            _ => ("build", "build/server/index.js"),
+        };
+        // Nuxt is the only one that bundles its dependencies; the
+        // others still resolve from `node_modules` at runtime.
+        let deps = if self.framework == Framework::Nuxt {
+            String::new()
+        } else {
+            format!(
+                "COPY package.json {lock}* ./\n\
+                 RUN {mount} {prod}\n",
+                lock = pm.lockfile(),
+                mount = pm.cache_mount(),
+                prod = pm.prod_install(self.locked),
+            )
+        };
+        format!(
+            "{header}\n\
+             FROM {base} AS build\n\
+             WORKDIR /app\n\
+             COPY package.json {lock}* ./\n\
+             RUN {mount} {install}\n\
+             COPY . .\n\
+             RUN {build}\n\
+             \n\
+             FROM {base}\n\
+             WORKDIR /app\n\
+             ENV NODE_ENV=production HOST=0.0.0.0 PORT={port}\n\
+             {deps}\
+             COPY --from=build /app/{output} ./{output}\n\
+             EXPOSE {port}\n\
+             CMD [\"node\", \"{entry}\"]\n",
+            lock = pm.lockfile(),
+            mount = pm.cache_mount(),
+            install = pm.install(self.locked),
+            build = pm.run("build"),
+            port = self.port,
+        )
+    }
+
+    fn php_dockerfile(&self) -> String {
+        // PHP's built-in server, not php-fpm behind nginx. A preview
+        // environment is one process serving one branch for one team, and
+        // the two-container arrangement production wants buys nothing here
+        // while doubling what can break.
+        let (docroot, extras) = match self.framework {
+            Framework::Laravel | Framework::Symfony => ("public", true),
+            _ => (".", false),
+        };
+        let post = if extras {
+            // Laravel and Symfony both refuse to boot without a writable
+            // cache and a key; the second is generated because a preview
+            // environment has no secrets of its own by default.
+            "RUN if [ -f artisan ]; then php artisan key:generate --force || true; fi\n"
+        } else {
+            ""
+        };
+        format!(
+            "{header}\n\
+             FROM php:{version}-cli\n\
+             WORKDIR /app\n\
+             # `pdo_pgsql` because Oxid provisions a Postgres database per\n\
+             # branch — the one extension this product can predict a project\n\
+             # needing. Anything else needs a `Dockerfile`.\n\
+             # The headers are needed to compile the extension and never
+             # again. Dropping them in the same layer is what keeps them out\n\
+             # of the image — a later `apt-get purge` would only add a layer\n\
+             # that hides them.\n\
+             RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\\n\
+             \x20   apt-get update \\\n\
+             \x20   && apt-get install -y --no-install-recommends libpq-dev unzip \\\n\
+             \x20   && docker-php-ext-install pdo_pgsql \\\n\
+             \x20   && apt-get purge -y --auto-remove libpq-dev \\\n\
+             \x20   && apt-get install -y --no-install-recommends libpq5 \\\n\
+             \x20   && rm -rf /var/lib/apt/lists/*\n\
+             COPY --from=composer:2 /usr/bin/composer /usr/bin/composer\n\
+             COPY composer.json composer.lock* ./\n\
+             RUN --mount=type=cache,target=/root/.composer/cache \\\n\
+             \x20   composer install --no-dev --no-scripts --no-interaction --prefer-dist\n\
+             COPY . .\n\
+             RUN composer dump-autoload --optimize --no-interaction\n\
+             {post}\
+             EXPOSE {port}\n\
+             CMD [\"php\", \"-S\", \"0.0.0.0:{port}\", \"-t\", \"{docroot}\"]\n",
+            header = self.header(),
+            version = self.runtime_version.as_deref().unwrap_or("8.3"),
+            port = self.port,
+        )
+    }
+
+    fn ruby_dockerfile(&self) -> String {
+        format!(
+            "{header}\n\
+             FROM ruby:{version}-slim\n\
+             WORKDIR /app\n\
+             RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\\n\
+             \x20   apt-get update \\\n\
+             \x20   && apt-get install -y --no-install-recommends build-essential libpq-dev git \\\n\
+             \x20   && rm -rf /var/lib/apt/lists/*\n\
+             COPY Gemfile Gemfile.lock* ./\n\
+             RUN --mount=type=cache,target=/usr/local/bundle/cache \\\n\
+             \x20   bundle install\n\
+             COPY . .\n\
+             # A preview environment has no secret of its own, and Rails\n\
+             # will not boot in production without one.\n\
+             ENV RAILS_ENV=production RAILS_LOG_TO_STDOUT=1 RAILS_SERVE_STATIC_FILES=1\n\
+             EXPOSE {port}\n\
+             CMD [\"bundle\", \"exec\", \"rails\", \"server\", \"-b\", \"0.0.0.0\", \"-p\", \"{port}\"]\n",
+            header = self.header(),
+            version = self.runtime_version.as_deref().unwrap_or("3.3"),
+            port = self.port,
+        )
+    }
+
+    fn java_dockerfile(&self) -> String {
+        let version = self.runtime_version.as_deref().unwrap_or("21");
+        let gradle = self.build_target.as_deref() == Some("gradle");
+        // The wrapper, not a system Maven or Gradle: the version a project
+        // builds with is checked into it, and using another is how a build
+        // that works locally fails here.
+        let (build, artifact) = if gradle {
+            ("./gradlew --no-daemon bootJar", "build/libs/*.jar")
+        } else {
+            ("./mvnw -B -DskipTests package", "target/*.jar")
+        };
+        let cache = if gradle {
+            "--mount=type=cache,target=/root/.gradle"
+        } else {
+            "--mount=type=cache,target=/root/.m2"
+        };
+        format!(
+            "{header}\n\
+             FROM eclipse-temurin:{version}-jdk AS build\n\
+             WORKDIR /src\n\
+             COPY . .\n\
+             RUN chmod +x ./mvnw ./gradlew 2>/dev/null || true\n\
+             RUN {cache} {build}\n\
+             # One jar, at a path the runtime stage can name.\n\
+             RUN mkdir -p /out && cp {artifact} /out/app.jar\n\
+             \n\
+             # JRE, not JDK: the compiler is several hundred megabytes the\n\
+             # running service never uses.\n\
+             FROM eclipse-temurin:{version}-jre\n\
+             WORKDIR /app\n\
+             COPY --from=build /out/app.jar ./app.jar\n\
+             EXPOSE {port}\n\
+             CMD [\"java\", \"-jar\", \"app.jar\"]\n",
+            header = self.header(),
+            port = self.port,
+        )
+    }
+
+    fn dotnet_dockerfile(&self) -> String {
+        let name = self.build_target.as_deref().unwrap_or("App");
+        format!(
+            "{header}\n\
+             FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build\n\
+             WORKDIR /src\n\
+             COPY *.csproj ./\n\
+             RUN --mount=type=cache,target=/root/.nuget/packages dotnet restore\n\
+             COPY . .\n\
+             RUN --mount=type=cache,target=/root/.nuget/packages \\\n\
+             \x20   dotnet publish -c Release -o /out --no-restore\n\
+             \n\
+             FROM mcr.microsoft.com/dotnet/aspnet:8.0\n\
+             WORKDIR /app\n\
+             # Kestrel binds to localhost by default, which from outside the\n\
+             # container is nothing at all.\n\
+             ENV ASPNETCORE_URLS=http://0.0.0.0:{port}\n\
+             COPY --from=build /out ./\n\
+             EXPOSE {port}\n\
+             CMD [\"dotnet\", \"{name}.dll\"]\n",
+            header = self.header(),
             port = self.port,
         )
     }

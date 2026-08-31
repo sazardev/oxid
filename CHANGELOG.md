@@ -102,6 +102,18 @@ is the breaking position.
 - **Base images are fetched at registration**, in the background, so the
   first deploy of a project — the one someone is watching, having just wired
   up a webhook — does not begin with a several-hundred-megabyte download.
+- **The stack bank covers the web, not just JavaScript.** Added PHP
+  (Laravel, Symfony), Ruby (Rails), the JVM (Spring Boot, Maven and
+  Gradle), .NET (ASP.NET Core), and the JavaScript meta-frameworks — Nuxt,
+  SvelteKit, Astro and Remix — each with the server entry point it actually
+  emits, which is different for every one of them.
+
+  PHP serves from `public/`, not the repository root: serving the root
+  exposes `.env` and every source file to anyone who can reach the
+  environment. Verified — `composer.json` answers 404 from outside. The JVM
+  builds with the wrapper the project checked in and ships a JRE rather than
+  the JDK. ASP.NET sets `ASPNETCORE_URLS` because Kestrel binds to localhost
+  by default, which from outside a container is nothing at all.
 - **A repository can hold several services.** `repo_url` was `UNIQUE`, so
   "one project per repository" was a rule the schema enforced — right while
   a repository held one deployable thing, wrong the moment monorepos were

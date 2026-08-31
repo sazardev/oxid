@@ -855,3 +855,223 @@ fn a_next_app_without_a_public_directory_still_builds() {
         "the directory is created after it is copied\n{dockerfile}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// the wider web
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_javascript_meta_frameworks_are_told_apart() {
+    // Order matters here: a Nuxt app has `vite`, a SvelteKit app has
+    // `svelte`, and matching the generic one first would build every one of
+    // them as a static site with nothing to serve.
+    for (dep, expected, port) in [
+        ("nuxt", Framework::Nuxt, 3000),
+        ("@sveltejs/kit", Framework::SvelteKit, 3000),
+        ("@remix-run/node", Framework::Remix, 3000),
+    ] {
+        let package = format!(
+            r#"{{"devDependencies":{{"vite":"^5.0.0"}},"dependencies":{{"{dep}":"^1.0.0"}}}}"#
+        );
+        let stack = detect(&repo(&[("package.json", &package)])).unwrap();
+        assert_eq!(stack.framework, expected, "{dep}");
+        assert_eq!(stack.port, port, "{dep}");
+    }
+}
+
+#[test]
+fn astro_is_static_until_something_gives_it_a_server() {
+    // The two need entirely different images: one is nginx holding files,
+    // the other is a Node process.
+    let stat = detect(&repo(&[(
+        "package.json",
+        r#"{"dependencies":{"astro":"^4"}}"#,
+    )]))
+    .unwrap();
+    assert_eq!(stat.framework, Framework::SinglePageApp);
+    assert!(stat.dockerfile().contains("FROM nginx:alpine"));
+
+    let ssr = detect(&repo(&[(
+        "package.json",
+        r#"{"dependencies":{"astro":"^4","@astrojs/node":"^8"}}"#,
+    )]))
+    .unwrap();
+    assert_eq!(ssr.framework, Framework::Astro);
+    let dockerfile = ssr.dockerfile();
+    assert!(dockerfile.contains("dist/server/entry.mjs"), "{dockerfile}");
+    assert!(!dockerfile.contains("nginx"), "{dockerfile}");
+}
+
+#[test]
+fn each_meta_framework_runs_the_entry_point_it_actually_emits() {
+    // None of these are guessable, and getting one wrong fails at the end
+    // of a slow build with a path nobody in the project ever wrote.
+    for (dep, entry) in [
+        ("nuxt", ".output/server/index.mjs"),
+        ("@sveltejs/kit", "build/index.js"),
+        ("@remix-run/node", "build/server/index.js"),
+    ] {
+        let package = format!(r#"{{"dependencies":{{"{dep}":"^1.0.0"}}}}"#);
+        let dockerfile = detect(&repo(&[("package.json", &package)]))
+            .unwrap()
+            .dockerfile();
+        assert!(
+            dockerfile.contains(&format!("CMD [\"node\", \"{entry}\"]")),
+            "{dep}: {dockerfile}"
+        );
+    }
+
+    // Nuxt's Nitro output bundles its dependencies; the others still
+    // resolve from `node_modules`, so the runtime stage has to install.
+    let nuxt = detect(&repo(&[(
+        "package.json",
+        r#"{"dependencies":{"nuxt":"^3"}}"#,
+    )]))
+    .unwrap()
+    .dockerfile();
+    let nuxt_runtime = nuxt.rsplit("FROM ").next().unwrap();
+    assert!(!nuxt_runtime.contains("install"), "{nuxt}");
+
+    let kit = detect(&repo(&[(
+        "package.json",
+        r#"{"dependencies":{"@sveltejs/kit":"^2"}}"#,
+    )]))
+    .unwrap()
+    .dockerfile();
+    let kit_runtime = kit.rsplit("FROM ").next().unwrap();
+    assert!(kit_runtime.contains("install"), "{kit}");
+}
+
+#[test]
+fn laravel_and_symfony_are_recognised_and_served_from_public() {
+    // Serving the repository root instead of `public/` exposes `.env` and
+    // every source file to anyone who can reach the environment.
+    for (package, expected) in [
+        ("laravel/framework", Framework::Laravel),
+        ("symfony/framework-bundle", Framework::Symfony),
+    ] {
+        let composer = format!(r#"{{"require":{{"php":"^8.2","{package}":"^11.0"}}}}"#);
+        let stack = detect(&repo(&[
+            ("composer.json", &composer),
+            ("composer.lock", ""),
+        ]))
+        .unwrap();
+        assert_eq!(stack.runtime, Runtime::Php, "{package}");
+        assert_eq!(stack.framework, expected, "{package}");
+        assert_eq!(stack.runtime_version.as_deref(), Some("8.2"), "{package}");
+        let dockerfile = stack.dockerfile();
+        assert!(dockerfile.contains("FROM php:8.2-cli"), "{dockerfile}");
+        assert!(dockerfile.contains("-t\", \"public"), "{dockerfile}");
+        assert!(
+            dockerfile.contains("--no-dev"),
+            "dev dependencies ship\n{dockerfile}"
+        );
+        // The headers compile the extension and are never needed again.
+        // Dropping them in the same layer is what keeps them out of the
+        // image — a later purge would only add a layer that hides them.
+        assert!(
+            dockerfile.contains("purge -y --auto-remove libpq-dev"),
+            "{dockerfile}"
+        );
+        assert!(dockerfile.contains("libpq5"), "{dockerfile}");
+    }
+}
+
+#[test]
+fn rails_is_recognised_and_a_plain_gemfile_is_not() {
+    let gemfile = "source 'https://rubygems.org'\nruby '3.3.4'\ngem 'rails', '~> 7.1'\n";
+    let stack = detect(&repo(&[("Gemfile", gemfile), ("Gemfile.lock", "")])).unwrap();
+    assert_eq!(stack.runtime, Runtime::Ruby);
+    assert_eq!(stack.framework, Framework::Rails);
+    assert_eq!(stack.runtime_version.as_deref(), Some("3.3.4"));
+    let dockerfile = stack.dockerfile();
+    assert!(dockerfile.contains("FROM ruby:3.3.4-slim"), "{dockerfile}");
+    // Rails will not boot in production without these, and a preview
+    // environment has none of its own.
+    assert!(dockerfile.contains("RAILS_LOG_TO_STDOUT"), "{dockerfile}");
+    assert!(dockerfile.contains("-b\", \"0.0.0.0"), "{dockerfile}");
+
+    // A Gemfile describes a library as often as a web application.
+    assert!(detect(&repo(&[("Gemfile", "source 'x'\ngem 'rspec'\n")])).is_none());
+}
+
+#[test]
+fn spring_boot_builds_with_the_wrapper_the_project_checked_in() {
+    // Using a system Maven or Gradle is how a build that works locally
+    // fails here: the version a project builds with is checked into it.
+    let pom = "<project><properties><java.version>21</java.version></properties>\n               <dependency><artifactId>spring-boot-starter-web</artifactId></dependency></project>";
+    let maven = detect(&repo(&[("pom.xml", pom)])).unwrap();
+    assert_eq!(maven.runtime, Runtime::Java);
+    assert_eq!(maven.framework, Framework::SpringBoot);
+    assert_eq!(maven.runtime_version.as_deref(), Some("21"));
+    let dockerfile = maven.dockerfile();
+    assert!(dockerfile.contains("./mvnw"), "{dockerfile}");
+    // JRE at runtime: the compiler is hundreds of megabytes the service
+    // never uses.
+    assert!(
+        dockerfile.contains("FROM eclipse-temurin:21-jre"),
+        "{dockerfile}"
+    );
+    assert!(
+        !dockerfile.rsplit("FROM ").next().unwrap().contains("jdk"),
+        "{dockerfile}"
+    );
+
+    let gradle = detect(&repo(&[(
+        "build.gradle",
+        "plugins { id 'org.springframework.boot' version '3.3.0' }\njava { sourceCompatibility = 17 }",
+    )]))
+    .unwrap();
+    assert_eq!(gradle.runtime_version.as_deref(), Some("17"));
+    assert!(
+        gradle.dockerfile().contains("./gradlew"),
+        "{}",
+        gradle.dockerfile()
+    );
+
+    // A JVM build file with no web framework is a library or a CLI.
+    assert!(detect(&repo(&[("pom.xml", "<project></project>")])).is_none());
+}
+
+#[test]
+fn a_dotnet_project_runs_the_assembly_its_file_is_named_after() {
+    // `dotnet publish` names the DLL after the project file, so the wrong
+    // name is a container that starts and immediately exits.
+    let stack = detect(&repo(&[(
+        "Billing.Api.csproj",
+        "<Project Sdk=\"Microsoft.NET.Sdk.Web\" />",
+    )]))
+    .unwrap();
+    assert_eq!(stack.runtime, Runtime::DotNet);
+    assert_eq!(stack.build_target.as_deref(), Some("Billing.Api"));
+    let dockerfile = stack.dockerfile();
+    assert!(
+        dockerfile.contains("CMD [\"dotnet\", \"Billing.Api.dll\"]"),
+        "{dockerfile}"
+    );
+    // Kestrel binds to localhost by default, which from outside the
+    // container is nothing at all.
+    assert!(
+        dockerfile.contains("ASPNETCORE_URLS=http://0.0.0.0:8080"),
+        "{dockerfile}"
+    );
+    // Runtime image, not the SDK.
+    assert!(dockerfile.contains("dotnet/aspnet:8.0"), "{dockerfile}");
+}
+
+#[test]
+fn node_still_wins_over_a_language_that_only_tools_the_repository() {
+    // A Node service with a Gemfile for its docs tooling, or a composer.json
+    // for a linter, still deploys as Node. Detection order is what pins it,
+    // and this is the test that would catch reordering the list.
+    let stack = detect(&repo(&[
+        ("package.json", NEST_PACKAGE),
+        ("Gemfile", "source 'x'\ngem 'rails'\n"),
+        (
+            "composer.json",
+            r#"{"require":{"laravel/framework":"^11"}}"#,
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(stack.runtime, Runtime::Node);
+}

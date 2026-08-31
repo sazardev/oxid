@@ -131,6 +131,34 @@ The result is stored on the project (`detected_stack`, migration `0013`) and
 shown as a tag in the dashboard and an `oxid ps` column. Null is the normal
 case: the project answered for itself.
 
+### What is recognised
+
+Frontend and backend, by what the running web actually uses:
+
+| Runtime | Frameworks |
+|---|---|
+| Node | NestJS, Next.js, Nuxt, SvelteKit, Astro, Remix, SPA (Vite/CRA/Angular), plain servers |
+| Go | Fiber, Gin, Echo |
+| Python | FastAPI, Django, Flask |
+| PHP | Laravel, Symfony |
+| Ruby | Rails |
+| JVM | Spring Boot (Maven and Gradle) |
+| .NET | ASP.NET Core |
+| Rust | Axum, Actix |
+| — | a directory of static files |
+
+Detection order is load-bearing and tested: Node first, so a service whose
+docs tooling has a `Gemfile` still deploys as Node; the meta-frameworks
+before the generic SPA rule, since a Nuxt app also has `vite`; static last,
+because almost every repository has an `index.html` somewhere. Astro is a
+SPA until `@astrojs/node` makes it a server — the two need entirely
+different images.
+
+Two spellings caught by tests rather than by users: Spring Boot is
+`spring-boot-*` in Maven and `org.springframework.boot` in Gradle, and a
+`.csproj` names the assembly `dotnet publish` produces, so the file's own
+name is what the runtime stage must run.
+
 ### Build speed
 
 Every generated Dockerfile uses `RUN --mount=type=cache` for its
