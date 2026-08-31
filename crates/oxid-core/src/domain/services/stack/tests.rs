@@ -384,6 +384,95 @@ fn the_package_manager_reaches_the_generated_build() {
 }
 
 #[test]
+fn a_project_without_a_lockfile_gets_an_install_that_can_actually_run() {
+    // `npm ci` does not warn about a missing package-lock.json — it refuses
+    // to run. Defaulting to it meant every repository that does not commit
+    // its lockfile got a build that could not start, which is a large share
+    // of them. Found by building a real Vite app, not by reading the code.
+    let unlocked = detect(&repo(&[("package.json", VITE_PACKAGE)])).unwrap();
+    assert!(!unlocked.locked);
+    let dockerfile = unlocked.dockerfile();
+    assert!(
+        dockerfile.contains("npm install"),
+        "still emits an install that cannot run without a lockfile\n{dockerfile}"
+    );
+    assert!(!dockerfile.contains("npm ci"), "{dockerfile}");
+
+    // With a lockfile the reproducible variant is right, and is what
+    // guarantees two builds of the same commit install the same tree.
+    let locked = detect(&repo(&[
+        ("package.json", VITE_PACKAGE),
+        ("package-lock.json", "{}"),
+    ]))
+    .unwrap();
+    assert!(locked.locked);
+    assert!(locked.dockerfile().contains("npm ci"));
+
+    for (lock, frozen) in [
+        ("pnpm-lock.yaml", "--frozen-lockfile"),
+        ("yarn.lock", "--immutable"),
+    ] {
+        let with = detect(&repo(&[("package.json", VITE_PACKAGE), (lock, "")]))
+            .unwrap()
+            .dockerfile();
+        assert!(with.contains(frozen), "{lock}: {with}");
+    }
+}
+
+#[test]
+fn the_go_build_target_comes_from_where_main_actually_is() {
+    // `go build -o app ./...` breaks on any module with more than one
+    // `main` package: "cannot write multiple packages to a single output".
+    // Where the entry point is, is visible from the repository.
+    let at_root = detect(&repo(&[
+        ("go.mod", "module x\n\ngo 1.23\n"),
+        ("main.go", "package main"),
+    ]))
+    .unwrap();
+    assert_eq!(at_root.build_target.as_deref(), Some("."));
+    assert!(
+        at_root.dockerfile().contains("-o /out/app .\n"),
+        "{}",
+        at_root.dockerfile()
+    );
+
+    // No `main.go` at the root: the module may hold several binaries under
+    // `cmd/`, so the whole tree is left to `go build`, whose own error says
+    // which to pick.
+    let elsewhere = detect(&repo(&[("go.mod", "module x\n\ngo 1.23\n")])).unwrap();
+    assert_eq!(elsewhere.build_target, None);
+    assert!(elsewhere.dockerfile().contains("./..."));
+}
+
+#[test]
+fn the_rust_binary_is_named_from_the_manifest_not_assumed() {
+    // Cargo names the binary after the package. Assuming `app` meant the
+    // generated build failed for every crate not called `app` — which is
+    // all of them — and it failed after the slowest step in the build.
+    let cargo = "[package]\nname = \"billing-worker\"\nversion = \"0.1.0\"\n\n[dependencies]\naxum = \"0.7\"\n";
+    let stack = detect(&repo(&[("Cargo.toml", cargo)])).unwrap();
+    assert_eq!(stack.build_target.as_deref(), Some("billing-worker"));
+    assert!(
+        stack
+            .dockerfile()
+            .contains("/src/target/release/billing-worker"),
+        "{}",
+        stack.dockerfile()
+    );
+
+    // `name` also appears under `[[bin]]` and in dependency tables; only
+    // the one under `[package]` is the crate's own.
+    let tricky = "[package]\nname = \"gateway\"\n\n[[bin]]\nname = \"helper\"\n";
+    assert_eq!(
+        detect(&repo(&[("Cargo.toml", tricky)]))
+            .unwrap()
+            .build_target
+            .as_deref(),
+        Some("gateway")
+    );
+}
+
+#[test]
 fn the_detected_runtime_version_is_the_one_the_image_is_built_on() {
     let node = detect(&repo(&[("package.json", NEST_PACKAGE), (".nvmrc", "20")]))
         .unwrap()

@@ -124,27 +124,43 @@ impl PackageManager {
     }
 
     /// The install command for a build, which is not the one a developer
-    /// runs. Each of these is the reproducible variant: it installs exactly
-    /// what the lockfile pins and fails rather than updating it, so a
-    /// preview builds the same tree twice.
+    /// runs.
+    ///
+    /// With a lockfile these are the reproducible variants: they install
+    /// exactly what is pinned and fail rather than updating it, so a preview
+    /// builds the same tree twice. Without one they must not be — `npm ci`
+    /// does not merely warn about a missing `package-lock.json`, it refuses
+    /// to run, and a repository that does not commit its lockfile is common
+    /// enough that generating a build which cannot start is the wrong
+    /// default. Reproducibility is worth having; it is not worth refusing to
+    /// deploy over.
     #[must_use]
-    fn frozen_install(self) -> &'static str {
-        match self {
-            Self::Npm => "npm ci",
-            Self::Pnpm => "corepack enable && pnpm install --frozen-lockfile",
-            Self::Yarn => "corepack enable && yarn install --immutable",
-            Self::Bun => "bun install --frozen-lockfile",
+    fn install(self, locked: bool) -> &'static str {
+        match (self, locked) {
+            (Self::Npm, true) => "npm ci",
+            (Self::Npm, false) => "npm install",
+            (Self::Pnpm, true) => "corepack enable && pnpm install --frozen-lockfile",
+            (Self::Pnpm, false) => "corepack enable && pnpm install",
+            (Self::Yarn, true) => "corepack enable && yarn install --immutable",
+            (Self::Yarn, false) => "corepack enable && yarn install",
+            (Self::Bun, true) => "bun install --frozen-lockfile",
+            (Self::Bun, false) => "bun install",
         }
     }
 
     /// Installing only what production needs, for the stage that ships.
     #[must_use]
-    fn prod_install(self) -> &'static str {
-        match self {
-            Self::Npm => "npm ci --omit=dev",
-            Self::Pnpm => "corepack enable && pnpm install --frozen-lockfile --prod",
-            Self::Yarn => "corepack enable && yarn workspaces focus --production",
-            Self::Bun => "bun install --frozen-lockfile --production",
+    fn prod_install(self, locked: bool) -> &'static str {
+        match (self, locked) {
+            (Self::Npm, true) => "npm ci --omit=dev",
+            (Self::Npm, false) => "npm install --omit=dev",
+            (Self::Pnpm, true) => "corepack enable && pnpm install --frozen-lockfile --prod",
+            (Self::Pnpm, false) => "corepack enable && pnpm install --prod",
+            // `workspaces focus` needs a resolved lockfile to focus against.
+            (Self::Yarn, true) => "corepack enable && yarn workspaces focus --production",
+            (Self::Yarn, false) => "corepack enable && yarn install --production",
+            (Self::Bun, true) => "bun install --frozen-lockfile --production",
+            (Self::Bun, false) => "bun install --production",
         }
     }
 
@@ -276,11 +292,26 @@ pub struct Stack {
     /// is used.
     pub runtime_version: Option<String>,
     pub package_manager: Option<PackageManager>,
+    /// Whether a lockfile was actually found. Separate from
+    /// `package_manager`, which falls back to npm so there is always
+    /// *something* to run: without this the generated build would use the
+    /// frozen install commands, and `npm ci` refuses to run at all when
+    /// there is no `package-lock.json`.
+    #[serde(default)]
+    pub locked: bool,
     pub port: u16,
     pub confidence: Confidence,
     /// The specific files this conclusion was drawn from, so a wrong guess
     /// can be argued with rather than just disbelieved.
     pub evidence: Vec<String>,
+    /// For compiled runtimes, the package path to build.
+    ///
+    /// `go build -o app ./...` looks tidy and breaks on any module with
+    /// more than one `main` — "cannot write multiple packages to a single
+    /// output". Where the entry point actually is, is visible from the
+    /// repository, so it is read rather than assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_target: Option<String>,
 }
 
 impl Stack {
@@ -373,6 +404,8 @@ fn detect_node(manifest: &RepoManifest) -> Option<Stack> {
         framework,
         runtime_version,
         package_manager: package_manager.or(Some(PackageManager::Npm)),
+        locked: package_manager.is_some(),
+        build_target: None,
         port: framework.default_port(),
         confidence,
         evidence,
@@ -450,11 +483,23 @@ fn detect_go(manifest: &RepoManifest) -> Option<Stack> {
             .then(|| v.to_owned())
     });
 
+    // `main.go` beside `go.mod` is the overwhelmingly common shape of a
+    // single service; `cmd/` is the other convention, and there the module
+    // may hold several binaries, so the whole tree is left to `go build`
+    // and its own error explains what to pick.
+    let build_target = if manifest.has("main.go") {
+        Some(".".to_owned())
+    } else {
+        None
+    };
+
     Some(Stack {
         runtime: Runtime::Go,
         framework,
         runtime_version,
         package_manager: None,
+        locked: manifest.has("go.sum"),
+        build_target,
         port: framework.default_port(),
         confidence: if framework == Framework::GoServer {
             Confidence::Likely
@@ -506,6 +551,8 @@ fn detect_python(manifest: &RepoManifest) -> Option<Stack> {
         framework,
         runtime_version: python_version(&lower),
         package_manager: None,
+        locked: false,
+        build_target: None,
         port: framework.default_port(),
         confidence: Confidence::Certain,
         evidence,
@@ -541,11 +588,18 @@ fn detect_rust(manifest: &RepoManifest) -> Option<Stack> {
         Framework::RustServer
     };
 
+    // Cargo names the binary after the package, so the final stage has to
+    // copy that exact path. Assuming `app` meant the generated build failed
+    // for every crate not called `app` — which is all of them.
+    let build_target = cargo_package_name(cargo);
+
     Some(Stack {
         runtime: Runtime::Rust,
         framework,
         runtime_version: None,
         package_manager: None,
+        locked: manifest.has("Cargo.lock"),
+        build_target,
         port: framework.default_port(),
         confidence: if framework == Framework::RustServer {
             Confidence::Likely
@@ -554,6 +608,32 @@ fn detect_rust(manifest: &RepoManifest) -> Option<Stack> {
         },
         evidence,
     })
+}
+
+/// The `[package] name` from a Cargo manifest, which is what the compiled
+/// binary is called.
+///
+/// Read rather than assumed: the final stage copies one exact path, and
+/// getting it wrong fails the build after the slowest step in it.
+fn cargo_package_name(cargo: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in cargo.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            // `[package]` only — `name` also appears under `[[bin]]`,
+            // `[lib]` and dependency tables.
+            in_package = line == "[package]";
+            continue;
+        }
+        if in_package && let Some(rest) = line.strip_prefix("name") {
+            let value = rest.trim_start().strip_prefix('=')?.trim();
+            let name = value.trim_matches(['"', '\''].as_slice());
+            if !name.is_empty() {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +646,8 @@ fn detect_static(manifest: &RepoManifest) -> Option<Stack> {
         framework: Framework::None,
         runtime_version: None,
         package_manager: None,
+        locked: false,
+        build_target: None,
         port: 80,
         confidence: Confidence::Likely,
         evidence: vec!["index.html".to_owned()],
@@ -654,7 +736,7 @@ impl Stack {
                  COPY --from=build /app/dist* /app/build* /usr/share/nginx/html/\n\
                  EXPOSE {port}\n",
                 lock = pm.lockfile(),
-                install = pm.frozen_install(),
+                install = pm.install(self.locked),
                 build = pm.run("build"),
             ),
             // Next.js in standalone output mode ships a self-contained
@@ -681,7 +763,7 @@ impl Stack {
                  EXPOSE {port}\n\
                  CMD [\"node\", \"server.js\"]\n",
                 lock = pm.lockfile(),
-                install = pm.frozen_install(),
+                install = pm.install(self.locked),
                 build = pm.run("build"),
                 pm_name = pm.as_str(),
             ),
@@ -705,9 +787,9 @@ impl Stack {
                  EXPOSE {port}\n\
                  CMD [\"node\", \"dist/main.js\"]\n",
                 lock = pm.lockfile(),
-                install = pm.frozen_install(),
+                install = pm.install(self.locked),
                 build = pm.run("build"),
-                prod_install = pm.prod_install(),
+                prod_install = pm.prod_install(self.locked),
             ),
             // A plain server: it may or may not have a build step, so the
             // start script is what runs and the build is left to the
@@ -723,7 +805,7 @@ impl Stack {
                  EXPOSE {port}\n\
                  CMD [\"{pm_name}\", \"start\"]\n",
                 lock = pm.lockfile(),
-                prod_install = pm.prod_install(),
+                prod_install = pm.prod_install(self.locked),
                 pm_name = pm.as_str(),
             ),
         }
@@ -742,7 +824,7 @@ impl Stack {
              COPY . .\n\
              # CGO off: without it the binary links against musl and will not\n\
              # run in the scratch stage below.\n\
-             RUN CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o /out/app ./...\n\
+             RUN CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o /out/app {target}\n\
              \n\
              FROM alpine:latest\n\
              RUN apk add --no-cache ca-certificates\n\
@@ -751,6 +833,7 @@ impl Stack {
              CMD [\"/app\"]\n",
             header = self.header(),
             version = self.runtime_version.as_deref().unwrap_or("1.23"),
+            target = self.build_target.as_deref().unwrap_or("./..."),
             port = self.port,
         )
     }
@@ -809,12 +892,11 @@ impl Stack {
              FROM debian:stable-slim\n\
              RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \\\n\
              \x20   && rm -rf /var/lib/apt/lists/*\n\
-             # The binary takes the package name, which Oxid does not read\n\
-             # from Cargo.toml — adjust this line if yours differs.\n\
-             COPY --from=build /src/target/release/app /app\n\
+             COPY --from=build /src/target/release/{binary} /app\n\
              EXPOSE {port}\n\
              CMD [\"/app\"]\n",
             header = self.header(),
+            binary = self.build_target.as_deref().unwrap_or("app"),
             port = self.port,
         )
     }

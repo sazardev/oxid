@@ -75,6 +75,13 @@ is the breaking position.
   context and never the checkout, and a repository Oxid cannot identify gets
   the same "write a Dockerfile" error as before rather than a build that
   fails halfway through.
+  Verified by building and serving one real repository per stack through
+  Docker. That is how three defects surfaced that no assertion on generated
+  text could have: `npm ci` refuses to run without a lockfile, `go build -o
+  app ./...` breaks on a module with more than one `main`, and the Rust
+  stage copied a binary path Cargo names after the package. Generated image
+  sizes: Go 24.5MB, SPA and static 94.5MB, Rust 136MB, FastAPI 209MB, Nest
+  215MB, Express 246MB.
 - **The detected stack is tracked and shown**, as a dashboard tag with the
   evidence behind it (`Detected from package.json, @nestjs/core`), a column
   in `oxid ps`, and a `detected_stack` field on the project in the API.

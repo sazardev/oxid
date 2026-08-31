@@ -118,6 +118,15 @@ Load-bearing, in order of how easy each is to undo:
   is testable without a filesystem, a network or Docker, and the adapter
   only reads files.
 
+Verified by deploying one real repository per stack through Docker, not by
+asserting on generated text — which is how three defects surfaced that the
+unit tests could not see: `npm ci` refuses to run without a lockfile (and
+plenty of repositories do not commit one), `go build -o app ./...` breaks on
+any module with more than one `main`, and the Rust stage copied
+`target/release/app` for a binary Cargo names after the package. Sizes of
+the generated images: Go 24.5MB, SPA/static 94.5MB, Rust 136MB, FastAPI
+209MB, Nest 215MB, Express 246MB.
+
 The result is stored on the project (`detected_stack`, migration `0013`) and
 shown as a tag in the dashboard and an `oxid ps` column. Null is the normal
 case: the project answered for itself.
