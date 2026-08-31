@@ -909,6 +909,17 @@ async fn register_project(client: &Client, base: &str) -> Result<Value, CliError
             ));
             register_project_by_url(client, base, &url, None).await
         }
+        // The daemon could not see the path and there is no `origin` to fall
+        // back to. Passing git2's `failed to resolve path … class=Os (2)`
+        // through says nothing a person can act on, and against a
+        // containerized daemon — what the one-command install sets up —
+        // this is the ordinary case rather than an exotic one.
+        Err(RegisterFailure::Rejected { body, .. }) if body.contains(&repo_dir) => Err(format!(
+            "the daemon cannot see {repo_dir}, and this checkout has no `origin` to register \
+             instead — it runs in a container and has no view of your filesystem. Give it the \
+             repository URL: oxid up <branch> --repo <url>"
+        )
+        .into()),
         Err(RegisterFailure::Rejected { status, body }) => {
             Err(response_error(&body, status, "project registration failed"))
         }

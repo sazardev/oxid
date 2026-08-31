@@ -48,6 +48,52 @@ impl RepoUrl {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The repository this URL points at, independent of how it is spelled.
+    ///
+    /// Two URLs are the same repository when their `host/path` match once
+    /// the scheme, any credentials, a trailing `.git` and surrounding
+    /// slashes are removed, compared case-insensitively.
+    ///
+    /// This exists because a team spells the same repository several ways
+    /// and every one of them is correct. An operator registers
+    /// `https://github.com/org/app.git`; a developer's clone says
+    /// `git@github.com:org/app.git` because they use SSH; a script drops
+    /// the `.git`. Comparing the raw strings makes those three different
+    /// projects, which in practice meant a developer's `oxid up` could not
+    /// find the project their own team had registered — it tried to create
+    /// a second one and was refused for lacking permission to.
+    ///
+    /// The *stored* URL is still the one registration was given, because
+    /// that is the one the daemon has to clone from: a developer's SSH
+    /// remote usually needs a key the daemon does not have. Identity is for
+    /// recognising a repository, never for fetching it.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        let rest = self.0.split_once("://").map_or(self.0.as_str(), |(_, r)| r);
+        // Credentials in the authority (`user:pass@host`, `git@host`) are
+        // not part of which repository this is.
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        // scp-style (`host:org/repo`) separates host and path with `:`,
+        // everything else with `/`.
+        let (host, path) = match rest.find(['/', ':']) {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => (rest, ""),
+        };
+        format!(
+            "{}/{}",
+            host.to_ascii_lowercase(),
+            path.trim_matches('/')
+                .trim_end_matches(".git")
+                .to_ascii_lowercase()
+        )
+    }
+
+    /// Whether both URLs name the same repository. See [`Self::identity`].
+    #[must_use]
+    pub fn same_repository(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
 }
 
 impl fmt::Display for RepoUrl {
@@ -175,6 +221,58 @@ impl From<Ttl> for String {
 
 #[cfg(test)]
 mod tests {
+    use super::RepoUrl as _TestRepoUrl;
+
+    fn url(s: &str) -> _TestRepoUrl {
+        _TestRepoUrl::parse(s).unwrap()
+    }
+
+    /// The case that made this necessary: an operator registers over HTTPS,
+    /// a developer's clone speaks SSH, and both are the same repository.
+    #[test]
+    fn the_same_repository_spelled_differently_is_recognised() {
+        let https = url("https://github.com/org/app.git");
+        for other in [
+            "https://github.com/org/app",
+            "https://github.com/org/app/",
+            "ssh://git@github.com/org/app.git",
+            "git://github.com/org/app.git",
+            "https://GitHub.com/Org/App.git",
+            "https://token:x-oauth-basic@github.com/org/app.git",
+        ] {
+            assert!(
+                https.same_repository(&url(other)),
+                "`{other}` should be the same repository as `{https}`"
+            );
+        }
+    }
+
+    #[test]
+    fn different_repositories_stay_different() {
+        let app = url("https://github.com/org/app.git");
+        for other in [
+            "https://github.com/org/app-api.git",
+            "https://github.com/other/app.git",
+            // Same path on a different host is a different repository —
+            // a self-hosted mirror is not the origin.
+            "https://gitlab.com/org/app.git",
+        ] {
+            assert!(
+                !app.same_repository(&url(other)),
+                "`{other}` must not match `{app}`"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_never_replaces_the_stored_url() {
+        // The daemon has to clone from what registration was given: a
+        // developer's SSH remote usually needs a key it does not have.
+        let u = url("https://github.com/org/app.git");
+        assert_eq!(u.as_str(), "https://github.com/org/app.git");
+        assert_eq!(u.identity(), "github.com/org/app");
+    }
+
     use super::*;
 
     #[test]

@@ -889,6 +889,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 evidence = ?stack.evidence,
                 "no Dockerfile in the build context; generated one from the detected stack"
             );
+            // Record what was detected, if registration did not already.
+            //
+            // Registration only detects when the repository said nothing at
+            // all, so a project with an `oxid.toml` but no Dockerfile — a
+            // perfectly ordinary combination — had its stack detected here,
+            // used to build the image, and then thrown away. The dashboard
+            // tag and the `oxid ps` column stayed empty for exactly the
+            // projects Oxid was auto-building, which is where the label is
+            // most worth having.
+            //
+            // Best-effort: this is a label. Failing to store it must never
+            // fail a deploy that has already produced a working image.
+            if project.detected_stack.is_none() {
+                let mut labelled = project.clone();
+                labelled.detected_stack = Some(stack.clone());
+                if let Err(e) = ProjectStore::update(&self.store, &labelled).await {
+                    tracing::debug!(error = %e, "could not record the detected stack");
+                }
+            }
         }
 
         let build = BuildSpec {

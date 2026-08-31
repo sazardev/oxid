@@ -372,8 +372,16 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         &self,
         repo_url: &RepoUrl,
     ) -> Result<Option<Project>, RepositoryError> {
+        // Compared by repository *identity*, not by the raw string: a team
+        // spells the same repository several ways and every one is correct.
+        // An operator registers `https://github.com/org/app.git`, a
+        // developer's clone says `git@github.com:org/app.git`, a script
+        // drops the `.git`. Exact-string matching made those three separate
+        // projects, so a developer's `oxid up` could not find the project
+        // their own team had registered: it tried to create a second one
+        // and was refused for lacking permission to.
         for project in self.store.list().await? {
-            if &project.repo_url == repo_url {
+            if project.repo_url.same_repository(repo_url) {
                 return Ok(Some(project));
             }
         }

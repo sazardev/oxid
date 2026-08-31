@@ -1984,7 +1984,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "oxid-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "oxid-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures-core",
  "serde",
@@ -2013,7 +2013,7 @@ dependencies = [
 
 [[package]]
 name = "oxid-daemon"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "arc-swap",

@@ -4,6 +4,46 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
+## [0.4.1] - 2026-08-31
+
+Five defects found by installing the published v0.4.0 bundle on a real
+Docker host and using it the way a team would: an operator registering a
+repository, a developer deploying from their own clone, webhooks, roles,
+secrets and scale-to-zero. Two of them affected everyone.
+
+### Fixed
+
+- **A developer could not use the CLI against their team's project.**
+  Projects were matched by comparing repository URLs as raw strings, so the
+  operator's `https://github.com/org/app.git` and the developer's
+  `git@github.com:org/app.git` were different repositories. `oxid up` fell
+  through to *creating* a project and was refused — a 403 about registration
+  permissions, for someone who only wanted to deploy a branch of a project
+  that already existed. `RepoUrl::identity` now compares `host/path` with
+  the scheme, any credentials, a trailing `.git` and surrounding slashes
+  removed, case-insensitively. A different host is still a different
+  repository: a mirror is not the origin. The *stored* URL is untouched,
+  because that is the one the daemon clones from — a developer's SSH remote
+  usually needs a key the daemon does not have.
+- **`install.sh` printed `origin: command not found` in the middle of its
+  summary**, and dropped the word it was explaining. The heredoc has to be
+  unquoted for `${API_TOKEN}` to expand, which makes backticks in it command
+  substitution.
+- **The installer's Dashboard line still said `127.0.0.1`** while the
+  webhook line two rows below it printed the host's routable address — a
+  leftover from when the port was loopback-only.
+- **A detected stack was used to build and then thrown away.** Detection at
+  registration only runs when the repository said nothing at all, so a
+  project with an `oxid.toml` but no Dockerfile — an ordinary combination —
+  had its stack detected at deploy time, used to generate the image, and
+  never recorded. The dashboard tag and the `oxid ps` column stayed empty for
+  exactly the projects Oxid was auto-building. Storing it is best-effort: a
+  label must never fail a deploy that already produced a working image.
+- **A checkout with no `origin` got git2's raw text.** `failed to resolve
+  path '…': No such file or directory; class=Os (2)` tells a developer
+  nothing, and against a containerized daemon — what the one-command install
+  sets up — it is the ordinary case. It now says what to pass instead.
+
 ## [0.4.0] - 2026-08-31
 
 A release about the two things between Oxid and a server a devops hands to a

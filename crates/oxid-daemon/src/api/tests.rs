@@ -4506,3 +4506,80 @@ async fn whoami_needs_a_credential_but_no_particular_power() {
         json!(["read"])
     );
 }
+
+/// The shape that made a whole team unable to use the CLI: an operator
+/// registers the repository over HTTPS, a developer's clone speaks SSH, and
+/// `oxid up` resolves the project by the URL its own checkout reports.
+///
+/// Matching raw strings made those two different repositories, so the
+/// developer's scoped credential fell through to *creating* a project and
+/// was refused for lacking permission — a 403 about registration, for
+/// someone who only wanted to deploy a branch of a project that already
+/// existed.
+#[tokio::test]
+async fn a_developer_resolves_the_project_however_their_clone_spells_the_url() {
+    // Registration by URL clones, so the fake git needs a repository to
+    // hand back — same setup as the scoped-resolution test above.
+    let repo = repo_dir_with_config();
+    let app = test_app_with_git_and_token(FakeGit::at(repo.path()), Some("master-secret")).await;
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/org/app.git" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let project_id = serde_json::from_slice::<Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+
+    let dev = mint_token(
+        &app,
+        json!({ "name": "juan", "projects": [project_id], "role": "developer" }),
+    )
+    .await;
+
+    for spelling in [
+        "git@github.com:org/app.git",
+        "ssh://git@github.com/org/app.git",
+        "https://github.com/org/app",
+        "https://GitHub.com/org/app.git/",
+    ] {
+        let (status, body) = json_request_with_auth(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_url": spelling }),
+            Some(&dev),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "`{spelling}` should resolve to the existing project, got {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["id"]
+                .as_u64()
+                .unwrap(),
+            project_id,
+            "`{spelling}` resolved to a different project"
+        );
+    }
+
+    // And a genuinely different repository is still refused, so this did not
+    // turn into "any URL resolves to something".
+    let (status, _) = json_request_with_auth(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_url": "https://github.com/org/other.git" }),
+        Some(&dev),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

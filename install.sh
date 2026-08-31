@@ -375,13 +375,13 @@ EOF
 
 [+] Oxid is up. Everything below is ready to use — nothing else to run.
 
-    Dashboard    http://127.0.0.1:8080/     (on this machine)
+    Dashboard    http://${HOST_ADDR}:8080/
     API token    ${API_TOKEN}
                  (paste into the dashboard's token box — the CLI on this
                   machine is already configured with it)
 
     CLI          oxid doctor          (verifies the token) — then oxid ps
-    Deploy       oxid up <branch>     (from a git checkout; its `origin` is
+    Deploy       oxid up <branch>     (from a git checkout; its 'origin' is
                  what gets registered, since this daemon runs in a container
                  and cannot see your working tree)
 
