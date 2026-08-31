@@ -157,6 +157,20 @@
 
 ---
 
+## Multi-nodo
+
+Fuera de este análisis por una razón que conviene dejar escrita: los
+documentos de visión nunca lo prometieron (`SPEC.md` habla del **nodo**, en
+singular), así que no es una brecha entre código y documentos sino una
+expansión de alcance.
+
+El plan completo — inventario de lo que asume un solo nodo, decisión de
+arquitectura con sus alternativas descartadas, esquema, enrutado, modos de
+fallo y etapas con estimaciones — vive en
+[`MULTINODE.md`](MULTINODE.md). Su etapa 0 (cola de deploys reclamable de
+forma atómica) ya está entregada, porque arreglaba un fallo que muerde con
+un solo servidor.
+
 ## Priorización
 
 > **Última actualización:** P1 (UX CLI), P2 (Scale-to-Zero real) y P5 (Dockerfile, self-hosting,
