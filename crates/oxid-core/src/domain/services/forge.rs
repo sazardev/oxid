@@ -70,24 +70,38 @@ impl std::fmt::Display for ForgeKind {
     }
 }
 
-/// The API root for a host, derived from the repository's own URL.
+/// The API root for a forge, derived from the repository's own URL.
 ///
 /// This is how self-hosting is supported without asking anyone to configure
-/// a second URL: the host is already in `repo_url`, and each forge puts its
-/// API at a fixed path under it. Only an unusual deployment needs an
+/// a second URL: the origin is already in `repo_url`, and each forge puts
+/// its API at a fixed path under it. Only an unusual deployment needs an
 /// override.
+///
+/// Takes the whole **origin** — scheme, host *and port* — not just the
+/// hostname. Found the hard way against a real Gitea: keeping only the host
+/// and assuming `https://` addressed `https://10.0.0.2/api/v1` for a forge
+/// actually living on `http://10.0.0.2:3000`, and every call failed in a
+/// way that looked like a bad token. Self-hosted forges on a port, or
+/// behind plain HTTP on an internal network, are the normal case for the
+/// people most likely to run Oxid.
 #[must_use]
-pub fn api_base_for(kind: ForgeKind, host: &str) -> String {
-    let host = host.trim_end_matches('/');
+pub fn api_base_for(kind: ForgeKind, origin: &str) -> String {
+    let origin = origin.trim_end_matches('/');
+    let bare_host = origin
+        .split_once("://")
+        .map_or(origin, |(_, rest)| rest)
+        .split(':')
+        .next()
+        .unwrap_or(origin);
     match kind {
         // github.com's API lives on a different host entirely; GitHub
         // Enterprise puts it under the same one.
-        ForgeKind::GitHub if host.eq_ignore_ascii_case("github.com") => {
+        ForgeKind::GitHub if bare_host.eq_ignore_ascii_case("github.com") => {
             "https://api.github.com".to_owned()
         }
-        ForgeKind::GitHub => format!("https://{host}/api/v3"),
-        ForgeKind::GitLab => format!("https://{host}/api/v4"),
-        ForgeKind::Gitea | ForgeKind::Gogs => format!("https://{host}/api/v1"),
+        ForgeKind::GitHub => format!("{origin}/api/v3"),
+        ForgeKind::GitLab => format!("{origin}/api/v4"),
+        ForgeKind::Gitea | ForgeKind::Gogs => format!("{origin}/api/v1"),
     }
 }
 
@@ -97,9 +111,12 @@ pub fn api_base_for(kind: ForgeKind, host: &str) -> String {
 pub enum PreviewState {
     /// The image is being built.
     Building,
-    /// Live, at this URL.
+    /// Live. `url` is empty when the daemon cannot know the address — in
+    /// direct-publish mode the environment is on a port of the Oxid host,
+    /// and which name that host answers to from wherever the reader sits is
+    /// not something the daemon can know. `detail` then says what it can.
     Ready {
-        /// The address a person can open.
+        /// The address a person can open, or empty.
         url: String,
     },
     /// The build or first start failed.
@@ -134,6 +151,8 @@ pub struct CommentContext {
     pub state: PreviewState,
     /// Short commit sha, when known.
     pub commit: Option<String>,
+    /// What to say when there is no URL to link.
+    pub detail: Option<String>,
 }
 
 /// Renders the whole comment body, marker included.
@@ -145,6 +164,11 @@ pub fn render_comment(ctx: &CommentContext) -> String {
     let marker = comment_marker(ctx.project_id);
     let (status, detail) = match &ctx.state {
         PreviewState::Building => ("⏳ building".to_owned(), String::new()),
+        PreviewState::Ready { url } if url.is_empty() => (
+            "✅ ready".to_owned(),
+            // No invented hostname: see `PreviewState::Ready`.
+            ctx.detail.clone().unwrap_or_default(),
+        ),
         PreviewState::Ready { url } => ("✅ ready".to_owned(), format!("<{url}>")),
         PreviewState::Failed { reason } => {
             // The reason can be a whole build log line; a comment is not the
@@ -252,6 +276,7 @@ mod tests {
             branch: "feature/carrito".to_owned(),
             state,
             commit: Some("8dfe800b7c8f8d2".to_owned()),
+            detail: None,
         }
     }
 
@@ -261,20 +286,42 @@ mod tests {
         // should have to tell Oxid where their Gitea's API is when the
         // repository URL already said.
         assert_eq!(
-            api_base_for(ForgeKind::GitHub, "github.com"),
+            api_base_for(ForgeKind::GitHub, "https://github.com"),
             "https://api.github.com"
         );
         assert_eq!(
-            api_base_for(ForgeKind::GitHub, "git.acme.internal"),
+            api_base_for(ForgeKind::GitHub, "https://git.acme.internal"),
             "https://git.acme.internal/api/v3"
         );
         assert_eq!(
-            api_base_for(ForgeKind::GitLab, "gitlab.acme.internal"),
+            api_base_for(ForgeKind::GitLab, "https://gitlab.acme.internal"),
             "https://gitlab.acme.internal/api/v4"
         );
         assert_eq!(
-            api_base_for(ForgeKind::Gitea, "gitea.acme.internal/"),
+            api_base_for(ForgeKind::Gitea, "https://gitea.acme.internal/"),
             "https://gitea.acme.internal/api/v1"
+        );
+    }
+
+    /// Found against a real Gitea: keeping only the hostname and assuming
+    /// `https://` addressed the wrong scheme *and* dropped the port, and
+    /// every call failed in a way that looked like a bad token. A forge on
+    /// a port, or on plain HTTP inside a private network, is the normal
+    /// case for the people most likely to self-host.
+    #[test]
+    fn a_forge_on_a_port_or_plain_http_keeps_both() {
+        assert_eq!(
+            api_base_for(ForgeKind::Gitea, "http://10.0.0.2:3000"),
+            "http://10.0.0.2:3000/api/v1"
+        );
+        assert_eq!(
+            api_base_for(ForgeKind::GitLab, "https://git.acme.internal:8443"),
+            "https://git.acme.internal:8443/api/v4"
+        );
+        // github.com is still special-cased, however it is spelled.
+        assert_eq!(
+            api_base_for(ForgeKind::GitHub, "https://github.com:443"),
+            "https://api.github.com"
         );
     }
 
@@ -393,5 +440,25 @@ mod tests {
             assert_eq!(kind.as_str().parse::<ForgeKind>().unwrap(), kind);
         }
         assert!("bitbucket".parse::<ForgeKind>().is_err());
+    }
+
+    /// In direct-publish mode the daemon cannot know the host's public
+    /// name, and a comment is published where a placeholder would be read
+    /// as a real link. It says what it knows instead.
+    #[test]
+    fn a_ready_preview_with_no_url_reports_what_it_can_and_links_nothing() {
+        let body = render_comment(&CommentContext {
+            project_id: 1,
+            branch: "feature/x".to_owned(),
+            state: PreviewState::Ready { url: String::new() },
+            commit: None,
+            detail: Some("ready on port 45831 of the Oxid host".to_owned()),
+        });
+        assert!(body.contains("ready on port 45831"), "{body}");
+        assert!(
+            !body.contains("<host>"),
+            "must never invent a hostname: {body}"
+        );
+        assert!(!body.contains("http"), "{body}");
     }
 }

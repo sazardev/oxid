@@ -184,6 +184,14 @@ pub struct UpdateProjectBody {
     /// alone, `null` removes it.
     #[serde(default, deserialize_with = "present_or_absent")]
     max_environments: Option<Option<u32>>,
+    /// Write-scoped token for this project's git host, used only to post
+    /// the preview URL back to a pull request. Empty clears it.
+    ///
+    /// Separate from `git_token`, which clones: that one may legitimately
+    /// be read-only, and quietly requiring it to gain write access to
+    /// somebody's issues would be a security regression nobody asked for.
+    /// Never echoed back by any response.
+    forge_token: Option<String>,
 }
 
 /// Distinguishes "field absent" from "field set to null" for an optional
@@ -230,6 +238,12 @@ pub async fn update_project<
         state
             .cp
             .set_project_git_token(ProjectId(id), Some(git_token).filter(|t| !t.is_empty()))
+            .await?;
+    }
+    if let Some(forge_token) = body.forge_token.as_deref() {
+        state
+            .cp
+            .set_project_forge_token(ProjectId(id), Some(forge_token).filter(|t| !t.is_empty()))
             .await?;
     }
     if body.branches.is_some() || body.ignore.is_some() || body.max_environments.is_some() {

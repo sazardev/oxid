@@ -2028,6 +2028,7 @@ dependencies = [
  "hmac",
  "oxid-core",
  "rand 0.8.7",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

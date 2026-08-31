@@ -625,6 +625,192 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Everything a project knows about its git host, with the API token
+    /// decrypted.
+    ///
+    /// `None` when the project has no forge recorded or no token — which
+    /// is the ordinary case, and means pull-request comments are simply off
+    /// for it.
+    ///
+    /// Deliberately not part of `Project`: that struct is returned wholesale
+    /// by `GET /api/v1/projects`, and a token on it would be published to
+    /// every caller. Same reasoning as `git_token_enc`.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn get_project_forge(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<Option<crate::service::control_plane::forge::ProjectForge>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT forge, repo_url, forge_api_base, forge_token_enc FROM projects WHERE id = ?",
+        )
+        .bind(id_as_i64(project_id.0))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let Some(row) = row else { return Ok(None) };
+        let (Some(forge), Some(enc)) = (
+            row.try_get::<Option<String>, _>("forge").map_err(storage)?,
+            row.try_get::<Option<String>, _>("forge_token_enc")
+                .map_err(storage)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::service::control_plane::forge::ProjectForge {
+            forge,
+            repo_url: row.try_get("repo_url").map_err(storage)?,
+            api_base: row.try_get("forge_api_base").map_err(storage)?,
+            token: self
+                .cipher
+                .load()
+                .decrypt(&enc)
+                .map_err(|e| storage(e.to_string()))?,
+        }))
+    }
+
+    /// Stores (or clears) a project's write-scoped git-host token.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn set_forge_token(
+        &self,
+        project_id: ProjectId,
+        token: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let enc = match token.filter(|t| !t.trim().is_empty()) {
+            Some(t) => Some(
+                self.cipher
+                    .load()
+                    .encrypt(t)
+                    .map_err(|e| storage(e.to_string()))?,
+            ),
+            None => None,
+        };
+        sqlx::query("UPDATE projects SET forge_token_enc = ? WHERE id = ?")
+            .bind(enc)
+            .bind(id_as_i64(project_id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Queues a thing to tell the git host, replacing any pending one for
+    /// the same branch.
+    ///
+    /// The replace is the rate-limit design: five pushes in a minute
+    /// collapse to one row carrying the latest state, so the queue can
+    /// never outrun the forge however fast somebody pushes. It also resets
+    /// the attempt count — a new state deserves a fresh set of tries, not
+    /// the exhausted budget of the state it superseded.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn enqueue_forge_notification(
+        &self,
+        project_id: ProjectId,
+        branch: &str,
+        state: &str,
+        url: Option<&str>,
+        detail: Option<&str>,
+        commit_sha: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO forge_notifications \
+             (project_id, branch, state, url, detail, commit_sha, requested_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (project_id, branch) DO UPDATE SET \
+               state = excluded.state, url = excluded.url, detail = excluded.detail, \
+               commit_sha = excluded.commit_sha, requested_at = excluded.requested_at, \
+               attempts = 0, not_before = 0",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch)
+        .bind(state)
+        .bind(url)
+        .bind(detail)
+        .bind(commit_sha)
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Notifications due to be sent now, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn due_forge_notifications(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PendingNotification>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, branch, state, url, detail, commit_sha, attempts \
+             FROM forge_notifications WHERE not_before <= ? ORDER BY id ASC LIMIT ?",
+        )
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                let id: i64 = r.try_get("id").map_err(storage)?;
+                let project_id: i64 = r.try_get("project_id").map_err(storage)?;
+                let attempts: i64 = r.try_get("attempts").map_err(storage)?;
+                Ok(PendingNotification {
+                    id: u64::try_from(id).map_err(|_| storage("id overflowed u64"))?,
+                    project_id: ProjectId(
+                        u64::try_from(project_id).map_err(|_| storage("id overflowed u64"))?,
+                    ),
+                    branch: r.try_get("branch").map_err(storage)?,
+                    state: r.try_get("state").map_err(storage)?,
+                    url: r.try_get("url").map_err(storage)?,
+                    detail: r.try_get("detail").map_err(storage)?,
+                    commit_sha: r.try_get("commit_sha").map_err(storage)?,
+                    attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    }
+
+    /// Removes a notification that is done with — sent, or given up on.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn remove_forge_notification(&self, id: u64) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM forge_notifications WHERE id = ?")
+            .bind(id_as_i64(id))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Defers a notification after a retryable failure.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn defer_forge_notification(
+        &self,
+        id: u64,
+        retry_in_secs: u64,
+    ) -> Result<(), RepositoryError> {
+        let not_before = OffsetDateTime::now_utc().unix_timestamp()
+            + i64::try_from(retry_in_secs).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE forge_notifications SET attempts = attempts + 1, not_before = ? WHERE id = ?",
+        )
+        .bind(not_before)
+        .bind(id_as_i64(id))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
     /// Records what a `pull_request`/`merge_request` delivery said, so a
     /// later push on that branch knows which PR to comment on.
     ///
@@ -951,6 +1137,27 @@ pub struct ApiTokenSummary {
     pub expires_at: Option<OffsetDateTime>,
     /// Whether access is currently suspended (reversible, unlike revoked).
     pub suspended: bool,
+}
+
+/// One queued thing to tell a git host.
+#[derive(Debug, Clone)]
+pub struct PendingNotification {
+    /// Row id, for removing or deferring it.
+    pub id: u64,
+    /// Which project.
+    pub project_id: ProjectId,
+    /// Which branch's preview.
+    pub branch: String,
+    /// Its state, as `PreviewState`'s tag.
+    pub state: String,
+    /// The preview URL, when there is one.
+    pub url: Option<String>,
+    /// A failure reason, when there is one.
+    pub detail: Option<String>,
+    /// The commit, when known.
+    pub commit_sha: Option<String>,
+    /// How many times sending has already failed.
+    pub attempts: u32,
 }
 
 /// What a named API token resolves to at authentication time: who it

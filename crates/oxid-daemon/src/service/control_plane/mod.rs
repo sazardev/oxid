@@ -16,6 +16,7 @@ pub mod admission;
 pub mod auth;
 pub mod deploy;
 pub mod error;
+pub mod forge;
 pub mod gc;
 pub mod helpers;
 pub mod infra;
@@ -84,6 +85,10 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// route on plain HTTP, which is what an install that never configured
     /// ACME gets.
     acme: Option<(oxid_core::AcmeConfig, u16)>,
+    /// Single-flights the forge-notification drain, for the same reason
+    /// `deploy_drain_lock` exists: two passes would read the same pending
+    /// row and comment twice.
+    forge_drain_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes every state-mutating lifecycle operation on environments —
     /// `deploy`, `pause`, `wake`, `destroy`, and each action a GC `sweep`
     /// applies — across every project. `Arc`-wrapped because `ControlPlane`
@@ -205,6 +210,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
             traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
             acme: None,
+            forge_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
             deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             deploy_concurrency: default_deploy_concurrency(),
@@ -261,23 +267,26 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         if self.acme.is_some() { "https" } else { "http" }
     }
 
-    /// An environment's address as a person should type it, scheme included.
+    /// An environment's address as a person should type it, scheme
+    /// included — or `None` when this daemon cannot know it.
     ///
-    /// The CLI used to print the bare hostname in Traefik mode, because the
-    /// scheme is a property of the proxy and only the daemon knows it. Now
-    /// that certificates can be on, guessing `http://` would be wrong half
-    /// the time and copying the bare host is wrong every time.
+    /// In Traefik mode the address is the routed hostname and the scheme
+    /// follows from whether certificates are configured, so both are known.
+    ///
+    /// In direct-publish mode they are not. The environment is reachable at
+    /// a port on *the host running Oxid*, and the daemon has no idea what
+    /// name or address that host answers to from wherever the reader is
+    /// sitting — behind NAT, on a VPN, through a bastion. An earlier
+    /// version filled that gap with a literal `<host>` placeholder, which
+    /// was fine in a terminal where the reader knows the machine and
+    /// useless in a pull-request comment, where it was published as a link.
+    /// Returning `None` is the honest answer, and callers say what they can
+    /// instead of inventing a hostname.
     #[must_use]
-    pub fn public_url(&self, env: &oxid_core::Environment) -> String {
-        if self.docker_network.is_some() {
-            format!("{}://{}/", self.routing_scheme(), env.url)
-        } else {
-            // Direct-publish: the container's own port, never behind the
-            // proxy that terminates TLS, so it genuinely is plain HTTP.
-            env.public_port
-                .or(env.host_port)
-                .map_or_else(|| env.url.clone(), |p| format!("http://<host>:{p}/"))
-        }
+    pub fn public_url(&self, env: &oxid_core::Environment) -> Option<String> {
+        self.docker_network
+            .is_some()
+            .then(|| format!("{}://{}/", self.routing_scheme(), env.url))
     }
 
     /// Sets the host port the built-in Traefik publishes on

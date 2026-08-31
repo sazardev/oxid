@@ -46,5 +46,28 @@ where
             }
             Err(err) => tracing::error!(error = %err, "deploy queue retry pass failed"),
         }
+
+        // After the deploys, because a deploy is what produces something
+        // worth saying. Building the client per tick rather than holding
+        // one: this runs every 30 seconds and usually finds nothing to do,
+        // and a client built at startup would be a connection pool kept
+        // alive for a feature most installs never turn on.
+        match crate::adapter::forge::HttpForge::new(forge_timeout_secs()) {
+            Ok(forge) => {
+                if let Err(err) = cp.drain_forge_notifications(&forge).await {
+                    tracing::warn!(error = %err, "forge notification pass failed");
+                }
+            }
+            Err(err) => tracing::debug!(error = ?err, "no forge client"),
+        }
     }
+}
+
+/// Per-request timeout for git-host calls (`OXID_FORGE_TIMEOUT_SECS`).
+fn forge_timeout_secs() -> u64 {
+    std::env::var("OXID_FORGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(20)
 }

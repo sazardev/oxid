@@ -37,6 +37,26 @@ is the breaking position.
   unverified rather than assumed: direct-publish is the supported topology
   there, and it needs no proxy at all.
 
+- **The preview URL is posted back to the pull request.** One comment per
+  PR, edited in place on every push — verified against a real Gitea:
+  four pushes, one comment. The association is learned from the
+  `pull_request`/`merge_request` deliveries that already arrived and were
+  discarded, because a push webhook carries no PR number and is answered
+  before anything is built.
+
+  Notifications go through a persisted queue shaped like the deploy queue,
+  so a restart does not lose one, and a unique index collapses a burst of
+  pushes into a single pending row carrying the latest state — the queue
+  can never outrun the git host. Failure is invisible to the deploy: a
+  comment is a courtesy, an environment is the product. A missing scope or
+  a rejected token is never retried, because it will fail identically
+  forever; a rate limit waits exactly as long as the host asked.
+
+  The write-scoped credential is stored separately from the clone token
+  (`oxid configure --forge-token -`, read from stdin). The clone one may
+  legitimately be read-only, and quietly requiring it to gain write access
+  to somebody's issues would be a security regression nobody asked for.
+
 ### Fixed
 
 - **`oxid infra setup` failed on any host that had never pulled Traefik.**

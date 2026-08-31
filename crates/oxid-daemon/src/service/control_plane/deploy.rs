@@ -554,6 +554,43 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             error = %err,
             "deploy failed"
         );
+        // Every failure path in `deploy_at` funnels through here, which is
+        // what makes this the one place a failed preview has to be reported
+        // from.
+        self.notify_forge(
+            env.project_id,
+            env.branch.name.as_str(),
+            "failed",
+            None,
+            Some(&err.to_string()),
+            Some(env.branch.commit_sha.as_str()),
+        )
+        .await;
+    }
+
+    /// Queues a preview state for the branch's pull request, if it has one.
+    ///
+    /// Best-effort by contract, and silent on failure by design: this is
+    /// called from inside a deploy, and a git host being unreachable is not
+    /// a reason to fail a deploy that otherwise worked. Everything that can
+    /// go wrong later — a missing scope, a rate limit — is the queue
+    /// drain's problem, where it can be retried and reported.
+    async fn notify_forge(
+        &self,
+        project_id: ProjectId,
+        branch: &str,
+        state: &str,
+        url: Option<&str>,
+        detail: Option<&str>,
+        commit_sha: Option<&str>,
+    ) {
+        if let Err(e) = self
+            .store
+            .enqueue_forge_notification(project_id, branch, state, url, detail, commit_sha)
+            .await
+        {
+            tracing::debug!(error = %e, "could not queue a forge notification");
+        }
     }
 
     /// Deploys `branch`, pinned to `sha_override` instead of the branch's
@@ -968,6 +1005,31 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
 
         tracing::info!(%project_id, %branch, environment_id = %env.id, "deploy succeeded");
+        // Tell the pull request, if the branch has one. Queued rather than
+        // sent: a rate-limited git host must never hold the per-branch lock
+        // this deploy is still inside, and a deploy that worked must never
+        // be reported as failed because a comment could not be posted.
+        // In direct-publish mode there is no URL to advertise — see
+        // `public_url`. The comment then reports the port instead of a link
+        // to a hostname nobody could have known.
+        let (url, detail) = match self.public_url(&env) {
+            Some(url) => (Some(url), None),
+            None => (
+                None,
+                env.public_port
+                    .or(env.host_port)
+                    .map(|p| format!("ready on port {p} of the Oxid host")),
+            ),
+        };
+        self.notify_forge(
+            project_id,
+            branch.as_str(),
+            "ready",
+            url.as_deref(),
+            detail.as_deref(),
+            Some(env.branch.commit_sha.as_str()),
+        )
+        .await;
         Ok(DeployOutcome::Deployed(
             env,
             DeployReport {

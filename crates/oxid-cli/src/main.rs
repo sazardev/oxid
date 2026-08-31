@@ -225,6 +225,15 @@ enum Command {
         /// the cap.
         #[arg(long)]
         max_environments: Option<u32>,
+        /// Token for this project's git host, used only to post the preview
+        /// URL back to a pull request. Needs write access to pull requests
+        /// (`pull requests: write` on GitHub, `api` on GitLab,
+        /// `write:issue` on Gitea) — deliberately NOT the same credential
+        /// as `--git-token`, which only clones and may be read-only. Read
+        /// from stdin when given as `-`, so it stays out of your shell
+        /// history. Empty string clears it.
+        #[arg(long)]
+        forge_token: Option<String>,
     },
     /// Save a server and its token so nothing has to be passed again.
     ///
@@ -848,7 +857,14 @@ async fn main() {
             branches,
             ignore,
             max_environments,
+            forge_token,
         } => {
+            // `-` means stdin: a write-scoped token has no business in a
+            // shell history or in `ps` output on a shared machine.
+            let forge_token = match forge_token.as_deref() {
+                Some("-") => read_secret_from_stdin("Git host token").ok(),
+                other => other.map(str::to_owned),
+            };
             cmd_configure(
                 &client,
                 &base,
@@ -859,6 +875,7 @@ async fn main() {
                     branches: branches.as_deref(),
                     ignore: ignore.as_deref(),
                     max_environments,
+                    forge_token: forge_token.as_deref(),
                 },
             )
             .await
@@ -1657,6 +1674,21 @@ struct ConfigureArgs<'a> {
     branches: Option<&'a str>,
     ignore: Option<&'a str>,
     max_environments: Option<u32>,
+    forge_token: Option<&'a str>,
+}
+
+/// Reads one secret from stdin, prompting only when a person is watching.
+///
+/// Same reasoning as `oxid login`: a credential passed as an argument lands
+/// in shell history and in the process list.
+fn read_secret_from_stdin(label: &str) -> Result<String, CliError> {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprint!("{label} (paste and press enter): ");
+    }
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+        .map_err(|e| format!("cannot read the token: {e}"))?;
+    Ok(line.trim().to_owned())
 }
 
 /// Splits a comma-separated pattern list, dropping blanks.
@@ -1684,6 +1716,7 @@ async fn cmd_configure(
         branches,
         ignore,
         max_environments,
+        forge_token,
     } = args;
     if pause_after.is_none()
         && destroy_after.is_none()
@@ -1691,6 +1724,7 @@ async fn cmd_configure(
         && branches.is_none()
         && ignore.is_none()
         && max_environments.is_none()
+        && forge_token.is_none()
     {
         return Err(
             "nothing to configure — pass --pause-after, --destroy-after, --git-token, \
@@ -1718,6 +1752,9 @@ async fn cmd_configure(
             }
             if let Some(raw) = ignore {
                 body["ignore"] = json!(pattern_list(raw));
+            }
+            if let Some(token) = forge_token {
+                body["forge_token"] = json!(token);
             }
             if let Some(max) = max_environments {
                 // 0 is how a shell flag says "remove the cap"; the API

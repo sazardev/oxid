@@ -3,6 +3,7 @@
 pub mod compose;
 pub mod config;
 pub mod crypto;
+pub mod forge;
 pub mod git;
 pub mod oci;
 pub mod postgres_pool;

@@ -416,6 +416,26 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(self.find_project_by_repo(repo_url).await?)
     }
 
+    /// Stores (or clears) the write-scoped token used to comment on this
+    /// project's pull requests.
+    ///
+    /// Kept apart from the clone credential deliberately — see
+    /// `UpdateProjectBody::forge_token`. Encrypted at rest by the same
+    /// `secret.key` as every other secret, and never returned by any
+    /// endpoint.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn set_project_forge_token(
+        &self,
+        project_id: ProjectId,
+        token: Option<&str>,
+    ) -> Result<(), CpError> {
+        self.ensure_project(project_id).await?;
+        self.store.set_forge_token(project_id, token).await?;
+        Ok(())
+    }
+
     /// Records which pull request a branch belongs to, and which git host
     /// the project lives on.
     ///

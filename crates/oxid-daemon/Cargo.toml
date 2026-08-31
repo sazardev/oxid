@@ -22,6 +22,10 @@ toml.workspace = true
 tokio.workspace = true
 sqlx.workspace = true
 bollard.workspace = true
+# The daemon's first outbound HTTP client, for posting preview URLs back to
+# a git host. `rustls-tls` reuses the `ring` backend already vendored here
+# (see the axum-server note below), so this adds no second crypto stack.
+reqwest.workspace = true
 tar.workspace = true
 bytes.workspace = true
 git2.workspace = true

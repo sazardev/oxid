@@ -21,6 +21,7 @@ use crate::domain::infra::{
 };
 use crate::domain::project::{Project, ProjectId};
 use crate::domain::secret_context::{EnvVarScope, SecretContext, SecretValue};
+use crate::domain::services::forge::ForgeError;
 use crate::domain::services::tls::TraefikRuntime;
 use crate::domain::state::EnvironmentState;
 use crate::domain::value_objects::RepoUrl;
@@ -594,4 +595,65 @@ pub trait ContainerPort {
     /// # Errors
     /// Any container-runtime failure.
     async fn runtime_info(&self) -> Result<RuntimeInfo, OciError>;
+}
+
+/// Posting a preview's state back to the git host it came from.
+///
+/// A separate port from [`GitPort`] on purpose: that one clones over git,
+/// with a credential that may legitimately be read-only. This one calls a
+/// REST API with a credential that can write to somebody's pull requests,
+/// and keeping them apart is what stops the second requirement quietly
+/// attaching itself to the first.
+#[trait_variant::make(Send)]
+pub trait ForgePort {
+    /// Finds Oxid's own comment on a pull request, by the hidden marker it
+    /// embeds, returning its id.
+    ///
+    /// The recovery path when a stored id goes stale — a restored backup, a
+    /// deleted comment — so a lost id becomes one lookup rather than a
+    /// second comment on every push from then on.
+    ///
+    /// # Errors
+    /// Any [`ForgeError`].
+    async fn find_comment(
+        &self,
+        req: &ForgeRequest,
+        marker: &str,
+    ) -> Result<Option<String>, ForgeError>;
+
+    /// Posts a new comment, returning its id.
+    ///
+    /// # Errors
+    /// Any [`ForgeError`].
+    async fn create_comment(&self, req: &ForgeRequest, body: &str) -> Result<String, ForgeError>;
+
+    /// Edits an existing comment in place.
+    ///
+    /// # Errors
+    /// Any [`ForgeError`].
+    async fn update_comment(
+        &self,
+        req: &ForgeRequest,
+        comment_id: &str,
+        body: &str,
+    ) -> Result<(), ForgeError>;
+}
+
+/// Everything one call to a git host needs.
+///
+/// Carried as a struct rather than six arguments because every method needs
+/// the same five, and a positional list of that many strings is exactly how
+/// a repository path ends up where a token belongs.
+#[derive(Debug, Clone)]
+pub struct ForgeRequest {
+    /// Which host, so the adapter knows the API shape.
+    pub kind: crate::domain::services::forge::ForgeKind,
+    /// API root, derived from the repository URL or configured explicitly.
+    pub api_base: String,
+    /// `owner/repo`.
+    pub repo_path: String,
+    /// The pull request number, as a person sees it.
+    pub number: u64,
+    /// The write-scoped credential.
+    pub token: String,
 }
