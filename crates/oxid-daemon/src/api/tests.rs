@@ -4440,3 +4440,69 @@ async fn a_token_created_without_a_role_keeps_the_power_it_used_to_have() {
         "an unscoped token with no role must still be node-wide, as before"
     );
 }
+
+/// `oxid whoami` is what a person runs on a daemon they were handed. Its
+/// capability list is derived from the role rather than written out again,
+/// so it cannot claim a power the middleware would refuse.
+#[tokio::test]
+async fn whoami_reports_the_callers_own_role_and_powers() {
+    let app = two_project_app().await;
+    let tok = mint_token(
+        &app,
+        json!({ "name": "juan", "projects": [1], "role": "developer" }),
+    )
+    .await;
+
+    let (status, body) =
+        json_request_with_auth(&app, "GET", "/api/v1/me", json!({}), Some(&tok)).await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["name"], "juan");
+    assert_eq!(me["role"], "developer");
+    assert_eq!(me["master"], false);
+    assert_eq!(me["projects"], json!([1]));
+
+    let can: Vec<&str> = me["can"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(can.contains(&"read") && can.contains(&"operate"), "{can:?}");
+    // The two it must not claim: a developer cannot reach secrets, and a
+    // scoped credential is never node-wide whatever its role.
+    assert!(!can.contains(&"secrets"), "{can:?}");
+    assert!(!can.contains(&"manage_node"), "{can:?}");
+
+    // And what it claims is what the routes actually do.
+    let (status, _) = json_request_with_auth(
+        &app,
+        "GET",
+        "/api/v1/projects/1/secrets",
+        json!({}),
+        Some(&tok),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn whoami_needs_a_credential_but_no_particular_power() {
+    let app = two_project_app().await;
+    let (status, _) = json_request(&app, "GET", "/api/v1/me", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A viewer — the least powerful role there is — can still ask.
+    let tok = mint_token(
+        &app,
+        json!({ "name": "ana", "projects": [1], "role": "viewer" }),
+    )
+    .await;
+    let (status, body) =
+        json_request_with_auth(&app, "GET", "/api/v1/me", json!({}), Some(&tok)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["can"],
+        json!(["read"])
+    );
+}

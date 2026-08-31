@@ -41,10 +41,15 @@
         <a href="index.html">Docs home</a>
         <a href="install.html">Install &amp; setup</a>
         <p class="side-group">Guide</p>
+        <a href="developers.html">For developers</a>
         <a href="guide.html">How Oxid is used</a>
         <a href="stacks.html">Stacks &amp; builds</a>
         <p class="side-group">Modules</p>
         <a href="cli.html" class="current">CLI reference</a>
+        <a href="#cli-session" class="sub">Connecting</a>
+        <a href="#cli-lifecycle" class="sub">Lifecycle</a>
+        <a href="#cli-observe" class="sub">Observation</a>
+        <a href="#cli-ops" class="sub">Operations</a>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
@@ -95,6 +100,68 @@
           Contexts (<a href="#cli-context"><code>oxid context</code></a>) persist both values per
           named daemon at <code>~/.config/oxid/config.toml</code>, <code>kubectl config</code>-style.
         </p>
+      </section>
+
+      <section class="doc-section" id="cli-session">
+        <h2>Connecting to a server</h2>
+        <p>
+          The short path. <code>oxid context</code> below is the same configuration with more
+          knobs; these are the four commands a person actually types.
+        </p>
+
+        <article class="doc-entry">
+          <h3><code>oxid login [url]</code></h3>
+          <pre class="cmd-block">oxid login http://oxid.example.local:8080
+<span class="tk-gray"># token is read from stdin — not from your shell history or `ps`</span>
+
+oxid login --as-name staging http://staging.example.local:8080
+oxid login                    <span class="tk-gray"># log back in to the last server, no URL needed</span>
+oxid login --token "$TOKEN" http://…   <span class="tk-gray"># for scripts</span></pre>
+          <p>
+            Saves the server and token, <strong>verifies both against the daemon</strong>, and
+            makes it active. Verifying is the point of doing this rather than writing a config
+            file: a token typed one character short otherwise fails later, on some unrelated
+            command, with a 401 that looks like the server's fault.
+          </p>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid logout</code></h3>
+          <pre class="cmd-block">oxid logout            <span class="tk-gray"># clears the token, keeps the server</span>
+oxid logout --forget   <span class="tk-gray"># removes the server entry too</span>
+oxid logout --server staging</pre>
+          <p>
+            Clearing the credential and forgetting the address are different things. On a
+            shared machine you want the first, and having to re-type a URL afterwards is
+            exactly the friction that stops people logging out at all.
+          </p>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid server</code> &middot; <code>oxid connect &lt;name&gt;</code></h3>
+          <pre class="cmd-block"><span class="tk-gray">$</span> oxid server
+     NAME             API                        TOKEN
+*    default          http://oxid.example:8080   ••••••••cd91
+     staging          http://staging.example:8080 ••••••••7a02
+
+<span class="tk-gray">$</span> oxid connect staging</pre>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid whoami</code></h3>
+          <pre class="cmd-block"><span class="tk-gray">$</span> oxid whoami
+<span class="tk-green">[+]</span> juan on http://oxid.example.local:8080 (developer)
+<span class="tk-gray">[~]</span> Projects: 1 — every other project answers 404
+<span class="tk-gray">[~]</span> Access expires: 2026-11-29 15:36:04
+<span class="tk-gray">[~]</span> You can: view environments and logs · deploy, pause, wake, destroy</pre>
+          <p>
+            Your name, role, scope, expiry and the list of what you may actually do &mdash;
+            derived from the role rather than written out separately, so it cannot drift from
+            what the daemon enforces. Backed by <code>GET /api/v1/me</code>, which needs no
+            capability beyond being authenticated: a credential asking about itself reveals
+            nothing it does not already hold.
+          </p>
+        </article>
       </section>
 
       <section class="doc-section" id="cli-lifecycle">

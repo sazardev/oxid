@@ -8,6 +8,46 @@ is the breaking position.
 
 ### Added
 
+- **`oxid login` / `logout` / `connect` / `server` / `whoami`.** Pointing the
+  CLI at a server was `context add` followed by `context use` — two commands
+  and a name to invent for what is one step, which is why people kept passing
+  `--api`/`--token` on every call instead.
+
+  ```
+  oxid login http://oxid.example.local:8080   # token read from stdin
+  oxid whoami                                 # who am I, what may I do
+  oxid logout                                 # clears the token, keeps the server
+  oxid login                                  # log back in, no URL to re-type
+  oxid server / oxid connect staging
+  ```
+
+  Three details are the difference between this and a config file writer:
+
+  - **The token is read from stdin**, not an argument, so it never lands in
+    shell history or the process list where `ps` shows it to anyone on a
+    shared machine. `--token` stays for scripts.
+  - **`login` verifies before saving.** A token typed one character short
+    otherwise fails later, on an unrelated command, with a 401 that looks
+    like the server's fault.
+  - **`logout` clears the credential and keeps the address.** They are
+    different things: on a shared machine you want the first, and having to
+    re-type a URL afterwards is the friction that stops people logging out at
+    all. `oxid login` with no argument then logs back in.
+
+- **`GET /api/v1/me`, behind `oxid whoami`** — the calling credential's own
+  name, role, scope, expiry and the list of what it may actually do. Every
+  other answer to "why can't I do this" is a 403 after the fact; this one
+  answers before. The capability list is derived from the role rather than
+  written out again, so it cannot claim a power the middleware would refuse,
+  and a test asserts that against the real routes. It needs no capability
+  beyond being authenticated: a credential asking about itself reveals
+  nothing it does not already hold.
+
+- **A developer-facing documentation page** (`docs/docs/developers.html`) for
+  the person who was handed a token rather than a server: connecting, getting
+  a branch running, reading logs, what each environment state means, and what
+  a 403 versus a 404 is telling them.
+
 - **Roles, scopes and expiries on every credential — users a devops can
   actually manage.** A named token used to have one level of power: inside
   its projects it could do *everything*, including rewriting secrets and

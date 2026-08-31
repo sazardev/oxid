@@ -226,6 +226,50 @@ enum Command {
         #[arg(long)]
         max_environments: Option<u32>,
     },
+    /// Save a server and its token so nothing has to be passed again.
+    ///
+    /// The first command a developer runs on a daemon someone handed them.
+    /// Equivalent to `oxid context add … && oxid context use …`, which is
+    /// two commands and a name to invent for what is really one step.
+    Login {
+        /// Daemon URL, e.g. `http://oxid.miempresa.local:8080`. Omit it to
+        /// log back in to the server you last used — after `oxid logout`
+        /// the address is still saved, and re-typing it is exactly the
+        /// friction that stops people logging out on a shared machine.
+        server: Option<String>,
+        /// Your access token. Omit it and it is read from stdin, so it
+        /// never lands in your shell history.
+        #[arg(long)]
+        token: Option<String>,
+        /// Name for this server, if you talk to more than one.
+        #[arg(long, default_value = "default")]
+        as_name: String,
+    },
+    /// Forget the stored token for a server, keeping the server itself.
+    ///
+    /// Deliberately not `context remove`: on a shared machine what you want
+    /// gone is the credential, not the address, and having to re-type a URL
+    /// is what stops people from logging out at all.
+    Logout {
+        /// Which saved server to clear. Defaults to the active one.
+        #[arg(long)]
+        server: Option<String>,
+        /// Remove the saved server entirely, not just its token.
+        #[arg(long)]
+        forget: bool,
+    },
+    /// Switch to another saved server.
+    Connect {
+        /// Name of a server saved by `oxid login`.
+        name: String,
+    },
+    /// Show the servers you have saved, and which one is active.
+    Server,
+    /// Show who you are on this server, and what you may do.
+    ///
+    /// Answers "why can't I do this" *before* you try it, rather than as a
+    /// 403 afterwards.
+    Whoami,
     /// Manage named daemon contexts (`kubectl config`-style), persisted at
     /// `~/.config/oxid/config.toml`, so `--api`/`--token` don't need to be
     /// repeated for every daemon you talk to.
@@ -809,6 +853,15 @@ async fn main() {
             )
             .await
         }
+        Command::Login {
+            server,
+            token,
+            as_name,
+        } => cmd_login(&client, server.as_deref(), token, &as_name).await,
+        Command::Logout { server, forget } => cmd_logout(server.as_deref(), forget),
+        Command::Connect { name } => cmd_context_use(&name),
+        Command::Server => cmd_context_list(),
+        Command::Whoami => cmd_whoami(&client, &base).await,
         Command::Context { action } => cmd_context(action),
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
@@ -1690,6 +1743,182 @@ async fn cmd_configure(
 
 /// Handles `oxid context <add|use|list|current|remove>` — purely local,
 /// no daemon round-trip, so it's synchronous unlike every other `cmd_*`.
+/// Saves a server and its token, verifies both, and makes it active.
+///
+/// Verification is the reason this is not just a config write: a token
+/// typed one character short otherwise fails later, on some unrelated
+/// command, with a 401 that looks like the daemon's fault.
+async fn cmd_login(
+    client: &Client,
+    server: Option<&str>,
+    token: Option<String>,
+    name: &str,
+) -> Result<(), CliError> {
+    let saved = config::load()?;
+    // No URL: log back in to whatever was last active. The context name
+    // comes from there too, or `--as-name` would silently create a second
+    // entry pointing at the same server.
+    let (name, server) = if let Some(url) = server {
+        (name.to_owned(), url.trim_end_matches('/').to_owned())
+    } else {
+        let active = saved.current_context.clone().ok_or_else(|| {
+            "no saved server — pass one, e.g. `oxid login http://host:8080`".to_owned()
+        })?;
+        let url = saved
+            .contexts
+            .get(&active)
+            .map(|c| c.api.clone())
+            .ok_or_else(|| format!("saved server `{active}` has no address"))?;
+        (active, url)
+    };
+    let name = name.as_str();
+    let token = if let Some(t) = token {
+        t
+    } else {
+        {
+            // Read from stdin so the token never reaches shell history or
+            // the process list, where `--token` puts it for anyone running
+            // `ps` on a shared machine.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprint!("Access token (paste and press enter): ");
+            }
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                .map_err(|e| format!("cannot read the token: {e}"))?;
+            line.trim().to_owned()
+        }
+    };
+    if token.is_empty() {
+        return Err("no token given — pass --token or paste one when prompted"
+            .to_owned()
+            .into());
+    }
+
+    let probe = build_client(Some(&token))?;
+    let me = get_json(&probe, format!("{server}/api/v1/me")).await?;
+
+    let mut cfg = saved;
+    cfg.contexts.insert(
+        name.to_owned(),
+        config::Context {
+            api: server.clone(),
+            token: Some(token),
+        },
+    );
+    cfg.current_context = Some(name.to_owned());
+    config::save(&cfg)?;
+    let _ = client;
+
+    if !emit_json(&json!({ "server": server, "context": name, "me": me })) {
+        let who = me["name"].as_str().unwrap_or("the master credential");
+        let role = me["role"].as_str().unwrap_or("?");
+        ok(format!("Logged in to {server} as `{who}` ({role})"));
+        print_whoami(&me);
+        bg("Saved — no --api or --token needed from now on. `oxid logout` clears it.");
+    }
+    Ok(())
+}
+
+/// Clears a saved token, or the whole server entry with `--forget`.
+fn cmd_logout(server: Option<&str>, forget: bool) -> Result<(), CliError> {
+    let mut cfg = config::load()?;
+    let name = match server {
+        Some(name) => name.to_owned(),
+        None => cfg
+            .current_context
+            .clone()
+            .ok_or_else(|| "no active server — nothing to log out of".to_owned())?,
+    };
+    let entry = cfg
+        .contexts
+        .get_mut(&name)
+        .ok_or_else(|| format!("no saved server named `{name}`"))?;
+
+    if forget {
+        cfg.contexts.remove(&name);
+        if cfg.current_context.as_deref() == Some(name.as_str()) {
+            cfg.current_context = None;
+        }
+    } else {
+        entry.token = None;
+    }
+    config::save(&cfg)?;
+
+    if !emit_json(&json!({ "server": name, "forgotten": forget })) {
+        if forget {
+            ok(format!("Forgot server `{name}` entirely"));
+        } else {
+            ok(format!(
+                "Logged out of `{name}` — the server is still saved, log back in with `oxid login`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reports the calling credential: who, what role, where, until when.
+async fn cmd_whoami(client: &Client, base: &str) -> Result<(), CliError> {
+    let me = get_json(client, format!("{base}/api/v1/me")).await?;
+    if !emit_json(&me) {
+        let who = me["name"].as_str().unwrap_or("the master credential");
+        ok(format!(
+            "{who} on {base} ({})",
+            me["role"].as_str().unwrap_or("?")
+        ));
+        print_whoami(&me);
+    }
+    Ok(())
+}
+
+/// The shared body of `whoami` and `login`'s summary: scope, expiry, and
+/// what this credential may actually do.
+fn print_whoami(me: &Value) {
+    match me["projects"].as_array() {
+        Some(ids) => {
+            let ids: Vec<String> = ids
+                .iter()
+                .map(|v| v.as_u64().unwrap_or_default().to_string())
+                .collect();
+            bg(format!(
+                "Projects: {} — every other project answers 404",
+                ids.join(", ")
+            ));
+        }
+        None => bg("Projects: all"),
+    }
+    if !me["expires_at"].is_null() {
+        bg(format!(
+            "Access expires: {}",
+            format_occurred_at(&me["expires_at"])
+        ));
+    }
+    if me["suspended"].as_bool().unwrap_or(false) {
+        bg("Access is SUSPENDED — ask an operator to re-enable it");
+    }
+    // Spelled in the words a person would use, not the wire names, since
+    // this is the answer to "what can I do here".
+    let can: Vec<&str> = me["can"]
+        .as_array()
+        .map(|caps| {
+            caps.iter()
+                .filter_map(|c| match c.as_str()? {
+                    "read" => Some("view environments and logs"),
+                    "operate" => Some("deploy, pause, wake, destroy"),
+                    "secrets" => Some("read and write secrets"),
+                    "manage_project" => Some("change project settings"),
+                    "create_project" => Some("register new projects"),
+                    "manage_node" => Some("manage the node"),
+                    "manage_access" => Some("give other people access"),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !can.is_empty() {
+        bg(format!("You can: {}", can.join(" · ")));
+    }
+}
+
 fn cmd_context(action: ContextAction) -> Result<(), CliError> {
     match action {
         ContextAction::Add { name, api, token } => cmd_context_add(&name, api, token),

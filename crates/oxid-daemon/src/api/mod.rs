@@ -251,6 +251,7 @@ pub fn router<
             "/api/v1/tokens/{id}",
             delete(handlers::tokens::revoke_token).patch(handlers::tokens::update_token),
         )
+        .route("/api/v1/me", get(handlers::tokens::whoami))
         .route("/api/v1/rotate-key", post(handlers::tokens::rotate_key))
         .route("/api/v1/audit", get(handlers::audit::recent_audit))
         .route("/api/v1/queue", get(handlers::audit::list_queue))

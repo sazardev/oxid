@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::middleware::AuthedAs;
-use crate::api::middleware::authorize;
 use crate::api::middleware::require_master;
+use crate::api::middleware::{authorize, grant_of};
 use crate::api::types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -130,6 +130,80 @@ pub async fn create_token<
             "expires_at": expires_at,
         })),
     ))
+}
+
+/// Reports the calling credential back to itself: who it is, what it may
+/// do, where, and until when.
+///
+/// The endpoint a person runs first on a daemon they were handed. Every
+/// other answer to "why can't I do this" is a `403` after the fact; this
+/// one tells them before they try, and it is what `oxid whoami` prints.
+///
+/// Needs no capability beyond being authenticated — a credential asking
+/// about itself reveals nothing it does not already hold.
+pub async fn whoami<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(_state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<Json<Value>> {
+    let grant = grant_of(authed.as_ref());
+    let name = match &authed {
+        Some(Extension(AuthedAs::Operator(identity))) => Some(identity.name.clone()),
+        // The master credential is anonymous by design: it is one token for
+        // the whole team, not a person.
+        _ => None,
+    };
+    // The capability list is derived from the role rather than written out
+    // again here, so it cannot drift from what the middleware enforces.
+    let can: Vec<&str> = [
+        (Capability::Read, "read"),
+        (Capability::Operate, "operate"),
+        (Capability::Secrets, "secrets"),
+        (Capability::ManageProject, "manage_project"),
+        (Capability::CreateProject, "create_project"),
+        (Capability::ManageNode, "manage_node"),
+        (Capability::ManageAccess, "manage_access"),
+    ]
+    .into_iter()
+    .filter(|(cap, _)| {
+        // Node-wide capabilities are reported honestly for a scoped
+        // credential: it does not have them, whatever its role says.
+        let project = if matches!(
+            cap,
+            Capability::Read
+                | Capability::Operate
+                | Capability::Secrets
+                | Capability::ManageProject
+        ) {
+            grant.projects.as_ref().and_then(|p| p.first()).copied()
+        } else {
+            None
+        };
+        grant
+            .authorize(*cap, project, OffsetDateTime::now_utc().unix_timestamp())
+            .is_ok()
+    })
+    .map(|(_, name)| name)
+    .collect();
+
+    Ok(Json(json!({
+        "name": name,
+        "master": matches!(authed, Some(Extension(AuthedAs::Master))),
+        "role": grant.role.as_str(),
+        "projects": grant.projects,
+        // RFC3339 rather than unix seconds: every other timestamp the API
+        // returns is RFC3339, and the CLI already knows how to render it.
+        "expires_at": grant.expires_at.and_then(|at| {
+            OffsetDateTime::from_unix_timestamp(at)
+                .ok()
+                .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        }),
+        "suspended": grant.suspended,
+        "can": can,
+        "daemon_version": env!("CARGO_PKG_VERSION"),
+    })))
 }
 
 /// Lists every named token (never the raw value or its hash),

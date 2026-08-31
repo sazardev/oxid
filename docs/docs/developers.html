@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oxid — For developers</title>
+  <meta name="description" content="Using Oxid as a developer on a server someone else runs: log in, deploy a branch, read logs, and understand what your role lets you do." />
+  <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a href="../" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="28" height="28" />
+        <span>oxid</span><span class="brand-suffix">/ docs</span>
+      </a>
+      <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Toggle navigation">
+        <span></span><span></span><span></span>
+      </button>
+      <nav class="primary-nav" id="primaryNav">
+        <a href="../#why">Why</a>
+        <a href="../#features">Features</a>
+        <a href="../#how">How it works</a>
+        <a href="../#status">Status</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub &#8599;</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="wrap docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <nav>
+        <p class="side-group">Overview</p>
+        <a href="index.html">Docs home</a>
+        <a href="install.html">Install &amp; setup</a>
+        <p class="side-group">Guide</p>
+        <a href="developers.html" class="current">For developers</a>
+        <a href="#dev-connect" class="sub">Connecting</a>
+        <a href="#dev-whoami" class="sub">What can I do?</a>
+        <a href="#dev-deploy" class="sub">Deploying a branch</a>
+        <a href="#dev-logs" class="sub">Logs &amp; debugging</a>
+        <a href="#dev-day" class="sub">Day-to-day</a>
+        <a href="#dev-config" class="sub">Build config</a>
+        <a href="#dev-trouble" class="sub">When something is off</a>
+        <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
+        <p class="side-group">Modules</p>
+        <a href="cli.html">CLI reference</a>
+        <a href="daemon.html">Daemon</a>
+        <a href="api.html">HTTP API</a>
+        <a href="dashboard.html">Web dashboard</a>
+        <p class="side-group">Operate</p>
+        <a href="security.html">Security &amp; hardening</a>
+      </nav>
+    </aside>
+
+    <main class="docs-content" id="content">
+
+      <section class="doc-section" id="dev-intro">
+        <p class="eyebrow">// for developers</p>
+        <h2>Someone gave you a token. Now what?</h2>
+        <p style="max-width:70ch; font-size:1.05rem;">
+          You do not run the Oxid server &mdash; someone on your team does. This page is the
+          whole of what you need: connect once, push a branch, get a URL, read the logs when
+          it misbehaves. Nothing here requires access to the server itself.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray"># once, on your machine:</span>
+oxid login http://oxid.tu-empresa.local:8080
+<span class="tk-gray">→ paste your token when prompted</span>
+
+<span class="tk-gray"># then, from any checkout, forever:</span>
+oxid up mi-rama
+oxid logs mi-rama</pre>
+      </section>
+
+      <section class="doc-section" id="dev-connect">
+        <h2>Connecting</h2>
+        <p>
+          <code>oxid login</code> saves the server and your token, checks both against the
+          daemon, and makes it active. From then on no command needs <code>--api</code> or
+          <code>--token</code>.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid login http://oxid.tu-empresa.local:8080
+Access token (paste and press enter): <span class="tk-gray">••••</span>
+<span class="tk-green">[+]</span> Logged in to http://oxid.tu-empresa.local:8080 as `juan` (developer)
+<span class="tk-gray">[~]</span> Projects: 1 — every other project answers 404
+<span class="tk-gray">[~]</span> Access expires: 2026-11-29 15:36:04
+<span class="tk-gray">[~]</span> You can: view environments and logs · deploy, pause, wake, destroy</pre>
+        <p>
+          The token is read from stdin rather than an argument, so it never lands in your shell
+          history or in the process list where anyone on a shared machine could read it with
+          <code>ps</code>. Pass <code>--token</code> instead when you are scripting.
+        </p>
+        <table class="docs-table">
+          <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td><code>oxid login &lt;url&gt;</code></td><td>Save a server and log in. <code>--as-name staging</code> if you use more than one.</td></tr>
+            <tr><td><code>oxid login</code></td><td>Log back in to the last server &mdash; the address is still saved, so you never re-type it.</td></tr>
+            <tr><td><code>oxid logout</code></td><td>Clear the token, keep the server. What you want on a shared machine.</td></tr>
+            <tr><td><code>oxid logout --forget</code></td><td>Remove the server entry too.</td></tr>
+            <tr><td><code>oxid server</code></td><td>List saved servers; the active one is marked, tokens masked.</td></tr>
+            <tr><td><code>oxid connect staging</code></td><td>Switch to another saved server.</td></tr>
+            <tr><td><code>oxid whoami</code></td><td>Who you are here, and what you may do.</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          Everything lives in <code>~/.config/oxid/config.toml</code>, written <code>0600</code>.
+          <code>oxid context</code> is the same thing with more knobs, if you prefer it.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-whoami">
+        <h2>What am I allowed to do?</h2>
+        <p>
+          Ask, instead of finding out from a <code>403</code> halfway through something:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid whoami
+<span class="tk-green">[+]</span> juan on http://oxid.tu-empresa.local:8080 (developer)
+<span class="tk-gray">[~]</span> Projects: 1 — every other project answers 404
+<span class="tk-gray">[~]</span> Access expires: 2026-11-29 15:36:04
+<span class="tk-gray">[~]</span> You can: view environments and logs · deploy, pause, wake, destroy</pre>
+        <table class="docs-table">
+          <thead><tr><th>Your role</th><th>You can</th><th>You cannot</th></tr></thead>
+          <tbody>
+            <tr><td><code>viewer</code></td><td>See environments, logs and history.</td><td>Change anything.</td></tr>
+            <tr><td><code>developer</code></td><td>Everything above, plus deploy, roll back, pause, wake and destroy environments.</td><td>Read or write secrets; change project settings.</td></tr>
+            <tr><td><code>maintainer</code></td><td>Everything above, plus your projects' secrets, settings and branch rules.</td><td>Anything about the server itself.</td></tr>
+            <tr><td><code>admin</code></td><td>The server too, and giving other people access.</td><td>—</td></tr>
+          </tbody>
+        </table>
+        <p>
+          Two answers mean different things, and it is worth knowing which you got.
+          A <strong>403</strong> tells you exactly what is wrong &mdash; your role is too low,
+          your access expired, it was suspended &mdash; and is something an operator can fix
+          for you. A <strong>404</strong> on a project means it is not in your scope; from
+          where you stand it does not exist.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-deploy">
+        <h2>Getting a branch running</h2>
+        <p>
+          Usually you do not: someone wires a webhook once, and every push deploys its branch
+          by itself. <code>oxid up</code> is for the times you want it <em>now</em>, or the
+          branch is not one the webhook rules cover.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">$</span> cd ~/code/tienda &amp;&amp; git checkout -b feature-carrito
+<span class="tk-gray">$</span> oxid up feature-carrito
+<span class="tk-orange">[&gt;]</span> Building image for feature-carrito...
+<span class="tk-green">[+]</span> Image built (cache hit: 100%, 832ms)
+<span class="tk-green">[+]</span> Environment live at: http://feature-carrito.tienda.local.dev/</pre>
+        <p>
+          The daemon clones the repository itself, from your checkout's <code>origin</code>.
+          It never reads your working tree &mdash; uncommitted work is not deployed, which is
+          usually what you want and always worth knowing.
+        </p>
+        <p class="note">
+          <strong>Asking explicitly always wins.</strong> If your team restricted which
+          branches deploy on push, <code>oxid up &lt;branch&gt;</code> still deploys the branch
+          you name. The filter is about what a <em>push</em> does, not about what you may ask
+          for.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-logs">
+        <h2>Reading logs, and working out what happened</h2>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid logs feature-carrito           <span class="tk-gray"># what the container printed</span>
+<span class="tk-gray">$</span> oxid logs feature-carrito --follow  <span class="tk-gray"># and keep printing</span>
+<span class="tk-gray">$</span> oxid logs feature-carrito --tail 200</pre>
+        <p>Where to look, by what you are actually asking:</p>
+        <table class="docs-table">
+          <thead><tr><th>The question</th><th>The command</th></tr></thead>
+          <tbody>
+            <tr><td>Is my branch up, and on what URL?</td><td><code>oxid status</code></td></tr>
+            <tr><td>What is my app printing?</td><td><code>oxid logs &lt;branch&gt;</code></td></tr>
+            <tr><td>Why did my deploy fail?</td><td><code>oxid logs &lt;branch&gt;</code> &mdash; a failed build leaves a <code>build_failed</code> environment whose logs are the build output.</td></tr>
+            <tr><td>Who deployed this, and when?</td><td><code>oxid audit --branch &lt;branch&gt;</code></td></tr>
+            <tr><td>Is it just waiting for capacity?</td><td><code>oxid queue</code></td></tr>
+            <tr><td>Is it me, or the server?</td><td><code>oxid doctor</code></td></tr>
+          </tbody>
+        </table>
+        <h3 style="font-size:1.05rem; margin:1.75rem 0 0.5rem;">States you will see</h3>
+        <table class="docs-table">
+          <thead><tr><th>State</th><th>Means</th></tr></thead>
+          <tbody>
+            <tr><td><code>building</code></td><td>The image is being built. First build of a branch is the slow one; after that the cache does most of the work.</td></tr>
+            <tr><td><code>running</code></td><td>Live and serving.</td></tr>
+            <tr><td><code>paused</code></td><td>Nobody used it for a while, so it was stopped and its memory given back. <strong>The next request wakes it</strong> &mdash; you do not have to do anything. <code>oxid wake &lt;branch&gt;</code> if you want it warm first.</td></tr>
+            <tr><td><code>build_failed</code></td><td>Your build or first start broke. The previous working environment, if any, is still serving &mdash; a broken push does not take the branch down.</td></tr>
+            <tr><td><code>destroyed</code></td><td>Gone: the branch was deleted, its lifetime ran out, or someone tore it down.</td></tr>
+          </tbody>
+        </table>
+        <p class="note">
+          A paused environment answering slowly on the first request is normal, not a bug: it
+          is the container starting. That is the whole point of scale-to-zero &mdash; your
+          idle branches are not holding the server's RAM.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-day">
+        <h2>The rest of the day-to-day</h2>
+        <pre class="cmd-block"><span class="tk-gray">$</span> oxid status                    <span class="tk-gray"># your branches, states and URLs</span>
+<span class="tk-gray">$</span> oxid ps                        <span class="tk-gray"># projects you can see</span>
+<span class="tk-gray">$</span> oxid pause feature-carrito     <span class="tk-gray"># give the RAM back now</span>
+<span class="tk-gray">$</span> oxid wake feature-carrito      <span class="tk-gray"># warm it before a demo</span>
+<span class="tk-gray">$</span> oxid down feature-carrito      <span class="tk-gray"># destroy it for good</span>
+<span class="tk-gray">$</span> oxid rollback feature-carrito --commit a1b2c3d
+<span class="tk-gray">$</span> oxid audit --branch feature-carrito</pre>
+        <p>
+          Every command takes <code>--json</code> and exits with a distinct code per failure
+          kind, so any of this drops into CI without parsing text.
+        </p>
+        <p class="note">
+          Prefer a browser? The same server serves a dashboard at its root. Paste your token
+          into the box in the top bar and you get the same view, plus live logs. It installs
+          as an app and opens offline &mdash; see <a href="dashboard.html">Web dashboard</a>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-config">
+        <h2>Changing how your branch is built</h2>
+        <p>
+          Most repositories need nothing: if yours has a <code>Dockerfile</code> it is used,
+          and if it does not, Oxid reads your <code>package.json</code>, <code>go.mod</code>,
+          <code>pyproject.toml</code> or <code>Cargo.toml</code> and generates one &mdash; see
+          <a href="stacks.html">Stacks &amp; builds</a>.
+        </p>
+        <p>
+          When you do need to say something, it goes in <code>oxid.toml</code> at the root of
+          your repository, and it is <strong>read from the commit being deployed</strong>. So
+          you can change it on your branch and see the effect on your branch alone:
+        </p>
+        <pre class="cmd-block"><span class="tk-orange">[build]</span>
+dockerfile = <span class="tk-green">"docker/Dockerfile.dev"</span>
+context    = <span class="tk-green">"."</span>
+on_start   = [<span class="tk-green">"./seed.sh"</span>]   <span class="tk-gray"># runs inside the container once it is up</span>
+
+<span class="tk-orange">[routing]</span>
+port = <span class="tk-green">3000</span>                <span class="tk-gray"># the port your app listens on</span></pre>
+        <p class="note">
+          The base domain and the idle/lifetime policy are <em>not</em> yours to change from a
+          branch &mdash; otherwise one branch could rewrite another's URL. Those belong to
+          whoever runs the server.
+        </p>
+      </section>
+
+      <section class="doc-section" id="dev-trouble">
+        <h2>When something is off</h2>
+        <table class="docs-table">
+          <thead><tr><th>What you see</th><th>What it is</th></tr></thead>
+          <tbody>
+            <tr><td><code>403 … needs the `maintainer` role</code></td><td>Your role is below the action. Ask an operator; nothing is broken.</td></tr>
+            <tr><td><code>403 … this access expired</code></td><td>Your token ran out. An operator issues a new one.</td></tr>
+            <tr><td><code>403 … has been suspended</code></td><td>Your access was switched off. It can be switched back on with the same token.</td></tr>
+            <tr><td><code>404 project …</code></td><td>Not in your scope. From where you stand it does not exist.</td></tr>
+            <tr><td><code>401 missing or invalid bearer token</code></td><td>Not logged in, or an <code>OXID_TOKEN</code> in your shell is overriding the saved one. <code>oxid whoami</code> says which server you are on.</td></tr>
+            <tr><td><code>cannot reach daemon</code></td><td>Wrong address, or the server is down. <code>oxid server</code> shows what you are pointed at; <code>oxid doctor</code> checks the rest.</td></tr>
+            <tr><td>Your branch deployed nothing on push</td><td>Your team may have restricted which branches deploy. <code>oxid up &lt;branch&gt;</code> still works, and <code>oxid audit</code> shows what happened.</td></tr>
+            <tr><td>The URL is slow the first time</td><td>The environment was paused and is waking. Normal.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <p class="docs-footer-note">
+        Something missing or wrong? The
+        <a href="https://github.com/sazardev/oxid/issues" target="_blank" rel="noopener">issue tracker</a>
+        takes docs bugs too.
+      </p>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <a href="#content" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
+        <span>oxid</span>
+      </a>
+      <p class="footer-tagline">Ephemeral environments that breathe.</p>
+      <nav class="footer-links">
+        <a href="index.html">Docs home</a>
+        <a href="../">Home</a>
+        <a href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
