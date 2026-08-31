@@ -65,12 +65,28 @@ open.
 
 ## Installation
 
-**One command** — full docker stack (daemon + Traefik, secrets generated,
-scale-to-zero wired):
+**One command** — daemon + Traefik, secrets generated, scale-to-zero wired,
+CLI installed and pointed at it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sazardev/oxid/main/install.sh | sh -s -- --docker
 ```
+
+It finishes by printing what you need, rather than telling you how to find
+it:
+
+```
+[+] Oxid is up. Everything below is ready to use — nothing else to run.
+
+    Dashboard    http://192.168.1.40:8080/
+    API token    4f3c…                  ← paste into the dashboard, or:
+    CLI          oxid --api http://192.168.1.40:8080 --token 4f3c… status
+    Webhook      http://192.168.1.40:8080/api/v1/webhooks/github
+    Secret       9ab2…
+```
+
+The CLI is configured against that daemon on the way out, so `oxid doctor`
+works immediately with no token to copy anywhere.
 
 Native server instead (systemd service + auto-generated secrets + Traefik):
 

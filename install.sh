@@ -52,6 +52,46 @@ as_root() {  # run a command as root only when we are not already root
 
 usage() { sed -n '2,24p' "$0"; exit 0; }
 
+# -----------------------------------------------------------------------------
+# Finishing the job
+#
+# The point of these two: an installer that ends by telling you to run three
+# more commands has not finished installing anything. The credentials it just
+# generated are printed, not described — a devops who has to `grep` a `.env`
+# to find the token the script created two seconds ago is doing the script's
+# work for it.
+#
+# Printing a secret to a terminal is a deliberate trade. It is the operator's
+# own machine, they just ran the installer as root, and the alternative is
+# every one of them pasting a `docker compose logs | grep` from the README.
+# The file it also lives in is written 0600.
+# -----------------------------------------------------------------------------
+
+# The address other machines can reach this host on, for the URLs a webhook
+# and a teammate's CLI actually need. Falls back to the loopback address
+# rather than a literal "DAEMON" nobody can paste anywhere.
+reachable_host() {
+  _ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
+  [ -n "${_ip}" ] || _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "${_ip}" ] || _ip="127.0.0.1"
+  printf '%s' "${_ip}"
+}
+
+# Points the CLI at the daemon it just installed, so `oxid status` works
+# without the operator ever seeing the token. Skipped silently when the CLI
+# is not on this machine — a docker-only install is a perfectly normal
+# choice.
+configure_cli() {  # configure_cli API TOKEN
+  have oxid || return 0
+  oxid context add local --api "$1" --token "$2" >/dev/null 2>&1 || return 0
+  # `add` stores the context; it does not select it. Without `use`, the CLI
+  # falls back to no credentials and every command 401s against the daemon
+  # this installer just set up — a context that exists and is never read.
+  oxid context use local >/dev/null 2>&1 || return 0
+  log "CLI configured — try: oxid doctor"
+}
+
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --server)  MODE="server" ;;
@@ -226,18 +266,27 @@ EOF
     fi
   fi
 
+  WEBHOOK_SECRET="$(as_root grep '^OXID_WEBHOOK_SECRET=' "${ENV_FILE}" | cut -d= -f2)"
+  HOST_ADDR="$(reachable_host)"
+  configure_cli "http://127.0.0.1:8080" "${API_TOKEN}"
+
   cat <<EOF
 
-[+] Oxid server is installed.
+[+] Oxid is installed. Everything below is ready to use — nothing else to run.
 
-    Control API : http://127.0.0.1:8080 (locally) — expose http://SERVER-IP:8080
-    CLI access  : oxid context add prod --api http://DAEMON:8080 \\
-                    --token \$(sudo grep ^OXID_API_TOKEN ${ENV_FILE} | cut -d= -f2)
-                  oxid doctor
-    Webhooks    : point your Git host at http://DAEMON:8080/api/v1/webhooks/github
-                  secret: \$(sudo grep ^OXID_WEBHOOK_SECRET ${ENV_FILE} | cut -d= -f2)
-    Data/backups: ${DATA}   (snapshots every 300s in ${DATA}/backups)
-    Logs        : journalctl -u oxidd -f
+    Dashboard    http://${HOST_ADDR}:8080/
+    API token    ${API_TOKEN}
+                 (paste into the dashboard's token box, or use the CLI below)
+
+    CLI          oxid --api http://${HOST_ADDR}:8080 --token ${API_TOKEN} status
+    Deploy       oxid up <branch>     (from a git checkout)
+
+    Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
+    Secret       ${WEBHOOK_SECRET}
+
+    These live in ${ENV_FILE} (0600).
+    Data/backups ${DATA}   (snapshots every 300s in ${DATA}/backups)
+    Logs         journalctl -u oxidd -f
 
     TLS: terminate at Traefik (already running) or set OXID_TLS_CERT/KEY in
     ${ENV_FILE} and 'systemctl restart oxidd'. Full guide: PRODUCTION.md
@@ -308,21 +357,26 @@ EOF
     warn "daemon not healthy yet — check: cd ${STACK} && docker compose logs oxid-daemon"
   fi
 
+  WEBHOOK_SECRET="$(grep '^OXID_WEBHOOK_SECRET=' "${STACK}/.env" | cut -d= -f2)"
+  HOST_ADDR="$(reachable_host)"
+  configure_cli "http://127.0.0.1:8080" "${API_TOKEN}"
+
   cat <<EOF
 
-[+] Oxid docker stack is up in ${STACK}.
+[+] Oxid is up. Everything below is ready to use — nothing else to run.
 
-    Dashboard  : http://DAEMON:8080/  — open it and follow the setup wizard
-                 (token → infra → first project → webhooks → CLI)
-    Token      : if the stack generated one (OXID_AUTO_TOKEN), read it with
-                   cd ${STACK} && docker compose logs oxid-daemon | grep -A2 Generated
-                 (or your own OXID_API_TOKEN from ${STACK}/.env)
-    CLI access : oxid context add prod --api http://DAEMON:8080 \\
-                   --token \$(grep ^OXID_API_TOKEN ${STACK}/.env | cut -d= -f2)
-                 oxid doctor
-    Webhooks   : http://DAEMON:8080/api/v1/webhooks/github
-                 secret: \$(grep ^OXID_WEBHOOK_SECRET ${STACK}/.env | cut -d= -f2)
-    Upgrade    : cd ${STACK} && docker compose pull && docker compose up -d
+    Dashboard    http://${HOST_ADDR}:8080/
+    API token    ${API_TOKEN}
+                 (paste into the dashboard's token box, or use the CLI below)
+
+    CLI          oxid --api http://${HOST_ADDR}:8080 --token ${API_TOKEN} status
+    Deploy       oxid up <branch>     (from a git checkout)
+
+    Webhook      http://${HOST_ADDR}:8080/api/v1/webhooks/github
+    Secret       ${WEBHOOK_SECRET}
+
+    These live in ${STACK}/.env (0600). Upgrade with:
+      cd ${STACK} && docker compose pull && docker compose up -d
 EOF
   exit 0
 fi

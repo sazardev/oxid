@@ -4,7 +4,13 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
-## [Unreleased]
+## [0.3.0] - 2026-08-31
+
+Oxid deploys a repository that has no Dockerfile. Sixteen stacks across
+eight runtimes are recognised from what a project already says about
+itself, and every one of them was verified by building and serving a real
+repository through Docker — a practice that found a defect in almost all of
+them, none of which was visible in the code.
 
 ### Changed
 
