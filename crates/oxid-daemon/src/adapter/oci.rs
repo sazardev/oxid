@@ -24,7 +24,8 @@ use oxid_core::services::tls::{
 };
 use oxid_core::{
     AcmeChallenge, BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus,
-    HostCapacity, LogStream, NetworkStatus, OciError, SelfWiringStatus, TraefikSpec, TraefikStatus,
+    HostCapacity, LogStream, NetworkStatus, OciError, RuntimeFlavor, RuntimeInfo, SelfWiringStatus,
+    TraefikSpec, TraefikStatus,
 };
 
 /// Backed by a Docker connection (default socket).
@@ -42,6 +43,28 @@ impl DockerClient {
         Docker::connect_with_defaults()
             .map(|docker| Self { docker })
             .map_err(map_err)
+    }
+
+    /// Connects to the runtime named by `OXID_CONTAINER_HOST`, or the
+    /// default socket.
+    ///
+    /// `bollard` already honours `DOCKER_HOST`, so pointing Oxid at Podman
+    /// has always worked — but only if you happened to know that, since
+    /// nothing in Oxid mentioned it. An explicit variable makes the
+    /// supported thing discoverable, and reads better in a systemd unit
+    /// than borrowing another product's name.
+    ///
+    /// # Errors
+    /// Returns [`OciError::Failure`] if the socket cannot be reached.
+    pub fn connect_from_env() -> Result<Self, OciError> {
+        match std::env::var("OXID_CONTAINER_HOST") {
+            Ok(host) if !host.trim().is_empty() => {
+                Docker::connect_with_local(&host, 120, bollard::API_DEFAULT_VERSION)
+                    .map(|docker| Self { docker })
+                    .map_err(map_err)
+            }
+            _ => Self::connect(),
+        }
     }
 }
 
@@ -588,6 +611,44 @@ impl ContainerPort for DockerClient {
                 .filter_map(|m| m.destination)
                 .collect(),
         }))
+    }
+
+    async fn runtime_info(&self) -> Result<RuntimeInfo, OciError> {
+        let version = self.docker.version().await.map_err(map_err)?;
+        // Podman identifies itself in `Components[].Name` ("Podman
+        // Engine"); Docker says "Engine". Fall back to the platform name so
+        // an unknown engine is reported as itself rather than mislabelled.
+        let components = version.components.unwrap_or_default();
+        let podman = components
+            .iter()
+            .any(|c| c.name.to_ascii_lowercase().contains("podman"));
+        let flavor = if podman {
+            RuntimeFlavor::Podman
+        } else if components.iter().any(|c| c.name == "Engine") {
+            RuntimeFlavor::Docker
+        } else {
+            RuntimeFlavor::Other(
+                version
+                    .platform
+                    .map_or_else(|| "unknown".to_owned(), |p| p.name),
+            )
+        };
+
+        let info = self.docker.info().await.map_err(map_err)?;
+        Ok(RuntimeInfo {
+            version: version.version.unwrap_or_else(|| "unknown".to_owned()),
+            // Docker's BuildKit progress is what the build report's
+            // cache numbers are parsed from; Podman's compat API does not
+            // emit it, which is why a Podman build shows a duration and no
+            // percentage.
+            buildkit: flavor == RuntimeFlavor::Docker,
+            rootless: info
+                .security_options
+                .unwrap_or_default()
+                .iter()
+                .any(|o| o.contains("rootless")),
+            flavor,
+        })
     }
 
     async fn ensure_volume(&self, name: &str) -> Result<(), OciError> {

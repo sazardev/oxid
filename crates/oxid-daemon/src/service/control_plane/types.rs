@@ -38,8 +38,17 @@ pub enum AdmissionMode {
 
 /// Aggregate node-wide counts for the web dashboard's overview — see
 /// [`crate::service::control_plane::ControlPlane::node_stats`].
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct NodeStats {
+    /// Which container engine this daemon drives (`docker`, `podman`, …)
+    /// and its version, so a bug report says what it ran on without anyone
+    /// having to ask.
+    #[serde(default)]
+    pub runtime: String,
+    /// Things that do not work on this runtime, already phrased for a
+    /// person. Empty on Docker.
+    #[serde(default)]
+    pub runtime_limitations: Vec<String>,
     /// Number of registered projects.
     pub projects: u64,
     /// Environments currently `Running`.

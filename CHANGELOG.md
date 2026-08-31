@@ -6,6 +6,37 @@ is the breaking position.
 
 ## [Unreleased]
 
+### Added
+
+- **Automatic TLS for preview environments.** `DESIGN.md` has always shown
+  `https://feature-login.local.dev` in its own example output and Oxid could
+  not produce it. Setting `OXID_ACME_EMAIL` turns it on; naming a DNS
+  provider selects DNS-01, where a single wildcard covers every branch that
+  will ever exist. HTTP-01 works too and issues one certificate per branch —
+  which meets Let's Encrypt's 50-per-domain-per-week limit on exactly the
+  repositories the branch filter was built for, so the docs say so.
+
+  The Traefik command line now comes from one place
+  (`oxid_core::services::tls::traefik_cmd`) instead of being written twice,
+  which is what makes `oxid infra status` able to compare the *running*
+  proxy against it. That check previously asked only whether a container
+  named `oxid-traefik` existed: verified live, a Traefik missing every flag
+  Oxid needs reported healthy, and now reports 15 specific findings.
+
+  The wake catch-all router had to learn `websecure`. A sleeping branch has
+  no router of its own, so with TLS on and the catch-all listening only on
+  `web`, every sleeping branch would have silently stopped waking.
+
+- **Podman.** Oxid drives it already — `bollard` speaks the API Podman
+  exposes — but nothing said so and nothing told you what differs.
+  `OXID_CONTAINER_HOST` names the socket explicitly, and `oxid doctor` now
+  reports the runtime and its limitations: verified against Podman 6.1,
+  builds work and report a duration with no cache percentage (the progress
+  stream is not `BuildKit`'s), and a rootless engine cannot bind port 80.
+  Traefik's Docker provider against a Podman socket is reported as
+  unverified rather than assumed: direct-publish is the supported topology
+  there, and it needs no proxy at all.
+
 ### Fixed
 
 - **`oxid infra setup` failed on any host that had never pulled Traefik.**

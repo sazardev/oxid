@@ -11,6 +11,110 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Which container engine the daemon is actually talking to.
+///
+/// Detected rather than configured: `bollard` speaks the Docker API, and
+/// Podman exposes a compatible socket, so Oxid can drive either. What
+/// differs is what *works* — and a person deserves to be told which they
+/// are on before they hit a limitation, not after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeFlavor {
+    /// Docker Engine.
+    Docker,
+    /// Podman through its Docker-compatible API.
+    Podman,
+    /// Something else answering the Docker API.
+    Other(String),
+}
+
+impl RuntimeFlavor {
+    /// The name to show a person.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+            Self::Other(name) => name,
+        }
+    }
+}
+
+/// What the container runtime reports about itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    /// Which engine.
+    pub flavor: RuntimeFlavor,
+    /// Its version string.
+    pub version: String,
+    /// Whether it runs without root.
+    pub rootless: bool,
+    /// Whether builds go through `BuildKit`, which is what produces the
+    /// cache-effectiveness numbers a build report shows.
+    pub buildkit: bool,
+}
+
+/// Something that does not work on this runtime, phrased for a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Limitation {
+    /// No `BuildKit` means no cache statistics.
+    NoBuildKitMetrics,
+    /// A rootless engine cannot bind a privileged host port.
+    RootlessPrivilegedPort(u16),
+    /// Traefik's Docker provider against a non-Docker socket is not
+    /// something Oxid has verified.
+    TraefikProviderUnverified(String),
+}
+
+impl Limitation {
+    /// The line an operator reads.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::NoBuildKitMetrics => "this runtime does not report BuildKit progress, so \
+                 builds show a duration but no cache-hit percentage"
+                .to_owned(),
+            Self::RootlessPrivilegedPort(port) => format!(
+                "this runtime is rootless and cannot bind host port {port}; either raise \
+                 net.ipv4.ip_unprivileged_port_start, or set OXID_TRAEFIK_HTTP_PORT to a \
+                 port above 1024"
+            ),
+            Self::TraefikProviderUnverified(flavor) => format!(
+                "Traefik's Docker provider against a {flavor} socket is not verified by \
+                 Oxid: direct-publish mode (OXID_DOCKER_NETWORK unset) is the supported \
+                 topology on this runtime"
+            ),
+        }
+    }
+}
+
+/// Everything about `info` that will not work as it does on Docker.
+///
+/// Pure so every combination is testable without a container runtime —
+/// which is the point, because the combinations that matter (rootless plus
+/// a privileged port, non-Docker plus Traefik) are the ones nobody has a
+/// machine for when they need the answer.
+#[must_use]
+pub fn limitations(
+    info: &RuntimeInfo,
+    traefik_http_port: u16,
+    traefik_enabled: bool,
+) -> Vec<Limitation> {
+    let mut out = Vec::new();
+    if !info.buildkit {
+        out.push(Limitation::NoBuildKitMetrics);
+    }
+    if info.rootless && traefik_http_port < 1024 {
+        out.push(Limitation::RootlessPrivilegedPort(traefik_http_port));
+    }
+    if traefik_enabled && info.flavor != RuntimeFlavor::Docker {
+        out.push(Limitation::TraefikProviderUnverified(
+            info.flavor.as_str().to_owned(),
+        ));
+    }
+    out
+}
+
 /// Outcome of [`crate::ContainerPort::ensure_network`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,5 +384,66 @@ mod tests {
             has_wake_catchall: false,
         };
         assert!(!missing_catchall.is_fully_wired());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn info(flavor: RuntimeFlavor, rootless: bool, buildkit: bool) -> RuntimeInfo {
+        RuntimeInfo {
+            flavor,
+            version: "test".to_owned(),
+            rootless,
+            buildkit,
+        }
+    }
+
+    #[test]
+    fn docker_with_buildkit_on_port_80_has_nothing_to_warn_about() {
+        let docker = info(RuntimeFlavor::Docker, false, true);
+        assert!(limitations(&docker, 80, true).is_empty());
+    }
+
+    /// Verified live against Podman 6.1: builds succeed and report a
+    /// duration with no cache percentage, because the progress stream is
+    /// not `BuildKit`'s.
+    #[test]
+    fn a_runtime_without_buildkit_loses_only_the_cache_numbers() {
+        let podman = info(RuntimeFlavor::Podman, false, false);
+        let found = limitations(&podman, 8080, false);
+        assert_eq!(found, vec![Limitation::NoBuildKitMetrics]);
+        assert!(found[0].describe().contains("cache-hit"));
+    }
+
+    #[test]
+    fn rootless_cannot_take_a_privileged_port_and_says_which() {
+        let rootless = info(RuntimeFlavor::Podman, true, false);
+        let found = limitations(&rootless, 80, false);
+        assert!(found.contains(&Limitation::RootlessPrivilegedPort(80)));
+        // Above 1024 is fine, so the warning must not fire for it.
+        assert!(
+            !limitations(&rootless, 8080, false)
+                .contains(&Limitation::RootlessPrivilegedPort(8080))
+        );
+    }
+
+    /// Traefik's Docker provider is the real portability question on a
+    /// non-Docker socket — not bollard, which already works. Say so instead
+    /// of letting someone find out from routes that never appear.
+    #[test]
+    fn traefik_is_flagged_as_unverified_off_docker_and_only_when_enabled() {
+        let podman = info(RuntimeFlavor::Podman, false, false);
+        assert!(
+            limitations(&podman, 8080, true)
+                .iter()
+                .any(|l| matches!(l, Limitation::TraefikProviderUnverified(_)))
+        );
+        assert!(
+            !limitations(&podman, 8080, false)
+                .iter()
+                .any(|l| matches!(l, Limitation::TraefikProviderUnverified(_)))
+        );
     }
 }

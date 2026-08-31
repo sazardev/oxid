@@ -19,7 +19,8 @@ pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
 pub use infra::{
-    AcmeChallenge, AcmeConfig, NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus,
+    AcmeChallenge, AcmeConfig, Limitation, NetworkStatus, RuntimeFlavor, RuntimeInfo,
+    SelfWiringStatus, TraefikSpec, TraefikStatus, limitations,
 };
 pub use ports::{
     AuditFilter, AuditStore, BuildReport, BuildSpec, CommitRef, ContainerPort, ContainerSpec,

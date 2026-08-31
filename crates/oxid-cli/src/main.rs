@@ -2509,6 +2509,21 @@ fn print_doctor_report(
 /// Renders one `GET /api/v1/stats` payload — shared by `doctor`'s capacity
 /// section and `oxid stats`.
 fn print_node_stats(node_stats: &Value) {
+    // Which engine, before the capacity numbers: on Podman the numbers are
+    // right but some behaviour differs, and knowing which runtime you are
+    // on is the first thing a bug report needs.
+    if let Some(runtime) = node_stats["runtime"].as_str().filter(|r| !r.is_empty()) {
+        ok(format!("Container runtime: {runtime}"));
+    }
+    for limitation in node_stats["runtime_limitations"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+    {
+        bg(limitation);
+    }
     let mem_bytes = node_stats["host_total_memory_bytes"].as_u64().unwrap_or(0);
     let cpus = node_stats["host_cpu_count"].as_u64().unwrap_or(0);
     if mem_bytes == 0 || cpus == 0 {

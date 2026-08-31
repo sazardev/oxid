@@ -54,6 +54,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         stats.host_total_memory_bytes = host.total_memory_bytes;
         stats.host_cpu_count = host.cpu_count;
         stats.traefik_enabled = self.docker_network.is_some();
+        // Best-effort: a runtime that will not answer `version` is already
+        // reported by everything else failing, and a missing label must not
+        // turn `oxid stats` into an error.
+        if let Ok(info) = self.oci.runtime_info().await {
+            stats.runtime = format!("{} {}", info.flavor.as_str(), info.version);
+            stats.runtime_limitations =
+                oxid_core::limitations(&info, self.traefik_http_port(), stats.traefik_enabled)
+                    .iter()
+                    .map(oxid_core::Limitation::describe)
+                    .collect();
+        }
         Ok(stats)
     }
 

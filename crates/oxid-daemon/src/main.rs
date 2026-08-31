@@ -25,6 +25,37 @@
 //!   `last_accessed_at` on real traffic, which nothing calls in direct-publish
 //!   mode — the GC sweep is a deliberate no-op there instead of auto-pausing/
 //!   destroying environments on data it has no way to know is accurate.
+//! - `OXID_CONTAINER_HOST` — the container runtime's socket, e.g.
+//!   `unix:///run/user/1000/podman/podman.sock`. Defaults to Docker's usual
+//!   socket. Podman answers the same API, so Oxid drives it too; `oxid
+//!   doctor` names the runtime it found and what does not work on it
+//!   (`BuildKit` cache statistics, privileged ports when rootless, and
+//!   Traefik's Docker provider, which Oxid has not verified off Docker —
+//!   direct-publish mode is the supported topology there).
+//! - `OXID_ACME_EMAIL` — turns on automatic certificates for deployed
+//!   environments. Unset means plain HTTP, which is what every install
+//!   without it keeps.
+//! - `OXID_ACME_DNS_PROVIDER` — a lego provider code (`cloudflare`,
+//!   `route53`, …) selects the DNS-01 challenge, which issues **one wildcard
+//!   covering every branch** and needs no inbound reachability. Without it
+//!   the HTTP-01 challenge is used, which issues one certificate *per
+//!   branch* — Let's Encrypt allows 50 new certificates per registered
+//!   domain per week, so a repository with many live branches will hit that
+//!   wall. DNS-01 is the recommended shape.
+//! - `OXID_ACME_DNS_ENV` — comma-separated **names** of the environment
+//!   variables the DNS provider reads (e.g. `CF_DNS_API_TOKEN`). Only the
+//!   names are configuration; the values are read from this daemon's own
+//!   environment when Traefik is created, so a credential never enters a
+//!   struct that could be serialized into a response or a log.
+//! - `OXID_ACME_CA` — `staging` (strongly recommended while setting this
+//!   up), `production`, or a directory URL.
+//! - `OXID_ACME_STORAGE` — Docker **volume** holding `acme.json` (default
+//!   `oxid-acme`). A named volume rather than a bind mount because Traefik
+//!   refuses to start when that file is not `0600`, and a bind mount an
+//!   operator created is almost always `0644`.
+//! - `OXID_ACME_HTTP_REDIRECT` — `0` disables the 80→443 redirect.
+//! - `OXID_TRAEFIK_HTTPS_PORT` — host port for the `websecure` entrypoint
+//!   (default 443), the TLS counterpart of `OXID_TRAEFIK_HTTP_PORT`.
 //! - `OXID_TRAEFIK_HTTP_PORT` — host port `oxid infra setup` publishes the
 //!   built-in Traefik's `web` entrypoint on (default `80`). Traefik always
 //!   listens on 80 *inside* its container; this only chooses where that
@@ -186,7 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     apply_staged_restore(&data_dir_path)?;
     let store = SqliteStore::open(db_path, cipher).await?;
     let git = GitClient::new();
-    let oci = DockerClient::connect()?;
+    let oci = DockerClient::connect_from_env()?;
     let mut cp = ControlPlane::new(store, git, oci, cache_dir);
     if let Ok(network) = std::env::var("OXID_DOCKER_NETWORK") {
         let daemon_url = std::env::var("OXID_DAEMON_URL")

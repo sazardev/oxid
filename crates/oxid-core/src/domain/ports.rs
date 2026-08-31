@@ -16,7 +16,9 @@ use futures_core::Stream;
 use crate::domain::audit::AuditEvent;
 use crate::domain::branch::BranchName;
 use crate::domain::environment::{Environment, EnvironmentId};
-use crate::domain::infra::{NetworkStatus, SelfWiringStatus, TraefikSpec, TraefikStatus};
+use crate::domain::infra::{
+    NetworkStatus, RuntimeInfo, SelfWiringStatus, TraefikSpec, TraefikStatus,
+};
 use crate::domain::project::{Project, ProjectId};
 use crate::domain::secret_context::{EnvVarScope, SecretContext, SecretValue};
 use crate::domain::services::tls::TraefikRuntime;
@@ -581,4 +583,15 @@ pub trait ContainerPort {
     /// # Errors
     /// Any container-runtime failure.
     async fn ensure_volume(&self, name: &str) -> Result<(), OciError>;
+
+    /// Which container engine this is, and what it can do.
+    ///
+    /// Oxid drives Podman as well as Docker — both answer the same API —
+    /// but not everything works identically, and a person should be told
+    /// which engine they are on and what it costs them before they trip
+    /// over it.
+    ///
+    /// # Errors
+    /// Any container-runtime failure.
+    async fn runtime_info(&self) -> Result<RuntimeInfo, OciError>;
 }

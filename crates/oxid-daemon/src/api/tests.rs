@@ -104,6 +104,14 @@ impl FakeOci {
 }
 
 impl ContainerPort for FakeOci {
+    async fn runtime_info(&self) -> Result<oxid_core::RuntimeInfo, OciError> {
+        Ok(oxid_core::RuntimeInfo {
+            flavor: oxid_core::RuntimeFlavor::Docker,
+            version: "fake".to_owned(),
+            rootless: false,
+            buildkit: true,
+        })
+    }
     async fn traefik_runtime(
         &self,
         _name: &str,
