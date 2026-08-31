@@ -29,7 +29,7 @@ Toolchain pinned in `rust-toolchain.toml` — `stable` + `clippy` + `rustfmt`. N
 
 ## Architecture (hexagonal, SPEC.md §2)
 
-- `oxid-core` — pure domain, zero I/O. Entities `Project/Branch/Environment/ResourcePool/SecretContext`, state machine `Building/Running/Paused/Hibernating/Destroyed/BuildFailed`, port traits in `domain/ports.rs` (all `#[trait_variant::make(Send)]`), services in `domain/services/` (`gc.rs`, `subdomain.rs`, `var_resolution.rs: Global→Project→Branch→Runtime`).
+- `oxid-core` — pure domain, zero I/O. Entities `Project/Branch/Environment/ResourcePool/SecretContext`, state machine `Building/Running/Paused/Hibernating/Destroyed/BuildFailed`, port traits in `domain/ports.rs` (all `#[trait_variant::make(Send)]`), services in `domain/services/` (`gc.rs`, `subdomain.rs`, `var_resolution.rs: Global→Project→Branch→Runtime`, `stack/` detection, `branch_filter.rs`, `access.rs`).
 - `oxid-daemon` — binary `oxidd`: `adapter/store.rs` (SQLite+`sqlx`, secrets AES-GCM via `adapter/crypto.rs`), `adapter/git.rs` (`git2` cached clones, optional per-project token for private repos), `adapter/oci.rs` (`bollard` on `/var/run/docker.sock`, network/Traefik bootstrap), `adapter/config.rs` (`oxid.toml`) + `compose.rs` (docker-compose.yml detection) + `postgres_pool.rs` (shared-Postgres per-branch DBs); `service/control_plane/` (`ControlPlane` split SRP: deploy/provision/lifecycle/gc/infra/admission/auth/project), `service/proxy.rs` (built-in per-branch TCP reverse proxy — stable `public_port`, zero-downtime redeploys), `service/scheduler.rs` (tokio GC tick + deploy-queue retry), `api/` (`axum` router in `mod.rs`, one file per resource in `handlers/`, `middleware.rs` auth+rate-limit+request-id, `dashboard.rs` embedded SPA).
 - `oxid-cli` — thin `clap` HTTP client, no business logic (multi-context config in `cli/config.rs`).
 
@@ -45,12 +45,14 @@ Daemon env (`crates/oxid-daemon/src/main.rs`):
 - `OXID_DATA_DIR` default `/data` → `audit.sqlite` (WAL), `git-cache/`, `secret.key` (0600, AES-GCM, `OXID_MASTER_KEY` 64-hex or auto-generated)
 - `OXID_ADDR` default `0.0.0.0:8080`, `OXID_GC_INTERVAL_SECS` default `30`, `OXID_DEPLOY_CONCURRENCY` default `4` (queued deploys per drain wave; see `service/control_plane/mod.rs::default_deploy_concurrency`). Per-project `git fetch` is coalesced in `service/refresh_coalescer.rs` — sharing is decided on when a caller *asked*, never on the age of the result, so it is coalescing rather than caching and has no staleness window
 - `OXID_WEBHOOK_SECRET` — HMAC-SHA256 (GitHub/Gitea/Gogs) + token echo (GitLab); webhooks rejected if unset; routes `/api/v1/webhooks/{github,gitlab,gitea,gogs}`
-- `OXID_API_TOKEN` — bearer auth; **daemon refuses to start on a non-loopback bind without it** (override `OXID_ALLOW_OPEN_API=1`); named tokens (`oxid token create [--project id]...`, migration `0010`) are project-scopable — scoped tokens get 404 outside their projects and 403 on node-wide routes (see `api/middleware.rs::authorize_project`)
+- `OXID_API_TOKEN` — bearer auth; **daemon refuses to start on a non-loopback bind without it** (override `OXID_ALLOW_OPEN_API=1`). Named credentials (`oxid token create <name> [--project id] [--role R] [--expires-in 90d]`, migrations `0010`/`0017`) carry a role, a scope and an expiry; `oxid_core::services::access` holds the rules and `api/middleware.rs::authorize(&authed, Capability::X, project)` is the only way a route asks. Out-of-scope → 404 (no existence leak), everything else → 403 with the reason. A scoped credential is refused **any** action with no project id, whatever the capability — that is what stops it writing a *global* secret. `require_master` survives for exactly two things an `admin` must not have: `rotate-key` and `setup/webhook-secret`
+- `OXID_BOOTSTRAP_TOKEN_ACCESS` (`loopback`/`any`/`off`) — who `GET /api/v1/setup/token` answers pre-auth. The shipped compose sets `off` **and** publishes `8080:8080`; the two go together, and re-enabling `any` with the port open hands out the master token
+- `GET /api/v1/me` (behind `oxid whoami`) reports the caller's own grant; its capability list is derived from the role, never written out separately
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. (see `main.rs`)
 - `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required) — per-client-IP bucket on protected routes
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
 
-CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. Run: `cargo run -p oxid-daemon` / `cargo run -p oxid-cli -- <subcommand>` (e.g. `ps`, `up`, `logs -f`). Docker required for daemon (build/run/pause), not for `cargo test` (pure `oxid-core` tests are instant; `oxid-daemon` integration tests use in-memory SQLite unless `#[ignore]` Docker tests).
+CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. `oxid login/logout/connect/server/whoami` wrap the context config (`cli/config.rs`); `login` reads the token from stdin and verifies it against `/api/v1/me` before saving, `logout` clears the credential but keeps the address. Run: `cargo run -p oxid-daemon` / `cargo run -p oxid-cli -- <subcommand>` (e.g. `ps`, `up`, `logs -f`). Docker required for daemon (build/run/pause), not for `cargo test` (pure `oxid-core` tests are instant; `oxid-daemon` integration tests use in-memory SQLite unless `#[ignore]` Docker tests).
 
 ## Hooks & CI
 
@@ -66,6 +68,10 @@ CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. Run: `
 
 ## Gotchas
 
+- **Docs are part of the change.** `docs/` is a hand-written GitHub Pages site (`docs/docs/*.html`, sidebar duplicated per page) that documents what `install.sh` prints, what the stack table detects, and what each role may do. Change any of those and the page is stale.
+- **Two things must not be undone in `access.rs`:** an out-of-scope denial answers 404 (403 would confirm the project exists), and a scoped credential is refused any action with `project: None` — the version that also asked whether the capability *looked* project-local let a scoped maintainer write a global secret.
+- **`[deploy]` lives on the project row (migration `0016`), not in the per-commit config**, because the branch filter has to answer before the checkout — reading it from the pushed commit would do the fetch the filter exists to avoid. Only webhooks are filtered; `oxid up <branch>` never is.
+- **Image tags are lowercased in full** (`helpers.rs::image_name`). Docker refuses any other reference, so `JIRA-123` failed every deploy before that.
 - `cargo test --workspace` also triggers `build.rs` hook wiring — first run sets `core.hooksPath` to `.githooks/` (local per-repo config only).
 - `pre-push` and `ci.yml` use `-D warnings` — a `clippy::pedantic` warn that passes locally will still fail push/CI.
 - Secrets never in logs/API/audit: encrypted at rest (AES-GCM), `secret.key` must be `0600`, `gitleaks` scans staged diff + push range + full history in CI.

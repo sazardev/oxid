@@ -4,10 +4,12 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
-## [Unreleased]
+## [0.4.0] - 2026-08-31
+
+A release about the two things between Oxid and a server a devops hands to a
+team: **who may do what**, and **which branches are worth an environment**.
 
 ### Added
-
 - **`oxid login` / `logout` / `connect` / `server` / `whoami`.** Pointing the
   CLI at a server was `context add` followed by `context use` — two commands
   and a name to invent for what is one step, which is why people kept passing
@@ -42,6 +44,16 @@ is the breaking position.
   and a test asserts that against the real routes. It needs no capability
   beyond being authenticated: a credential asking about itself reveals
   nothing it does not already hold.
+
+- **The documentation site gained the pages it was missing.** It described a
+  product that still needed a Dockerfile: `stacks.html` (the 23 detections,
+  precedence, generated image sizes, cache mounts, monorepos) and
+  `security.html` (what mounting the Docker socket implies, the publish
+  surface, the access model, webhook verification, key rotation) are new, and
+  `install.html` was rewritten as the complete setup — what each mode writes
+  and where, the output the installer really prints, removal, and a
+  troubleshooting table built from failures that actually happened.
+  `dashboard.html` gained the PWA, offline and responsive behaviour.
 
 - **A developer-facing documentation page** (`docs/docs/developers.html`) for
   the person who was handed a token rather than a server: connecting, getting
@@ -98,47 +110,6 @@ is the breaking position.
   `token create` prints the role it granted so the permissive default is
   visible rather than silent.
 
-### Changed
-
-- **The control API is published on every interface by default.** It was
-  `127.0.0.1` only, which meant a team's developers could not connect their
-  CLI and a Git host could not deliver a webhook without editing the compose
-  file first — and the webhook URL the installer printed pointed at an
-  address nothing could reach.
-
-  The port was never the security boundary; the credential is. Every route
-  requires a bearer token, the daemon refuses to start on a non-loopback bind
-  without one, credentials now carry a role and an expiry, and
-  `OXID_BOOTSTRAP_TOKEN_ACCESS` is now `off` in the shipped compose — so
-  nothing hands out a token pre-auth. The installer prints it instead, which
-  reaches exactly one person on the machine that ran it.
-
-  What an open port does not give you is confidentiality: put TLS in front
-  before this crosses a network you do not control. Narrowing the publish
-  back to `127.0.0.1:8080:8080` remains one line.
-
-### Fixed
-
-- **A branch with an uppercase letter could not be deployed at all.** The
-  image tag is built from the project and branch name, and Docker refuses any
-  reference that is not lowercase — so `JIRA-123`, `ABC-456-fix` and every
-  other ticket-prefixed branch failed with `invalid reference format:
-  repository name must be lowercase`, a message that never mentions branch
-  names. Ticket prefixes are among the most common branch naming schemes
-  there is. The tag is now lowercased in full. Two branches differing only in
-  case share a tag as a result, which Docker leaves no way to avoid and which
-  costs nothing: every deploy rebuilds its image, and a running container
-  holds its image by id.
-- `oxid doctor` opened with two raw `403 Forbidden` errors when run with a
-  project-scoped token. Its node-wide probes (capacity, infra) are refused
-  for such a token *by design*, and doctor already reported that gently — but
-  the underlying request printed the rejection on its way out, so a
-  developer's first command against a shared daemon looked like a failure.
-  The probes are now quiet, and the explanation names the real reason instead
-  of suggesting the daemon is out of date.
-
-### Added
-
 - **`[deploy]` in `oxid.toml`: which branches a push actually deploys.** Every
   pushed branch got an environment, which is the product on a normal
   repository and a problem on one with two hundred branches — most of them
@@ -184,6 +155,43 @@ is the breaking position.
   with defaults that say exactly that, and an unreadable pattern list falls
   back to "deploy everything": a filter failing closed would silently stop
   deploying a project, and a silent stop is the hardest outage to find.
+
+### Changed
+- **The control API is published on every interface by default.** It was
+  `127.0.0.1` only, which meant a team's developers could not connect their
+  CLI and a Git host could not deliver a webhook without editing the compose
+  file first — and the webhook URL the installer printed pointed at an
+  address nothing could reach.
+
+  The port was never the security boundary; the credential is. Every route
+  requires a bearer token, the daemon refuses to start on a non-loopback bind
+  without one, credentials now carry a role and an expiry, and
+  `OXID_BOOTSTRAP_TOKEN_ACCESS` is now `off` in the shipped compose — so
+  nothing hands out a token pre-auth. The installer prints it instead, which
+  reaches exactly one person on the machine that ran it.
+
+  What an open port does not give you is confidentiality: put TLS in front
+  before this crosses a network you do not control. Narrowing the publish
+  back to `127.0.0.1:8080:8080` remains one line.
+
+### Fixed
+- **A branch with an uppercase letter could not be deployed at all.** The
+  image tag is built from the project and branch name, and Docker refuses any
+  reference that is not lowercase — so `JIRA-123`, `ABC-456-fix` and every
+  other ticket-prefixed branch failed with `invalid reference format:
+  repository name must be lowercase`, a message that never mentions branch
+  names. Ticket prefixes are among the most common branch naming schemes
+  there is. The tag is now lowercased in full. Two branches differing only in
+  case share a tag as a result, which Docker leaves no way to avoid and which
+  costs nothing: every deploy rebuilds its image, and a running container
+  holds its image by id.
+- `oxid doctor` opened with two raw `403 Forbidden` errors when run with a
+  project-scoped token. Its node-wide probes (capacity, infra) are refused
+  for such a token *by design*, and doctor already reported that gently — but
+  the underlying request printed the rejection on its way out, so a
+  developer's first command against a shared daemon looked like a failure.
+  The probes are now quiet, and the explanation names the real reason instead
+  of suggesting the daemon is out of date.
 
 ## [0.3.1] - 2026-08-31
 

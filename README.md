@@ -79,14 +79,23 @@ it:
 [+] Oxid is up. Everything below is ready to use — nothing else to run.
 
     Dashboard    http://192.168.1.40:8080/
-    API token    4f3c…                  ← paste into the dashboard, or:
-    CLI          oxid --api http://192.168.1.40:8080 --token 4f3c… status
+    API token    4f3c…                  ← paste into the dashboard
+    CLI          oxid doctor            (verifies the token) — then oxid ps
     Webhook      http://192.168.1.40:8080/api/v1/webhooks/github
     Secret       9ab2…
+
+    Give a teammate access — they never need this master token:
+      oxid token create juan --project 1 --role developer --expires-in 90d
 ```
 
 The CLI is configured against that daemon on the way out, so `oxid doctor`
 works immediately with no token to copy anywhere.
+
+The control API listens on every interface, because your team's CLIs and
+your Git host have to reach it. The port is not the boundary — every route
+needs a token, the daemon refuses to start on a non-loopback bind without
+one, and nothing hands out a credential pre-auth. Put TLS in front before it
+crosses a network you don't control.
 
 Native server instead (systemd service + auto-generated secrets + Traefik):
 
@@ -130,16 +139,54 @@ automatically the first time you visit the dashboard:
    you.
 4. **Webhooks** — copy-paste the exact URL and secret into your Git host;
    pushed branches deploy themselves from then on.
-5. **CLI & team** — ready-made `oxid context add …` snippet, plus guidance
-   for minting project-scoped tokens instead of sharing the master one.
+5. **CLI & team** — ready-made snippets, plus guidance for issuing
+   role-scoped credentials instead of sharing the master one.
 
 Prefer the terminal? The same flow is:
 
 ```bash
-oxid context add prod --api http://DAEMON:8080 --token $TOKEN
+oxid login http://DAEMON:8080          # token read from stdin, verified, saved
 oxid up main --repo https://github.com/you/app.git   # registers + deploys
 oxid infra setup                                      # network + Traefik
 ```
+
+### Giving your team access
+
+A credential says what a person may do, where, and until when — so the
+developer who ships code never holds the secrets that code is handed:
+
+```bash
+oxid token create juan  --project 1 --role developer  --expires-in 90d
+oxid token create ana   --project 1 --role viewer
+oxid token create ops2               --role admin      # can issue access too
+oxid token suspend 2    # reversible — someone on leave
+```
+
+| Role | Can | Cannot |
+|---|---|---|
+| `viewer` | read environments, logs, history | change anything |
+| `developer` | deploy, roll back, pause, wake, destroy | secrets, project settings |
+| `maintainer` | its projects' secrets, settings, branch rules | anything node-wide |
+| `admin` | the node, and issuing access to others | rotate the master key |
+
+On the other side, a developer runs `oxid login`, then `oxid whoami` to see
+exactly what they may do — instead of finding out from a 403 halfway through
+something. See the [developer guide](https://sazardev.github.io/oxid/docs/developers.html).
+
+### Two hundred branches?
+
+Every pushed branch gets an environment, which is the product on a normal
+repository and waste on a large one. A project can say which are worth it:
+
+```toml
+[deploy]
+branches = ["main", "develop", "release/*"]
+ignore   = ["dependabot/*", "wip/*"]
+max_environments = 25
+```
+
+`oxid up <branch>` is never filtered — a person naming a branch is asking for
+that branch.
 
 See [`docker-compose.yml`](docker-compose.yml) for a fuller setup wired to
 Traefik (routing + scale-to-zero wake-on-request), matching `SPEC.md` §6.
@@ -149,9 +196,10 @@ idempotently creates the Docker network and starts Traefik for you.
 
 **Going to production?** Read [`PRODUCTION.md`](PRODUCTION.md): the supported
 Traefik topology, the auth baseline (a non-loopback daemon *refuses to start*
-without `OXID_API_TOKEN`), team access via project-scoped tokens
-(`oxid token create bob --project 1 --project 3`), backup/restore, and the
-upgrade protocol.
+without `OXID_API_TOKEN`), team access via roles and project scopes,
+backup/restore, and the upgrade protocol. The
+[security page](https://sazardev.github.io/oxid/docs/security.html) explains
+why each control defaults the way it does.
 
 **Pre-built binaries:** every [tagged
 release](https://github.com/sazardev/oxid/releases) publishes `oxid` (CLI)

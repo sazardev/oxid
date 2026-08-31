@@ -123,33 +123,68 @@ Restart=on-failure
 - **`OXID_WEBHOOK_SECRET`**: without it every webhook is rejected. Use one
   secret across providers; GitHub/Gitea/Gogs verify HMAC-SHA256 signatures,
   GitLab compares its plain token constant-time.
+- **`OXID_BOOTSTRAP_TOKEN_ACCESS`**: `GET /api/v1/setup/token` hands the
+  auto-generated master token to a caller *before* authentication, so the
+  onboarding wizard can finish. The shipped compose sets `off`, because it
+  publishes the port on every interface — a containerized daemon sees every
+  caller arrive from the bridge gateway, so `loopback` would not mean
+  loopback there and `any` would hand the master token to whoever reached
+  the port first. Leave it `off` unless the port is genuinely private.
+- **The port is published on every interface by default** (since v0.4.0), so
+  your team's CLIs and your Git host can reach it without editing anything.
+  The port was never the boundary — the credential is. Narrow it back to
+  `127.0.0.1:8080:8080` if only this host ever talks to the daemon.
 - Never put the dashboard/API on the internet without the token; `/health`,
   `/wake`, `/heartbeat` and the webhook routes are the only unauthenticated
   paths, and each is safe-by-design (wake/heartbeat only touch Oxid-managed
   environments).
 
-## 4. Team access: named tokens and project scoping
+## 4. Team access: roles, scopes and expiries
 
 Handing the master token to every teammate means anyone can destroy anything.
-Instead, mint named tokens — audit events are attributed to the operator's
-name automatically:
+Instead, issue a credential that says what a person may do, where, and until
+when — audit events are attributed to their name automatically:
 
 ```bash
-# Full-access operator (same reach as master, but attributable):
-oxid token create alice
+oxid token create juan  --project 1 --role developer  --expires-in 90d
+oxid token create ana   --project 1 --role viewer
+oxid token create ops2               --role admin      # can issue access too
+oxid token create ci    --project 1 --role developer   # deploys, no secrets
 
-# Scoped operator: may only act on projects 1 and 3:
-oxid token create bob --project 1 --project 3
+oxid token list          # role, status, scope, expiry
+oxid token suspend 2     # reversible — someone on leave
+oxid token resume 2
+oxid token revoke 2      # permanent
 ```
 
-A scoped token gets `404` on any other project's endpoints (no existence
-leak), sees only its projects in `oxid status`/audit/queue listings, and is
-rejected from node-wide operations (registering/deleting projects, global
-secrets, stats, infra, backups, token management). `oxid token list` shows
-each token's scopes; revoke takes effect immediately.
+| Role | Can | Cannot |
+|---|---|---|
+| `viewer` | read projects, environments, logs, history | change anything |
+| `developer` | deploy, roll back, pause, wake, destroy environments | secrets, project settings |
+| `maintainer` | its projects' secrets, settings, branch rules, deletion | anything node-wide |
+| `admin` | the node, and issuing access to others | rotate the master key, read the webhook secret |
 
-Rule of thumb: humans get scoped tokens for their projects; CI gets either a
-scoped token or the master token locked down at the network layer.
+Four rules are worth knowing before you hand anything out:
+
+- **Scope beats role, and out-of-scope is a `404`.** Another project's
+  endpoints do not confirm they exist, and a scoped credential sees only its
+  own projects in `status`/audit/queue listings.
+- **A scoped credential is never node-wide, whatever its role.** "Admin of
+  project 3" is not an admin of the server, and a *global* secret — injected
+  into every project's deploys — counts as node-wide.
+- **Omitting `--role` keeps pre-0.4 behaviour** (`maintainer` when scoped,
+  `admin` when not), so upgrading removes nobody's permissions. Least
+  privilege is something you ask for; `token create` prints what it granted.
+- **Rotating the master key and reading the webhook secret stay master-only.**
+  An admin is a role, and roles are things admins hand out.
+
+Rule of thumb: developers get `--role developer` scoped to their projects and
+an expiry; whoever runs the server gets `admin`; CI gets a scoped
+`developer`, since it ships code and does not need to read secrets.
+
+On the receiving end, a teammate runs `oxid login http://DAEMON:8080` (the
+token is read from stdin, not left in shell history) and `oxid whoami` to see
+what they may do. See `docs/docs/developers.html`.
 
 ## 5. Deploying projects
 
