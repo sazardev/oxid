@@ -33,6 +33,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
+use oxid_core::services::forge::ForgeKind;
 use oxid_core::{
     AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
     EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
@@ -255,6 +256,99 @@ async fn handle_push<
     ))
 }
 
+/// Records which pull request a branch belongs to.
+///
+/// This is the only delivery that carries a PR number: a push webhook has
+/// none, so without this there is nothing to comment on. It deliberately
+/// does **not** deploy — deploying stays a decision made from a push, so a
+/// pull request opened from somebody else's fork never runs their code on a
+/// daemon holding the Docker socket.
+///
+/// Best-effort by contract: a delivery Oxid cannot make sense of is
+/// acknowledged, not rejected. A git host that gets a 4xx from a webhook
+/// eventually stops sending them, and losing *push* deliveries because a
+/// *pull request* payload had an unexpected shape would be a bad trade.
+async fn handle_pull_request<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    state: &ApiState<G, O>,
+    payload: &Value,
+    forge: ForgeKind,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    // GitLab puts the human-visible number in `iid` — `id` is a global
+    // counter and commenting with it addresses somebody else's merge
+    // request entirely. Everyone else uses `number`.
+    let number = payload
+        .pointer("/pull_request/number")
+        .or_else(|| payload.pointer("/object_attributes/iid"))
+        .and_then(Value::as_u64);
+    let head_branch = payload
+        .pointer("/pull_request/head/ref")
+        .or_else(|| payload.pointer("/object_attributes/source_branch"))
+        .and_then(Value::as_str);
+    let head_sha = payload
+        .pointer("/pull_request/head/sha")
+        .or_else(|| payload.pointer("/object_attributes/last_commit/id"))
+        .and_then(Value::as_str);
+    let repo_hint = payload
+        .pointer("/repository/full_name")
+        .or_else(|| payload.pointer("/project/path_with_namespace"))
+        .and_then(Value::as_str);
+
+    let (Some(number), Some(head_branch), Some(repo_hint)) = (number, head_branch, repo_hint)
+    else {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({ "status": "ignored", "event": "pull_request" })),
+        ));
+    };
+
+    // Closed covers merged too: either way the branch is about to stop
+    // being previewed, and the comment should stop advertising a URL.
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/object_attributes/action")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("opened");
+    let pr_state = if matches!(action, "closed" | "close" | "merge" | "merged") {
+        "closed"
+    } else {
+        "open"
+    };
+
+    let projects: Vec<_> = state
+        .cp
+        .list_projects()
+        .await?
+        .into_iter()
+        .filter(|p| repo_matches(p.repo_url.as_str(), repo_hint))
+        .collect();
+    let mut recorded = Vec::new();
+    for project in &projects {
+        state
+            .cp
+            .record_pull_request(project.id, number, head_branch, head_sha, pr_state, forge)
+            .await?;
+        recorded.push(project.id.0);
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "status": "recorded",
+            "pull_request": number,
+            "branch": head_branch,
+            "state": pr_state,
+            "projects": recorded,
+        })),
+    ))
+}
+
 /// The shared head of every webhook provider's handler: the daemon refuses
 /// to process any webhook while no secret is configured at all (fail
 /// closed — a typo'd env var must not silently open deploys to anyone who
@@ -304,6 +398,16 @@ pub async fn github_webhook<
     if let Some(event) = headers.get("x-github-event").and_then(|v| v.to_str().ok())
         && event != "push"
     {
+        // A pull-request delivery is the only place the PR *number* for a
+        // branch ever appears — a push carries none — so it is recorded
+        // rather than discarded. It deliberately does not deploy: the code
+        // in a fork's PR is somebody else's, and this daemon holds the
+        // Docker socket. Deploying stays a push-only decision.
+        if event == "pull_request" {
+            let payload: Value = serde_json::from_slice(&body)
+                .map_err(|e| ApiError::from_validation(format!("invalid JSON payload: {e}")))?;
+            return handle_pull_request(&state, &payload, ForgeKind::GitHub).await;
+        }
         return Ok((
             StatusCode::OK,
             Json(json!({ "status": "ignored", "event": event })),
@@ -380,6 +484,11 @@ pub async fn gitlab_webhook<
         // GitLab fires many object kinds at one URL (`push`, `tag_push`,
         // `pipeline`, `note`, ...); only branch pushes are acted upon.
         Some("push") => {}
+        // GitLab's equivalent, and the same reasoning: learn the
+        // association, never deploy from it.
+        Some("merge_request") => {
+            return handle_pull_request(&state, &payload, ForgeKind::GitLab).await;
+        }
         other => {
             return Ok((
                 StatusCode::OK,
@@ -484,6 +593,12 @@ async fn gitea_provider_webhook<
     if let Some(event) = headers.get(event_header).and_then(|v| v.to_str().ok())
         && event != "push"
     {
+        // Gitea and Gogs name it the same as GitHub does.
+        if event == "pull_request" {
+            let payload: Value = serde_json::from_slice(body)
+                .map_err(|e| ApiError::from_validation(format!("invalid JSON payload: {e}")))?;
+            return handle_pull_request(state, &payload, ForgeKind::Gitea).await;
+        }
         return Ok((
             StatusCode::OK,
             Json(json!({ "status": "ignored", "event": event })),

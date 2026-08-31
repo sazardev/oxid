@@ -416,6 +416,43 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Ok(self.find_project_by_repo(repo_url).await?)
     }
 
+    /// Records which pull request a branch belongs to, and which git host
+    /// the project lives on.
+    ///
+    /// The host is learned from the webhook route the delivery arrived on,
+    /// because nothing in a payload reliably says: a self-hosted Gitea and
+    /// a GitLab both answer at arbitrary domains. It is only ever set when
+    /// unknown, so an operator who configured it explicitly outranks the
+    /// guess.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on storage failure.
+    pub async fn record_pull_request(
+        &self,
+        project_id: ProjectId,
+        number: u64,
+        head_branch: &str,
+        head_sha: Option<&str>,
+        state: &str,
+        forge: oxid_core::services::forge::ForgeKind,
+    ) -> Result<(), CpError> {
+        self.store
+            .set_forge_if_unset(project_id, forge.as_str())
+            .await?;
+        self.store
+            .upsert_pull_request(project_id, number, head_branch, head_sha, state)
+            .await?;
+        tracing::info!(
+            project_id = project_id.0,
+            number,
+            branch = head_branch,
+            state,
+            forge = forge.as_str(),
+            "recorded pull request"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn ensure_project(&self, project_id: ProjectId) -> Result<Project, CpError> {
         ProjectStore::get(&self.store, project_id)
             .await?

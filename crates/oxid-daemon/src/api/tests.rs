@@ -4601,3 +4601,143 @@ async fn a_developer_resolves_the_project_however_their_clone_spells_the_url() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+/// A pull-request delivery is the only place a PR *number* for a branch
+/// appears — a push carries none — so it is recorded rather than discarded.
+#[tokio::test]
+async fn a_pull_request_event_is_recorded_and_never_deploys() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook_with_event(
+        &app,
+        json!({
+            "action": "opened",
+            "pull_request": {
+                "number": 42,
+                "head": { "ref": "feature/carrito", "sha": "abc1234" }
+            },
+            "repository": { "full_name": "org/app" }
+        }),
+        Some("pull_request"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "recorded", "{value}");
+    assert_eq!(value["pull_request"], 42);
+    assert_eq!(value["state"], "open");
+
+    // The point of not deploying: a PR from someone else's fork must not
+    // run their code on a daemon holding the Docker socket.
+    let (_, body) = json_request(&app, "GET", "/api/v1/projects/1/environments", json!({})).await;
+    let envs: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envs.as_array().map(Vec::len), Some(0), "{envs}");
+}
+
+/// GitLab puts the human-visible number in `iid`. `id` is a global counter,
+/// and commenting with it would address a completely different project's
+/// merge request.
+#[tokio::test]
+async fn gitlab_merge_requests_are_read_from_iid_not_id() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let payload = json!({
+        "object_kind": "merge_request",
+        "project": { "path_with_namespace": "org/app" },
+        "object_attributes": {
+            "id": 918_273,
+            "iid": 7,
+            "source_branch": "feature/checkout",
+            "action": "open",
+            "last_commit": { "id": "def5678" }
+        }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/webhooks/gitlab")
+                .header("content-type", "application/json")
+                .header("x-gitlab-token", "test-secret")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["pull_request"], 7, "must use iid, not id: {value}");
+    assert_eq!(value["branch"], "feature/checkout");
+}
+
+/// A closed or merged pull request stops being previewed, so its record
+/// must say so — otherwise the comment keeps advertising a URL that is
+/// about to be destroyed.
+#[tokio::test]
+async fn closing_a_pull_request_is_recorded_as_closed() {
+    let repo = repo_dir_with_config();
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (_, body) = signed_webhook_with_event(
+        &app,
+        json!({
+            "action": "closed",
+            "pull_request": { "number": 3, "head": { "ref": "feature/x", "sha": "a" } },
+            "repository": { "full_name": "org/app" }
+        }),
+        Some("pull_request"),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["state"],
+        "closed"
+    );
+}
+
+/// A payload Oxid cannot make sense of is acknowledged, not rejected: a git
+/// host that gets 4xx from a webhook eventually stops sending them, and
+/// losing *push* deliveries over an odd *pull request* payload would be a
+/// bad trade.
+#[tokio::test]
+async fn an_unparseable_pull_request_payload_is_acknowledged() {
+    let (app, _) = test_app().await;
+    let (status, body) = signed_webhook_with_event(
+        &app,
+        json!({ "action": "opened", "pull_request": { "number": 1 } }),
+        Some("pull_request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["status"],
+        "ignored"
+    );
+}

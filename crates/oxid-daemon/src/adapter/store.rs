@@ -625,6 +625,123 @@ impl SqliteStore {
         .transpose()
     }
 
+    /// Records what a `pull_request`/`merge_request` delivery said, so a
+    /// later push on that branch knows which PR to comment on.
+    ///
+    /// Upserts: a PR is announced on open, on every push to it, and on
+    /// close, and each delivery carries the freshest head sha.
+    /// `comment_id` is deliberately left alone — it is learned when the
+    /// comment is first posted and must survive every later delivery.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn upsert_pull_request(
+        &self,
+        project_id: ProjectId,
+        number: u64,
+        head_branch: &str,
+        head_sha: Option<&str>,
+        state: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO pull_requests \
+             (project_id, number, head_branch, head_sha, state, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (project_id, number) DO UPDATE SET \
+               head_branch = excluded.head_branch, \
+               head_sha = COALESCE(excluded.head_sha, pull_requests.head_sha), \
+               state = excluded.state, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(id_as_i64(number))
+        .bind(head_branch)
+        .bind(head_sha)
+        .bind(state)
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// The open pull request for a branch, if one was ever announced.
+    ///
+    /// Returns `(number, comment_id)`. `None` means there is nothing to
+    /// comment on — the ordinary case for a branch with no PR, and not an
+    /// error.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn open_pull_request_for_branch(
+        &self,
+        project_id: ProjectId,
+        branch: &str,
+    ) -> Result<Option<(u64, Option<String>)>, RepositoryError> {
+        let row = sqlx::query(
+            "SELECT number, comment_id FROM pull_requests \
+             WHERE project_id = ? AND head_branch = ? AND state = 'open' \
+             ORDER BY number DESC LIMIT 1",
+        )
+        .bind(id_as_i64(project_id.0))
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.map(|r| {
+            let number: i64 = r.try_get("number").map_err(storage)?;
+            let comment_id: Option<String> = r.try_get("comment_id").map_err(storage)?;
+            Ok((
+                u64::try_from(number).map_err(|_| storage("pr number overflowed u64"))?,
+                comment_id,
+            ))
+        })
+        .transpose()
+    }
+
+    /// Remembers the comment Oxid posted, so the next push edits it rather
+    /// than adding another.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn set_pull_request_comment(
+        &self,
+        project_id: ProjectId,
+        number: u64,
+        comment_id: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("UPDATE pull_requests SET comment_id = ? WHERE project_id = ? AND number = ?")
+            .bind(comment_id)
+            .bind(id_as_i64(project_id.0))
+            .bind(id_as_i64(number))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Records the git host a project belongs to, if it is not already
+    /// known.
+    ///
+    /// Learned from the webhook route a delivery arrived on. Never
+    /// overwrites: an operator who set it explicitly outranks a guess.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn set_forge_if_unset(
+        &self,
+        project_id: ProjectId,
+        forge: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("UPDATE projects SET forge = ? WHERE id = ? AND forge IS NULL")
+            .bind(forge)
+            .bind(id_as_i64(project_id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
     /// Lists every token (including revoked ones), newest first — never
     /// includes the raw token or its hash.
     ///
