@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Oxid">
+  <title>Oxid</title>
+  <!-- Maskable: the mark sits inside the 40% safe zone, so a launcher can
+       crop this to a circle or a squircle without clipping it. -->
+  <rect width="64" height="64" fill="#121212"/>
+  <path d="M32 18 47 26.5v17L32 52 17 43.5v-17z" fill="none" stroke="#de5236" stroke-width="4" stroke-linejoin="round"/>
+</svg>

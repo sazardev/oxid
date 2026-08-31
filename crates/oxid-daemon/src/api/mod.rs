@@ -58,8 +58,9 @@ pub mod types;
 pub(crate) const DEFAULT_AUDIT_LIMIT: u64 = 50;
 
 pub use dashboard::{
-    dashboard_alpine_js, dashboard_app_js, dashboard_i18n_js, dashboard_index, dashboard_style,
-    health,
+    dashboard_alpine_js, dashboard_app_js, dashboard_i18n_js, dashboard_icon,
+    dashboard_icon_maskable, dashboard_index, dashboard_manifest, dashboard_service_worker,
+    dashboard_style, health,
 };
 pub use error::{ApiError, ApiResult};
 use middleware::AuthedAs;
@@ -341,6 +342,13 @@ pub fn router<
         .route("/app.js", get(dashboard_app_js))
         .route("/i18n.js", get(dashboard_i18n_js))
         .route("/vendor/alpine.min.js", get(dashboard_alpine_js))
+        // Installable-app assets. Public like the rest of the shell: they
+        // carry no data, and a login page that cannot load its own
+        // stylesheet is not a login page.
+        .route("/manifest.webmanifest", get(dashboard_manifest))
+        .route("/sw.js", get(dashboard_service_worker))
+        .route("/icon.svg", get(dashboard_icon))
+        .route("/icon-maskable.svg", get(dashboard_icon_maskable))
         // Traefik's `errors` middleware always issues a GET when it
         // substitutes a custom error page (confirmed live: the original
         // POST/GET distinction is not preserved), so this must answer GET

@@ -89,6 +89,28 @@ One SQLite file, WAL, opened as a pool (`OXID_DB_MAX_CONNECTIONS`, default 8). T
 
 Measured on 12k environments / 60k audit events: heartbeat throughput went from flat at ~180 req/s (1→64 concurrent, p50 6ms→321ms) to 948–5108 req/s with p50 under 12ms. `environments(url)` is indexed — it is the column the busiest query in the system filters on.
 
+## Dashboard
+
+Embedded in the binary via `include_str!` — no build step, no bundler, and
+no request that leaves the host: Alpine is vendored, there is no webfont and
+no icon font, and the whole shell is ~232KB uncompressed (Alpine is 44KB of
+it; the panel's own CSS/JS/HTML is ~120KB).
+
+It is a PWA: `manifest.webmanifest`, `sw.js` and two SVG icons are served
+from the same binary (`api/dashboard.rs`). The service worker caches the
+shell so the panel opens with the daemon down, and **never caches `/api/`** —
+a cached environment list is a lie about live cluster state, and the tests
+in `api/tests.rs` assert that exclusion rather than trusting the comment.
+Registration is best-effort: it needs a secure context, which a daemon on a
+plain-HTTP LAN address does not have.
+
+Layout is fluid from 320px to ultrawide and verified there, not assumed:
+below 760px the tables become cards (each `<td>` carries `:data-label` with
+its column header, so the labels have one source), the nav becomes a
+thumb-scrollable strip rather than stacking, and `@media (pointer: coarse)`
+raises controls to a 44px target — a checkbox needs a wrapping `label.check`
+for that, since padding does not enlarge a replaced element.
+
 ## Internationalisation
 
 Spanish and English, in three places that each resolve the language their own way:

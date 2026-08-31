@@ -124,12 +124,32 @@ function dashboard() {
     },
 
     init() {
+      this.registerServiceWorker();
       this.applyLocale();
       this.token = localStorage.getItem("oxid_token") || "";
       window.addEventListener("popstate", () => this.onRouteChange());
       this.onRouteChange();
       this._timer = setInterval(() => this.refreshCurrentPage(), this.refreshIntervalSecs * 1000);
       this.loadSetupStatus().then(() => this.maybeStartOnboarding());
+    },
+
+    /**
+     * Registers the service worker that makes the panel open offline.
+     *
+     * Best-effort on purpose. Service workers need a secure context, which
+     * means HTTPS or localhost — a daemon reached over plain HTTP on a LAN
+     * address has none, and that is a perfectly normal way to run this.
+     * There the panel simply behaves as it always did rather than logging
+     * an error nobody can act on.
+     */
+    registerServiceWorker() {
+      if (!("serviceWorker" in navigator) || !window.isSecureContext) {
+        return;
+      }
+      navigator.serviceWorker.register("/sw.js").catch(() => {
+        // Registration can also be blocked by browser policy. Nothing here
+        // depends on it — it only makes the shell available offline.
+      });
     },
 
     // ------------------------------------------------------------------

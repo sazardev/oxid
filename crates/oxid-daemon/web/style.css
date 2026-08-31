@@ -7,8 +7,26 @@
   --iron-gray: #262626;
   --steel-white: #f4f4f5;
   --patina-green: #4a9e79;
-  --ash-gray: #6b7280;
+  /* Lightened from #6b7280, which measured 4.2:1 against the page and so
+     failed AA for the body-size text it is used on throughout — every
+     `.muted` label, every timestamp. This is 6.1:1 and still reads as the
+     quiet tone the design calls for. */
+  --ash-gray: #8b93a1;
   --border: #333333;
+
+  /* One spacing scale, so padding is chosen rather than guessed. */
+  --gap-1: 4px;
+  --gap-2: 8px;
+  --gap-3: 12px;
+  --gap-4: 20px;
+
+  /* The smallest a control may be where a finger is the pointer. Below
+     this, a tap lands on whatever is next to it. */
+  --tap: 44px;
+
+  /* Page gutter: tight on a phone, generous on a desktop, without a
+     breakpoint to maintain. */
+  --gutter: clamp(12px, 2.5vw, 28px);
 }
 
 * {
@@ -265,9 +283,14 @@ h2 {
   color: var(--oxid-orange);
 }
 
+/* Uses the screen it is given. The old fixed 1400px cap left a third of a
+   modern monitor empty while a phone got the same 20px gutter as a
+   desktop; the fleet table is the widest thing here and is exactly what
+   benefits from the room. The cap that remains only stops line lengths
+   from becoming unreadable on an ultrawide. */
 .page-container {
-  padding: 20px;
-  max-width: 1400px;
+  padding: var(--gutter);
+  max-width: 2200px;
   margin: 0 auto;
 }
 
@@ -763,11 +786,342 @@ h2 {
   background: #e86a4f;
 }
 
-@media (max-width: 900px) {
+/* ==========================================================================
+   Reaching the device
+   ==========================================================================
+
+   Three things this file did not do before: work on a phone, survive a
+   finger, and answer a keyboard. Everything below is in service of one of
+   those, and none of it costs a request — no framework, no icon font, no
+   webfont. The whole stylesheet is a few kilobytes served from the same
+   binary as the API, which is what makes the panel usable on a bad
+   connection and on a machine with nothing to spare.
+   ========================================================================== */
+
+/* -- keyboard ------------------------------------------------------------
+   There was no focus style at all: a keyboard user got whatever the
+   browser drew by default, which on this near-black surface is close to
+   invisible. `:focus-visible` keeps it off mouse clicks. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--oxid-orange);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Sent off-screen until focused, so a keyboard can reach the content
+   without walking the whole nav on every page. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 20;
+  background: var(--oxid-orange);
+  color: var(--carbon-black);
+  padding: var(--gap-2) var(--gap-3);
+  font-weight: 600;
+}
+
+.skip-link:focus {
+  left: var(--gap-2);
+  top: var(--gap-2);
+}
+
+/* -- touch ---------------------------------------------------------------
+   Applied only where the pointer is actually coarse, so a mouse keeps the
+   compact layout this design is built around. `.btn-sm` measured about
+   22px tall — half the size a fingertip can reliably hit. */
+@media (pointer: coarse) {
+  .btn,
+  .nav a,
+  .tabs a {
+    min-height: var(--tap);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .btn-sm {
+    min-height: 38px;
+    padding: var(--gap-2) var(--gap-3);
+    font-size: 12px;
+  }
+
+  .token-input,
+  select.token-input {
+    min-height: var(--tap);
+    font-size: 16px; /* under 16px, iOS zooms the page on focus */
+  }
+
+  /* A checkbox is the smallest thing here and the one bulk actions depend
+     on being hit accurately. Sizing the box is not enough — what has to be
+     44px is the area that responds, so the padding does the work and the
+     negative margin keeps the row from growing around it. */
+  input[type="checkbox"] {
+    width: 24px;
+    height: 24px;
+  }
+
+  /* The wrapper is what a finger actually has to hit. Negative margin
+     keeps it from adding height to the row it sits in. */
+  .check {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: var(--tap);
+    min-height: var(--tap);
+    margin: calc((var(--tap) - 24px) / -2);
+    cursor: pointer;
+  }
+
+  /* Links standing alone in a card or a row are targets too. 24px is the
+     AA floor (WCAG 2.5.8); prose links are exempt and stay inline. */
+  .env-table a,
+  .link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+  }
+
+  .skip-link {
+    min-height: var(--tap);
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* -- motion --------------------------------------------------------------
+   The spinner is the only animation, but a machine that struggles with it
+   is exactly the machine this panel is meant to run on. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* -- the top bar ---------------------------------------------------------
+   Sticky, because on a phone the nav is otherwise a scroll away from
+   whatever you just did. */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--carbon-black);
+}
+
+/* ==========================================================================
+   Wide screens
+   ========================================================================== */
+@media (min-width: 1600px) {
+  .stats {
+    grid-template-columns: repeat(8, 1fr);
+  }
+}
+
+/* ==========================================================================
+   Tablet
+   ========================================================================== */
+@media (max-width: 1100px) {
+  .stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* ==========================================================================
+   Phone
+   ==========================================================================
+
+   The nav scrolls sideways on one line rather than stacking into a column.
+   Stacking pushed the first row of real content below the fold on a phone,
+   which is the one screen that can least afford it; a thumb-swipeable
+   strip keeps the whole page reachable.
+   ========================================================================== */
+@media (max-width: 760px) {
+  .topbar {
+    padding: var(--gap-2) var(--gutter);
+    gap: var(--gap-2);
+  }
+
+  /* `flex: 1 0 100%`, not `width: 100%`: the base rule sets `flex: 1`,
+     whose `flex-basis: 0%` wins over any width and kept the nav on the
+     first line, squeezed to a few clipped characters beside the token
+     field. The basis is what makes it take a line of its own. */
+  .nav {
+    order: 3;
+    flex: 1 0 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .nav a {
+    flex: 0 0 auto;
+  }
+
+  .conn {
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .token-input {
+    width: 100%;
+    max-width: 200px;
+  }
+
+  /* Eight tiles at two columns filled a phone screen before a single
+     environment appeared. Compact enough that the fleet is the first thing
+     below the fold, not the seventh. */
+  .stats {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .stat {
+    padding: var(--gap-2) var(--gap-1);
+    text-align: center;
+  }
+
+  .stat-value {
+    font-size: 17px;
+  }
+
+  .stat-value-text {
+    font-size: 12px;
+  }
+
+  .stat-label {
+    font-size: 9px;
+    margin-top: 2px;
+  }
+
+  /* The brand's subtitle is decoration; on a phone the space belongs to
+     the controls beside it. */
+  .tagline {
+    display: none;
+  }
+
+  .page-head,
+  .filters,
+  .form-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filters .token-input,
+  .form-row .token-input,
+  .form-row .grow {
+    width: 100%;
+    max-width: none;
+  }
+
+  /* -- tables become cards ----------------------------------------------
+     A row of eight columns cannot be read on a 360px screen, and side-
+     scrolling a table to find the state of a branch is not reading. Each
+     row becomes a block, each cell labelled with the header it belonged
+     to — the labels come from `data-label` in the markup, so there is one
+     source for them rather than a duplicate set here. */
+  .table-scroll {
+    overflow-x: visible;
+  }
+
+  .env-table thead {
+    /* Not `display: none`: that also takes it out of the accessibility
+       tree, and the header is still what names each value. */
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .env-table,
+  .env-table tbody,
+  .env-table tr,
+  .env-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .env-table tr {
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    margin-bottom: var(--gap-2);
+    padding: var(--gap-2);
+  }
+
+  /* The state is the first thing anyone looks for, so it colours the edge
+     of the whole card rather than hiding in a cell. */
+  .env-table tr.row-running {
+    border-left-color: var(--patina-green);
+  }
+
+  .env-table tr.row-build_failed {
+    border-left-color: var(--oxid-orange);
+  }
+
+  .env-table td {
+    border: 0;
+    padding: var(--gap-1) 0;
+    display: flex;
+    gap: var(--gap-3);
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .env-table td::before {
+    content: attr(data-label);
+    color: var(--ash-gray);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    flex: 0 0 auto;
+  }
+
+  /* A cell with nothing to label — the checkbox and the action buttons. */
+  .env-table td.col-select,
+  .env-table td.actions {
+    justify-content: flex-start;
+  }
+
+  .env-table td.actions {
+    flex-wrap: wrap;
+    gap: var(--gap-2);
+    padding-top: var(--gap-2);
+  }
+
+  .env-table td.actions .btn-sm {
+    margin-left: 0;
+    flex: 1;
+  }
+
+  .bulk-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--carbon-black);
+  }
+}
+
+/* Very small or very zoomed: one column, nothing side by side. */
+@media (max-width: 420px) {
   .stats {
     grid-template-columns: repeat(3, 1fr);
   }
-  .nav {
+
+  .project-actions {
     flex-wrap: wrap;
+  }
+
+  .project-actions .btn {
+    flex: 1 1 auto;
   }
 }

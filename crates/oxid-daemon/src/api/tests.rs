@@ -505,11 +505,86 @@ async fn dashboard_static_assets_are_served_without_a_token() {
         ("/app.js", "function dashboard()"),
         ("/i18n.js", "OxidI18n"),
         ("/vendor/alpine.min.js", "Alpine"),
+        // Installable-app assets. Public like the rest of the shell: a
+        // manifest behind auth makes the panel silently un-installable,
+        // and a service worker that 404s takes offline support with it.
+        ("/manifest.webmanifest", "\"short_name\": \"Oxid\""),
+        ("/sw.js", "addEventListener"),
+        ("/icon.svg", "<svg"),
+        ("/icon-maskable.svg", "<svg"),
     ] {
         let (status, body) = json_request(&app, "GET", path, json!({})).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains(marker), "{path}: {text:.200}");
+    }
+}
+
+/// The manifest has to parse, and name assets that actually exist.
+///
+/// A typo here does not fail a build or a request — the browser simply
+/// declines to offer installation, with the reason buried in a devtools
+/// panel nobody has open.
+#[test]
+fn the_pwa_manifest_is_valid_and_self_consistent() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../web/manifest.webmanifest")).unwrap();
+
+    // Chromium refuses to install without all of these.
+    for key in ["name", "short_name", "start_url", "display", "icons"] {
+        assert!(manifest.get(key).is_some(), "manifest is missing `{key}`");
+    }
+    assert_eq!(manifest["display"], "standalone");
+
+    let served = ["/icon.svg", "/icon-maskable.svg"];
+    for icon in manifest["icons"].as_array().unwrap() {
+        let src = icon["src"].as_str().unwrap();
+        assert!(
+            served.contains(&src),
+            "manifest names an unserved icon `{src}`"
+        );
+    }
+    // A launcher crops the icon to its own shape; without a maskable one it
+    // crops the square, cutting the mark.
+    assert!(
+        manifest["icons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["purpose"] == "maskable"),
+        "no maskable icon: launchers will crop the square one"
+    );
+
+    // Every shortcut and the start URL must be routes the SPA resolves.
+    let mut urls = vec![manifest["start_url"].as_str().unwrap().to_owned()];
+    for s in manifest["shortcuts"].as_array().unwrap() {
+        urls.push(s["url"].as_str().unwrap().to_owned());
+    }
+    let app_js = include_str!("../../web/app.js");
+    for url in urls {
+        let name = url.trim_start_matches("/ui/");
+        assert!(
+            app_js.contains(&format!("\\/ui\\/{name}")),
+            "`{url}` is not a route the dashboard router knows"
+        );
+    }
+}
+
+/// The service worker must never answer for the API.
+///
+/// Everything under `/api/` is the live state of a cluster. A cached
+/// environment list is a lie, and a lie about whether something is running
+/// is worse than an error — so this is asserted rather than left to a
+/// comment.
+#[test]
+fn the_service_worker_never_caches_api_responses() {
+    let sw = include_str!("../../web/sw.js");
+    assert!(
+        sw.contains("url.pathname.startsWith(\"/api/\")"),
+        "the worker no longer excludes /api/ from caching"
+    );
+    for asset in ["/style.css", "/app.js", "/i18n.js"] {
+        assert!(sw.contains(asset), "the shell cache is missing `{asset}`");
     }
 }
 

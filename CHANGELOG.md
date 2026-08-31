@@ -54,6 +54,17 @@ is the breaking position.
 
 ### Added
 
+- **The dashboard is a PWA and works on a phone.** A manifest, a service
+  worker and SVG icons ship in the binary like the rest of the panel, so it
+  installs to a home screen and opens with the daemon unreachable — verified
+  by stopping the daemon and hard-navigating to a nested route. The worker
+  never caches `/api/`: a cached environment list is a lie about live
+  cluster state, and an error is better than a lie.
+- **Layout works from 320px to ultrawide.** Below 760px each table row
+  becomes a labelled card instead of something to scroll sideways, and the
+  nav becomes a thumb-scrollable strip rather than a column that pushed the
+  fleet off the first screen. The page container went from a fixed 1400px
+  cap — which left a third of a modern monitor empty — to a fluid width.
 - **`DELETE /api/v1/queue/{id}` cancels a queued deploy**, with a button in
   the dashboard's queue view. The drain stops at the first entry that does
   not fit, so a large deploy is never starved by small ones behind it — and
@@ -97,6 +108,16 @@ is the breaking position.
   does not fit a tablet, and letting it widen the document put a horizontal
   scrollbar under the nav and the stat strip too. Each table now scrolls
   inside its own box; verified at 1440, 1024, 768 and 480 px.
+- **Nothing had a focus style.** A keyboard user got the browser default,
+  which on this near-black surface is close to invisible. Every control now
+  has a `:focus-visible` ring, and there is a skip link past the nav.
+- **Controls were below the size a finger can hit.** `.btn-sm` measured
+  about 22px tall. Where the pointer is coarse they are 44px, links clear
+  the 24px WCAG floor, and inputs are 16px so iOS stops zooming the page on
+  focus. Measured across every view at 390px: 18 undersized targets before,
+  none after.
+- **Muted text failed contrast.** `--ash-gray` measured 4.2:1 against the
+  page — below AA — on every label and timestamp in the panel. Now 6.1:1.
 - **Every failed read showed a bare status code.** The API answers errors as
   a message written to be acted on — "set `OXID_DOCKER_NETWORK` first, then
   restart" — and in the caller's own language. Reads threw the status code

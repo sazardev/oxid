@@ -81,6 +81,51 @@ pub async fn dashboard_i18n_js() -> impl IntoResponse {
     )
 }
 
+/// The PWA manifest. Makes the panel installable — a devops on call gets
+/// it as an app on the home screen rather than a bookmark behind a browser
+/// chrome that wastes a fifth of a phone screen.
+pub async fn dashboard_manifest() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/manifest+json; charset=utf-8",
+        )],
+        include_str!("../../web/manifest.webmanifest"),
+    )
+}
+
+/// The service worker.
+///
+/// Served with `Cache-Control: no-cache` deliberately: a stale worker keeps
+/// serving a stale shell, and it is the one file whose own caching would
+/// defeat the mechanism it implements.
+pub async fn dashboard_service_worker() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("../../web/sw.js"),
+    )
+}
+
+/// App icon, and the maskable variant a launcher crops to its own shape.
+/// SVG rather than a set of PNGs: one file, a few hundred bytes, sharp at
+/// every density, and nothing to generate at build time.
+pub async fn dashboard_icon() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("../../web/icon.svg"),
+    )
+}
+
+pub async fn dashboard_icon_maskable() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("../../web/icon-maskable.svg"),
+    )
+}
+
 pub async fn dashboard_alpine_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],

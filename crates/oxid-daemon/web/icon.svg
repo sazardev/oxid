@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Oxid">
+  <title>Oxid</title>
+  <rect width="64" height="64" fill="#121212"/>
+  <!-- The hexagon from the dashboard's own mark: flat colour, hard edges,
+       no gradient — it has to stay legible at 16px in a browser tab. -->
+  <path d="M32 10 54 22v20L32 54 10 42V22z" fill="none" stroke="#de5236" stroke-width="5" stroke-linejoin="round"/>
+</svg>
