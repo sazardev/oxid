@@ -154,6 +154,13 @@ because almost every repository has an `index.html` somewhere. Astro is a
 SPA until `@astrojs/node` makes it a server — the two need entirely
 different images.
 
+Every one of these is verified by deploying a real repository through
+Docker, not by asserting on generated text — the practice that has caught a
+defect in almost every stack added, including three in this batch: Remix's
+build output is a request handler rather than a server (`node` on it exits
+silently), pnpm 10 refuses to finish an install whose dependencies have
+skipped build scripts, and Next.js has no `public/` unless someone made one.
+
 Two spellings caught by tests rather than by users: Spring Boot is
 `spring-boot-*` in Maven and `org.springframework.boot` in Gradle, and a
 `.csproj` names the assembly `dotnet publish` produces, so the file's own

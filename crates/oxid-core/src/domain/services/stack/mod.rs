@@ -180,8 +180,22 @@ impl PackageManager {
         match (self, locked) {
             (Self::Npm, true) => "npm ci",
             (Self::Npm, false) => "npm install",
-            (Self::Pnpm, true) => "corepack enable && pnpm install --frozen-lockfile",
-            (Self::Pnpm, false) => "corepack enable && pnpm install",
+            // `dangerouslyAllowAllBuilds` is not bravado. pnpm 10 stopped
+            // running dependencies' install scripts unless a human approves
+            // them, and *fails* the install when any were skipped — which
+            // is every project using esbuild, sharp or a native binding,
+            // i.e. most of the modern frontend. A build container has
+            // nobody to ask, runs exactly what the lockfile already pins,
+            // and is thrown away afterwards. Refusing to build them instead
+            // would not make anything safer, only undeployable.
+            (Self::Pnpm, true) => {
+                "corepack enable && pnpm config set dangerouslyAllowAllBuilds true \
+                 && pnpm install --frozen-lockfile"
+            }
+            (Self::Pnpm, false) => {
+                "corepack enable && pnpm config set dangerouslyAllowAllBuilds true \
+                 && pnpm install"
+            }
             (Self::Yarn, true) => "corepack enable && yarn install --immutable",
             (Self::Yarn, false) => "corepack enable && yarn install",
             (Self::Bun, true) => "bun install --frozen-lockfile",
@@ -195,8 +209,14 @@ impl PackageManager {
         match (self, locked) {
             (Self::Npm, true) => "npm ci --omit=dev",
             (Self::Npm, false) => "npm install --omit=dev",
-            (Self::Pnpm, true) => "corepack enable && pnpm install --frozen-lockfile --prod",
-            (Self::Pnpm, false) => "corepack enable && pnpm install --prod",
+            (Self::Pnpm, true) => {
+                "corepack enable && pnpm config set dangerouslyAllowAllBuilds true \
+                 && pnpm install --frozen-lockfile --prod"
+            }
+            (Self::Pnpm, false) => {
+                "corepack enable && pnpm config set dangerouslyAllowAllBuilds true \
+                 && pnpm install --prod"
+            }
             // `workspaces focus` needs a resolved lockfile to focus against.
             (Self::Yarn, true) => "corepack enable && yarn workspaces focus --production",
             (Self::Yarn, false) => "corepack enable && yarn install --production",
@@ -1194,7 +1214,8 @@ impl Monorepo {
         let (install, build) = match self.kind {
             WorkspaceKind::Pnpm => (
                 format!(
-                    "corepack enable && pnpm install {} --filter {name}...",
+                    "corepack enable && pnpm config set dangerouslyAllowAllBuilds true \
+                     && pnpm install {} --filter {name}...",
                     if locked { "--frozen-lockfile" } else { "" }
                 ),
                 format!("corepack enable && pnpm --filter {name} run build"),
@@ -1677,15 +1698,23 @@ impl Stack {
     /// fails at the end of a slow build with a path nobody in the project
     /// ever wrote.
     fn meta_framework_dockerfile(&self, pm: PackageManager, base: &str, header: &str) -> String {
-        let (output, entry) = match self.framework {
+        // What each one emits, and how it is started. Remix is the odd one:
+        // its build output is a request *handler*, not a server, so running
+        // it with `node` loads a module that exports something and exits.
+        // `remix-serve` is the server that wraps it — which is why
+        // `@remix-run/serve` is a dependency of every Remix app.
+        let (output, cmd) = match self.framework {
             // Nitro's output is self-contained: it bundles its own
             // dependencies, so the runtime stage needs nothing else.
-            Framework::Nuxt => (".output", ".output/server/index.mjs"),
+            Framework::Nuxt => (".output", r#"["node", ".output/server/index.mjs"]"#),
             // `adapter-node` emits `build/`, and unlike Nitro it
             // expects `node_modules` to still be there.
-            Framework::SvelteKit => ("build", "build/index.js"),
-            Framework::Astro => ("dist", "dist/server/entry.mjs"),
-            _ => ("build", "build/server/index.js"),
+            Framework::SvelteKit => ("build", r#"["node", "build/index.js"]"#),
+            Framework::Astro => ("dist", r#"["node", "dist/server/entry.mjs"]"#),
+            _ => (
+                "build",
+                r#"["npx", "remix-serve", "build/server/index.js"]"#,
+            ),
         };
         // Nuxt is the only one that bundles its dependencies; the
         // others still resolve from `node_modules` at runtime.
@@ -1715,7 +1744,7 @@ impl Stack {
              {deps}\
              COPY --from=build /app/{output} ./{output}\n\
              EXPOSE {port}\n\
-             CMD [\"node\", \"{entry}\"]\n",
+             CMD {cmd}\n",
             lock = pm.lockfile(),
             mount = pm.cache_mount(),
             install = pm.install(self.locked),

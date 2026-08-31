@@ -102,6 +102,16 @@ is the breaking position.
 - **Base images are fetched at registration**, in the background, so the
   first deploy of a project — the one someone is watching, having just wired
   up a webhook — does not begin with a several-hundred-megabyte download.
+- **Remix ran as a handler, not a server.** Its build output is a request
+  handler that `node` loads and exits from, so the container restart-looped
+  with no logs at all. It runs under `remix-serve`, which is why every Remix
+  app depends on `@remix-run/serve`.
+- **pnpm builds could not finish.** pnpm 10 stopped running dependencies'
+  install scripts without human approval and *fails* the install when any
+  were skipped — that is every project using esbuild, sharp or a native
+  binding, which is most of the modern frontend. Generated pnpm builds now
+  approve them explicitly: a build container has nobody to ask, runs exactly
+  what the lockfile pins, and is discarded afterwards.
 - **The stack bank covers the web, not just JavaScript.** Added PHP
   (Laravel, Symfony), Ruby (Rails), the JVM (Spring Boot, Maven and
   Gradle), .NET (ASP.NET Core), and the JavaScript meta-frameworks — Nuxt,

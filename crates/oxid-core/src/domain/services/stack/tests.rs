@@ -906,19 +906,23 @@ fn astro_is_static_until_something_gives_it_a_server() {
 fn each_meta_framework_runs_the_entry_point_it_actually_emits() {
     // None of these are guessable, and getting one wrong fails at the end
     // of a slow build with a path nobody in the project ever wrote.
-    for (dep, entry) in [
-        ("nuxt", ".output/server/index.mjs"),
-        ("@sveltejs/kit", "build/index.js"),
-        ("@remix-run/node", "build/server/index.js"),
+    for (dep, cmd) in [
+        ("nuxt", r#"CMD ["node", ".output/server/index.mjs"]"#),
+        ("@sveltejs/kit", r#"CMD ["node", "build/index.js"]"#),
+        // Remix's build output is a request *handler*, not a server:
+        // running it with `node` loads a module that exports something and
+        // exits. Found by deploying one — the container restart-looped with
+        // no logs at all.
+        (
+            "@remix-run/node",
+            r#"CMD ["npx", "remix-serve", "build/server/index.js"]"#,
+        ),
     ] {
         let package = format!(r#"{{"dependencies":{{"{dep}":"^1.0.0"}}}}"#);
         let dockerfile = detect(&repo(&[("package.json", &package)]))
             .unwrap()
             .dockerfile();
-        assert!(
-            dockerfile.contains(&format!("CMD [\"node\", \"{entry}\"]")),
-            "{dep}: {dockerfile}"
-        );
+        assert!(dockerfile.contains(cmd), "{dep}: {dockerfile}");
     }
 
     // Nuxt's Nitro output bundles its dependencies; the others still
@@ -1074,4 +1078,39 @@ fn node_still_wins_over_a_language_that_only_tools_the_repository() {
     ]))
     .unwrap();
     assert_eq!(stack.runtime, Runtime::Node);
+}
+
+#[test]
+fn a_pnpm_build_can_run_the_install_scripts_its_dependencies_need() {
+    // pnpm 10 stopped running dependencies' install scripts unless a human
+    // approves them, and *fails* the install when any were skipped. That is
+    // every project using esbuild, sharp or a native binding — most of the
+    // modern frontend. Found by deploying a Nuxt app:
+    // `ERR_PNPM_IGNORED_BUILDS: esbuild`.
+    for manifest in [
+        repo(&[("package.json", NEST_PACKAGE), ("pnpm-lock.yaml", "")]),
+        repo(&[("package.json", VITE_PACKAGE), ("pnpm-lock.yaml", "")]),
+        repo(&[
+            ("package.json", r#"{"dependencies":{"nuxt":"^3"}}"#),
+            ("pnpm-lock.yaml", ""),
+        ]),
+    ] {
+        let stack = detect(&manifest).unwrap();
+        assert_eq!(stack.package_manager, Some(PackageManager::Pnpm));
+        assert!(
+            stack.dockerfile().contains("dangerouslyAllowAllBuilds"),
+            "{}: pnpm will refuse to finish this install\n{}",
+            stack.label(),
+            stack.dockerfile()
+        );
+    }
+
+    // Only pnpm needs it; npm and yarn run install scripts by default.
+    let npm = detect(&repo(&[
+        ("package.json", NEST_PACKAGE),
+        ("package-lock.json", ""),
+    ]))
+    .unwrap()
+    .dockerfile();
+    assert!(!npm.contains("dangerouslyAllowAllBuilds"), "{npm}");
 }
