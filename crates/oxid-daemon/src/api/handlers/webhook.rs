@@ -113,47 +113,60 @@ async fn handle_push<
     state: &ApiState<G, O>,
     event: PushEvent,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    let mut matches = state
+    // Every project registered against this repository, not one.
+    //
+    // Two projects on one repository used to be rejected as an operator
+    // mistake, and it was one while a repository held a single deployable
+    // thing. A monorepo's API, web app and worker are three services that
+    // deploy, scale and fail independently — and a push touches all of
+    // them, because Oxid cannot know which packages a commit affected
+    // without building the workspace's dependency graph, and guessing wrong
+    // means a service silently running stale code.
+    let projects: Vec<_> = state
         .cp
         .list_projects()
         .await?
         .into_iter()
-        .filter(|p| repo_matches(p.repo_url.as_str(), &event.repo_hint));
-    let project = matches.next().ok_or_else(|| {
-        ApiError::not_found(crate::i18n::tf(
+        .filter(|p| repo_matches(p.repo_url.as_str(), &event.repo_hint))
+        .collect();
+    if projects.is_empty() {
+        return Err(ApiError::not_found(crate::i18n::tf(
             "notFound.repo",
-            &[("repo", &event.repo_hint)],
-        ))
-    })?;
-    // Two projects registered against the same repository is an operator
-    // mistake, and silently picking whichever came back first would deploy
-    // an arbitrary one of them on every push.
-    if matches.next().is_some() {
-        return Err(ApiError::from_validation(crate::i18n::tf(
-            "invalid.duplicateRepo",
             &[("repo", &event.repo_hint)],
         )));
     }
     let branch = parse_branch(&event.branch)?;
 
     if event.deleted {
-        return match state
-            .cp
-            .find_environment_by_branch(project.id, &branch)
-            .await?
-        {
-            Some(env) if env.state != EnvironmentState::Destroyed => {
+        // A deleted branch takes every service built from it, or a monorepo
+        // leaks one environment per service on every branch anyone deletes.
+        let mut destroyed = Vec::new();
+        for project in &projects {
+            if let Some(env) = state
+                .cp
+                .find_environment_by_branch(project.id, &branch)
+                .await?
+                && env.state != EnvironmentState::Destroyed
+            {
                 state
                     .cp
                     .destroy_with_operator(env.id, false, event.pusher.clone())
                     .await?;
-                Ok((
-                    StatusCode::OK,
-                    Json(json!({ "status": "destroyed", "environment_id": env.id.0 })),
-                ))
+                destroyed.push(env.id.0);
             }
-            _ => Ok((StatusCode::OK, Json(json!({ "status": "ignored" })))),
-        };
+        }
+        return Ok(if destroyed.is_empty() {
+            (StatusCode::OK, Json(json!({ "status": "ignored" })))
+        } else {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "destroyed",
+                    "environment_id": destroyed[0],
+                    "environment_ids": destroyed,
+                })),
+            )
+        });
     }
 
     // Accept the push, then build. Providers give a webhook delivery only a
@@ -162,10 +175,24 @@ async fn handle_push<
     // for deploys that actually succeeded and invited duplicate manual
     // redeliveries. The queue is persisted, so an accepted push also
     // survives a daemon restart, which an inline deploy never did.
-    let position = state
-        .cp
-        .enqueue_push(project.id, &branch, event.pusher.as_deref())
-        .await?;
+    let mut queued = Vec::new();
+    for project in &projects {
+        let position = state
+            .cp
+            .enqueue_push(project.id, &branch, event.pusher.as_deref())
+            .await?;
+        queued.push(json!({
+            "project_id": project.id.0,
+            "service": project.config.build.context,
+            "position": position,
+        }));
+    }
+    // The first position, kept for consumers that read it: this response
+    // shape predates monorepos and scripts assert on it.
+    let position = queued
+        .first()
+        .and_then(|q| q["position"].as_u64())
+        .unwrap_or_default();
 
     // Kick the queue right away rather than waiting for the scheduler's next
     // tick; the drain is single-flighted, so this is safe to fire on every
@@ -185,7 +212,11 @@ async fn handle_push<
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({ "status": "queued", "position": position })),
+        Json(json!({
+            "status": "queued",
+            "position": position,
+            "queued": queued,
+        })),
     ))
 }
 

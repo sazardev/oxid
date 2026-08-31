@@ -149,6 +149,14 @@ Two things are easy to get wrong here:
   out inside the same `RUN`. It is also `sharing=locked`, because cargo takes
   its own lock on a target directory and concurrent branch builds would
   queue anyway.
+- **Python's two stages cost about 5MB and buy a class of deploy.** The
+  venv duplicates pip over a base that already has it, so the image is
+  *slightly larger*. What it buys: `python:*-slim` ships no compiler, so any
+  dependency without a wheel failed to install at all. `build-essential` and
+  `libpq-dev` go in the build stage, `libpq5` in the runtime. Postgres is in
+  that curated set because Oxid provisions a database per branch — it is the
+  one native dependency this product can predict; anything else needs a
+  `Dockerfile`.
 - **`pip install --no-cache-dir` is the right advice without BuildKit and
   wrong with it**: the cache is no longer in a layer, so the flag only
   discards work between builds.
@@ -186,6 +194,21 @@ Three things are load-bearing:
   root usually builds nothing. The dashboard lists every service with the
   active one marked, so changing it is a `[build].context` edit rather than
   a guess.
+
+**One repository holds several services.** `repo_url` was `UNIQUE`, which
+made "one project per repository" a schema rule; migration `0015` rebuilds
+the table with `UNIQUE (repo_url, build_context)`, because what is actually
+unique is the repository *plus the part being built*. Registration takes an
+optional `context`, is idempotent per service, and a webhook push deploys
+**every** project registered against that repository — Oxid cannot know
+which packages a commit touched without building the workspace's dependency
+graph, and guessing wrong leaves a service silently running stale code. A
+deleted branch destroys every service's environment for it, or a monorepo
+leaks one per service per deleted branch.
+
+That migration rebuilds a table, so its column list must name every column
+earlier migrations added. Missing `git_token_enc` in the first draft dropped
+every private repository's credential, and 90 tests failed at once.
 
 Workspace globs are deliberately not parsed: "has a `package.json`" reaches
 the same answer without a glob language, and `adapter::config::read_repo_manifest`

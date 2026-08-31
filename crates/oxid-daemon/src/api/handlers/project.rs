@@ -76,20 +76,28 @@ pub async fn register_project<
         }
     }
     let project = match source {
-        RegistrationSource::Dir { dir, git_token } => {
+        RegistrationSource::Dir {
+            dir,
+            git_token,
+            context,
+        } => {
             let project = state
                 .cp
-                .register_project(std::path::Path::new(&dir))
+                .register_project(std::path::Path::new(&dir), context.as_deref())
                 .await?;
             apply_git_token(&state, project.id, git_token).await;
             project
         }
         // The URL form persists its token inside `register_project_by_url`
         // itself — atomically with the create.
-        RegistrationSource::Url { url, git_token } => {
+        RegistrationSource::Url {
+            url,
+            git_token,
+            context,
+        } => {
             state
                 .cp
-                .register_project_by_url(&url, git_token.as_deref())
+                .register_project_by_url(&url, git_token.as_deref(), context.as_deref())
                 .await?
         }
     };

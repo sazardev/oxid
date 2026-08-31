@@ -1141,7 +1141,12 @@ impl Stack {
                  COPY package.json {lock}* ./\n\
                  RUN {mount} {install}\n\
                  COPY . .\n\
-                 RUN {build}\n\
+                 # `public/` is optional in Next.js and plenty of apps have\n\
+                 # none. `COPY` fails outright on a missing source, so the\n\
+                 # build stage guarantees the directory exists rather than\n\
+                 # the final stage failing on an app that simply has no\n\
+                 # static assets.\n\
+                 RUN mkdir -p public && {build}\n\
                  \n\
                  FROM {base}\n\
                  WORKDIR /app\n\
@@ -1271,13 +1276,52 @@ impl Stack {
                 self.port
             ),
         };
+        // Two stages, with a virtualenv as the thing that moves between
+        // them — and the honest accounting is that this costs about 5MB
+        // rather than saving any.
+        //
+        // What it buys is builds that work at all. `python:*-slim` ships no
+        // compiler, so any dependency without a wheel for this platform
+        // failed the install outright. The build stage gets a toolchain and
+        // the runtime does not, which trades a few megabytes for a class of
+        // deploy that previously could not happen.
+        //
+        // `libpq-dev` is in that set deliberately rather than as a general
+        // answer to native dependencies — there is no general answer, and a
+        // build stage carrying every `-dev` package would be enormous.
+        // Postgres earns its place because Oxid provisions a database per
+        // branch, so a Python service talking to one is the most
+        // predictable native dependency this product will ever see.
+        // `libpq5` goes in the runtime stage because the compiled extension
+        // still links against it. Anything else needs a `Dockerfile`, and
+        // the generated one says so.
         format!(
             "{header}\n\
-             FROM python:{version}-slim\n\
+             FROM python:{version}-slim AS build\n\
              WORKDIR /app\n\
-             ENV PYTHONUNBUFFERED=1\n\
+             RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\\n\
+             \x20   apt-get update \\\n\
+             \x20   && apt-get install -y --no-install-recommends build-essential libpq-dev \\\n\
+             \x20   && rm -rf /var/lib/apt/lists/*\n\
+             RUN python -m venv /opt/venv\n\
+             ENV PATH=\"/opt/venv/bin:$PATH\"\n\
              {copy}\n\
              RUN {mount} {install}\n\
+             \n\
+             FROM python:{version}-slim\n\
+             WORKDIR /app\n\
+             # Runtime library only, not the headers: a compiled extension\n\
+             # still links against libpq, but nothing in the running image\n\
+             # compiles anything.\n\
+             RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\\n\
+             \x20   apt-get update \\\n\
+             \x20   && apt-get install -y --no-install-recommends libpq5 \\\n\
+             \x20   && rm -rf /var/lib/apt/lists/*\n\
+             # `PYTHONUNBUFFERED` so logs reach the daemon as they happen\n\
+             # rather than when a buffer fills — an environment nobody can\n\
+             # see the logs of is one nobody can debug.\n\
+             ENV PYTHONUNBUFFERED=1 PATH=\"/opt/venv/bin:$PATH\"\n\
+             COPY --from=build /opt/venv /opt/venv\n\
              COPY . .\n\
              EXPOSE {port}\n\
              {cmd}\n",

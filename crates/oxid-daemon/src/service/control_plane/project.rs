@@ -70,20 +70,60 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         });
     }
 
-    pub async fn register_project(&self, repo_dir: &Path) -> Result<Project, CpError>
+    /// Builds the project record for a checkout, honouring an explicit
+    /// `[build].context` and reporting the workspace either way.
+    ///
+    /// Registering the same repository twice with the *same* context is
+    /// still a duplicate; with a different one it is a second service, which
+    /// is what a monorepo's API and web app are.
+    fn describe(
+        parsed: config::ParsedProject,
+        repo_url: &RepoUrl,
+        context: Option<&str>,
+    ) -> Result<Project, CpError> {
+        let mut parsed = parsed;
+        if let Some(context) = context {
+            // Named explicitly, so it wins over whatever detection guessed —
+            // and the port follows it, since the service in `apps/web` is
+            // not the one in `apps/api`.
+            if let Some(mono) = &parsed.monorepo
+                && let Some(member) = mono.deployable.iter().find(|w| w.path == context)
+            {
+                parsed.config.port = member.port;
+            }
+            parsed.config.build.context = context.to_owned();
+        }
+        Ok(
+            Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?
+                .with_detected_stack(parsed.stack)
+                .with_workspace(parsed.monorepo),
+        )
+    }
+
+    pub async fn register_project(
+        &self,
+        repo_dir: &Path,
+        context: Option<&str>,
+    ) -> Result<Project, CpError>
     where
         O: Clone + Send + Sync + 'static,
     {
         let repo_url = self.git.remote_url(repo_dir).await?;
+        let parsed = config::parse_project(repo_dir)?;
+        let mut project = Self::describe(parsed, &repo_url, context)?;
 
-        if let Some(existing) = self.find_project_by_repo(&repo_url).await? {
+        // Idempotent per *service*, not per repository: the same repo and
+        // the same part of it is the same project, a different part is a
+        // different one.
+        if let Some(existing) = self
+            .find_projects_by_repo(&repo_url)
+            .await?
+            .into_iter()
+            .find(|p| p.config.build.context == project.config.build.context)
+        {
             return Ok(existing);
         }
 
-        let parsed = config::parse_project(repo_dir)?;
-        let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?
-            .with_detected_stack(parsed.stack)
-            .with_workspace(parsed.monorepo);
         match ProjectStore::create(&self.store, &project).await {
             Ok(id) => {
                 project.id = id;
@@ -91,8 +131,10 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
                 Ok(project)
             }
             Err(RepositoryError::Conflict(_)) => self
-                .find_project_by_repo(&repo_url)
+                .find_projects_by_repo(&repo_url)
                 .await?
+                .into_iter()
+                .find(|p| p.config.build.context == project.config.build.context)
                 .ok_or_else(|| CpError::NotFound(format!("project for `{repo_url}`"))),
             Err(e) => Err(e.into()),
         }
@@ -122,14 +164,11 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         &self,
         repo_url: &RepoUrl,
         git_token: Option<&str>,
+        context: Option<&str>,
     ) -> Result<Project, CpError>
     where
         O: Clone + Send + Sync + 'static,
     {
-        if let Some(existing) = self.find_project_by_repo(repo_url).await? {
-            return Ok(existing);
-        }
-
         let cloned_dir = self
             .git
             .ensure_repo(repo_url, git_token, &self.cache_dir)
@@ -145,9 +184,20 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
             })?;
 
         let parsed = config::parse_project(&cloned_dir)?;
-        let mut project = Project::new(ProjectId(0), parsed.name, repo_url.clone(), parsed.config)?
-            .with_detected_stack(parsed.stack)
-            .with_workspace(parsed.monorepo);
+        let mut project = Self::describe(parsed, repo_url, context)?;
+
+        // Same rule as the directory form: idempotent per service. The
+        // clone above happens first because the workspace is not knowable
+        // until the repository is on disk.
+        if let Some(existing) = self
+            .find_projects_by_repo(repo_url)
+            .await?
+            .into_iter()
+            .find(|p| p.config.build.context == project.config.build.context)
+        {
+            return Ok(existing);
+        }
+
         match ProjectStore::create(&self.store, &project).await {
             Ok(id) => {
                 project.id = id;
@@ -264,6 +314,24 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
 }
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
+    /// Every project registered against `repo_url`.
+    ///
+    /// A repository can hold several deployable services — a monorepo's
+    /// API, web app and worker — and a push to it deploys all of them. What
+    /// distinguishes them is `[build].context`, which is what the schema now
+    /// makes unique alongside the URL.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the projects cannot be listed.
+    pub async fn find_projects_by_repo(&self, repo_url: &RepoUrl) -> Result<Vec<Project>, CpError> {
+        Ok(self
+            .list_projects()
+            .await?
+            .into_iter()
+            .filter(|p| p.repo_url == *repo_url)
+            .collect())
+    }
+
     pub(crate) async fn find_project_by_repo(
         &self,
         repo_url: &RepoUrl,

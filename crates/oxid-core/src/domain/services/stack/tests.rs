@@ -711,6 +711,49 @@ fn every_generated_build_caches_its_dependency_downloads() {
 }
 
 #[test]
+fn python_ships_a_virtualenv_and_not_a_build_toolchain() {
+    // Installing in place put pip, setuptools and whatever a wheel needed
+    // to compile into the running image, none of which the process uses.
+    let dockerfile = detect(&repo(&[("requirements.txt", "fastapi\nuvicorn\n")]))
+        .unwrap()
+        .dockerfile();
+    assert_eq!(
+        dockerfile.matches("FROM python:").count(),
+        2,
+        "{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("python -m venv /opt/venv"),
+        "{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=build /opt/venv /opt/venv"),
+        "the venv never reaches the runtime stage\n{dockerfile}"
+    );
+    // The runtime stage has to find the venv's interpreter first, or it
+    // runs the system one and none of the dependencies exist.
+    let runtime = dockerfile.split("FROM python:").nth(2).unwrap();
+    assert!(runtime.contains("/opt/venv/bin:$PATH"), "{runtime}");
+
+    // The point of the split: `python:*-slim` has no compiler, so any
+    // dependency without a wheel for the platform failed to install at all.
+    // The toolchain goes in the build stage and stays there.
+    let build = dockerfile.split("FROM python:").nth(1).unwrap();
+    assert!(build.contains("build-essential"), "{build}");
+    assert!(
+        !runtime.contains("build-essential"),
+        "the compiler shipped in the running image\n{runtime}"
+    );
+    // Postgres headers to build against, the runtime library to link
+    // against — and never the headers in the running image. Oxid
+    // provisions a database per branch, so this is the one native
+    // dependency it can predict.
+    assert!(build.contains("libpq-dev"), "{build}");
+    assert!(runtime.contains("libpq5"), "{runtime}");
+    assert!(!runtime.contains("libpq-dev"), "{runtime}");
+}
+
+#[test]
 fn pip_is_not_told_to_throw_its_cache_away() {
     // `--no-cache-dir` is right without BuildKit — it keeps the cache out of
     // the image layer. With a cache mount the cache is not in a layer at
@@ -791,4 +834,24 @@ fn the_images_a_build_needs_are_knowable_before_it_runs() {
             );
         }
     }
+}
+
+#[test]
+fn a_next_app_without_a_public_directory_still_builds() {
+    // `public/` is optional in Next.js and `COPY` fails outright on a
+    // missing source, so an app with no static assets failed at the last
+    // step of a slow build. Found by deploying one.
+    let dockerfile = detect(&repo(&[(
+        "package.json",
+        r#"{"dependencies":{"next":"14.2.15"},"scripts":{"build":"next build"}}"#,
+    )]))
+    .unwrap()
+    .dockerfile();
+    assert!(dockerfile.contains("mkdir -p public"), "{dockerfile}");
+    let mkdir = dockerfile.find("mkdir -p public").unwrap();
+    let copy = dockerfile.find("/app/public").unwrap();
+    assert!(
+        mkdir < copy,
+        "the directory is created after it is copied\n{dockerfile}"
+    );
 }

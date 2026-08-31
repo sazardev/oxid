@@ -2282,6 +2282,97 @@ async fn deploy_queues_past_capacity_and_the_queue_endpoint_reports_it() {
 }
 
 #[tokio::test]
+async fn one_repository_can_hold_several_services() {
+    // A monorepo's API and web app deploy, scale and fail independently.
+    // `repo_url` being UNIQUE made the second one impossible to register;
+    // what is actually unique is the repository *plus the part being built*.
+    let (app, _) = test_app().await;
+    let repo = repo_dir_with_config();
+    let dir = repo.path().display().to_string();
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": dir, "context": "apps/api" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let api: Project = serde_json::from_slice(&body).unwrap();
+    assert_eq!(api.config.build.context, "apps/api");
+
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": dir, "context": "apps/web" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let web: Project = serde_json::from_slice(&body).unwrap();
+    assert_ne!(api.id.0, web.id.0, "the second service reused the first");
+    assert_eq!(web.config.build.context, "apps/web");
+
+    // Still idempotent per service: the same repo and the same part of it
+    // is the same project, not a third one.
+    let (_, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": dir, "context": "apps/api" }),
+    )
+    .await;
+    let again: Project = serde_json::from_slice(&body).unwrap();
+    assert_eq!(again.id.0, api.id.0);
+
+    let (_, body) = json_request(&app, "GET", "/api/v1/projects", json!({})).await;
+    let all: Vec<Project> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(all.len(), 2, "{all:?}");
+}
+
+#[tokio::test]
+async fn a_push_deploys_every_service_of_the_repository() {
+    // Oxid cannot know which packages a commit touched without building the
+    // workspace's dependency graph, and guessing wrong leaves a service
+    // silently running stale code. So a push deploys all of them.
+    let (app, _) = test_app().await;
+    let repo = repo_dir_with_config();
+    let dir = repo.path().display().to_string();
+    for context in ["apps/api", "apps/web"] {
+        json_request(
+            &app,
+            "POST",
+            "/api/v1/projects",
+            json!({ "repo_dir": dir, "context": context }),
+        )
+        .await;
+    }
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/main",
+            "after": "abc123",
+            "repository": { "full_name": "org/app", "clone_url": "https://github.com/org/app.git" },
+            "pusher": { "name": "dev" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let queued: Value = serde_json::from_slice(&body).unwrap();
+    let services = queued["queued"].as_array().unwrap();
+    assert_eq!(services.len(), 2, "{queued}");
+    let contexts: Vec<_> = services
+        .iter()
+        .map(|s| s["service"].as_str().unwrap())
+        .collect();
+    assert!(contexts.contains(&"apps/api"), "{queued}");
+    assert!(contexts.contains(&"apps/web"), "{queued}");
+    // The old single-service shape is still there for scripts that read it.
+    assert!(queued["position"].is_number(), "{queued}");
+}
+
+#[tokio::test]
 async fn a_queued_deploy_can_be_cancelled() {
     // The drain stops at the first entry that does not fit, so a large
     // deploy is not starved by small ones behind it. The other side of that

@@ -448,12 +448,12 @@ async fn register_and_deploy_happy_path() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
 
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     assert_eq!(project.name, "app");
     assert_eq!(project.repo_url.as_str(), "https://github.com/org/app.git");
 
     // Idempotent registration.
-    let again = cp.register_project(repo.path()).await.unwrap();
+    let again = cp.register_project(repo.path(), None).await.unwrap();
     assert_eq!(again.id, project.id);
     assert_eq!(cp.list_projects().await.unwrap().len(), 1);
 
@@ -482,7 +482,7 @@ async fn concurrent_first_registration_is_idempotent() {
         .map(|_| {
             let cp = cp.clone();
             let path = repo.path().to_owned();
-            tokio::spawn(async move { cp.register_project(&path).await })
+            tokio::spawn(async move { cp.register_project(&path, None).await })
         })
         .collect();
 
@@ -499,7 +499,7 @@ async fn deploy_records_oci_operations() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     cp.deploy(project.id, BranchName::parse("feature-b").unwrap())
         .await
@@ -543,7 +543,7 @@ port = 8080
     .unwrap();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(dir.path()).await.unwrap();
+    let project = cp.register_project(dir.path(), None).await.unwrap();
 
     cp.deploy(project.id, BranchName::parse("main").unwrap())
         .await
@@ -572,7 +572,7 @@ port = 8080
 async fn deploy_fails_clearly_when_dependency_is_unconfigured() {
     let repo = repo_dir_with_redis_dependency();
     let cp = cp(FakeOci::default()).await; // no `with_resource_pools` call
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let err = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -612,7 +612,7 @@ async fn deploy_injects_a_distinct_redis_index_per_branch_and_reuses_on_redeploy
     )
     .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16)
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let env_a = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -696,7 +696,7 @@ async fn sibling_branches_pushed_together_share_one_fetch() {
         )
         .with_readiness_check(false),
     );
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let baseline = git.fetches();
 
     let deploys = (0..8).map(|i| {
@@ -738,7 +738,7 @@ async fn concurrent_branches_never_share_a_redis_index() {
         .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 16)
         .with_readiness_check(false),
     );
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let branches: Vec<String> = (0..8).map(|i| format!("feature-{i}")).collect();
     let deploys = branches.iter().map(|b| {
@@ -776,7 +776,7 @@ async fn destroy_releases_the_redis_index_for_reuse() {
     )
     .with_resource_pools(None, Some("redis://cache:6379".to_owned()), 1)
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let env_a = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -812,7 +812,7 @@ async fn redeploying_a_live_branch_replaces_the_previous_environment() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let first = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -879,7 +879,7 @@ async fn rollback_without_to_sha_redeploys_the_immediately_prior_commit() {
         cache.path().to_owned(),
     )
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("main").unwrap();
 
     let first = cp.deploy(project.id, branch.clone()).await.unwrap();
@@ -903,7 +903,7 @@ async fn rollback_with_explicit_to_sha_uses_that_commit() {
         cache.path().to_owned(),
     )
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("main").unwrap();
 
     let first = cp.deploy(project.id, branch.clone()).await.unwrap();
@@ -929,7 +929,7 @@ async fn rollback_rejects_a_sha_not_in_the_branchs_history() {
         cache.path().to_owned(),
     )
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("main").unwrap();
     cp.deploy(project.id, branch.clone()).await.unwrap();
 
@@ -952,7 +952,7 @@ async fn rollback_with_no_prior_deploy_is_not_found() {
         cache.path().to_owned(),
     )
     .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("main").unwrap();
     cp.deploy(project.id, branch.clone()).await.unwrap();
 
@@ -974,7 +974,7 @@ async fn failed_deploy_does_not_permanently_block_branch() {
     let oci = FakeOci::default();
     *oci.fail_run_times.lock().unwrap() = 1;
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let err = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -1020,7 +1020,7 @@ async fn failed_redeploy_leaves_the_previous_instance_untouched() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let first = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -1082,7 +1082,7 @@ async fn failed_redeploy_leaves_the_previous_instance_untouched() {
 async fn concurrent_deploys_of_the_same_branch_leave_a_consistent_state() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let handles: Vec<_> = (0..10)
         .map(|_| {
@@ -1127,7 +1127,7 @@ async fn pause_wake_and_logs() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1162,7 +1162,7 @@ async fn deploy_applies_daemon_default_resource_limits_when_project_sets_none() 
     let cp = cp(oci.clone())
         .await
         .with_resource_defaults(Some(512), Some(1000));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     cp.deploy(project.id, BranchName::parse("main").unwrap())
         .await
         .unwrap();
@@ -1199,7 +1199,7 @@ cpu_limit_millicores = 250
     let cp = cp(oci.clone())
         .await
         .with_resource_defaults(Some(512), Some(1000));
-    let project = cp.register_project(dir.path()).await.unwrap();
+    let project = cp.register_project(dir.path(), None).await.unwrap();
     cp.deploy(project.id, BranchName::parse("main").unwrap())
         .await
         .unwrap();
@@ -1218,7 +1218,7 @@ async fn destroy_stops_removes_and_transitions() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1244,7 +1244,7 @@ async fn destroy_stops_removes_and_transitions() {
 async fn destroy_keeps_branch_secrets_by_default() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("feature-a").unwrap();
     let env = cp.deploy(project.id, branch.clone()).await.unwrap();
 
@@ -1276,7 +1276,7 @@ async fn destroy_keeps_branch_secrets_by_default() {
 async fn destroy_with_purge_secrets_deletes_only_that_branchs_branch_scope_secrets() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch_a = BranchName::parse("feature-a").unwrap();
     let branch_b = BranchName::parse("feature-b").unwrap();
     let env_a = cp.deploy(project.id, branch_a.clone()).await.unwrap();
@@ -1340,7 +1340,7 @@ async fn delete_project_destroys_environments_removes_cache_and_row() {
     let oci = FakeOci::default();
     let cp = ControlPlane::new(store().await, FakeGit, oci.clone(), cache.path().to_owned())
         .with_readiness_check(false);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1390,7 +1390,7 @@ async fn gc_destroy_also_removes_the_image() {
     // `sweep` no-ops entirely without Traefik configured (idle detection
     // needs its heartbeat) — exercise that real path here.
     let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1412,7 +1412,7 @@ async fn gc_destroy_also_removes_the_image() {
 async fn find_environment_by_branch_matches_and_misses() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1444,7 +1444,7 @@ async fn wake_dispatches_on_actual_container_state() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1530,7 +1530,7 @@ async fn wake_reports_a_missing_container_instead_of_succeeding() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1560,7 +1560,7 @@ async fn wake_backfills_host_port_for_environments_predating_dynamic_ports() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1595,7 +1595,7 @@ async fn wake_by_url_unknown_host_is_none() {
 async fn touch_by_url_refreshes_last_access_and_ignores_unknown() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1639,7 +1639,7 @@ async fn touch_env(cp: &ControlPlane<FakeGit, FakeOci>, mut env: Environment, at
 async fn sweep_does_nothing_without_traefik_even_when_wildly_idle() {
     let repo = repo_dir_with_config();
     let cp = cp(FakeOci::default()).await; // no `with_traefik(...)` call
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1667,7 +1667,7 @@ async fn sweep_keeps_recently_active_environment() {
     let cp = cp(FakeOci::default())
         .await
         .with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1692,7 +1692,7 @@ async fn sweep_pauses_idle_environment() {
     // `sweep` no-ops entirely without Traefik configured (idle detection
     // needs its heartbeat) — exercise that real path here.
     let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1743,7 +1743,7 @@ async fn concurrent_sweep_and_manual_destroy_do_not_corrupt_state() {
     let cp = cp(FakeOci::default())
         .await
         .with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1781,7 +1781,7 @@ async fn sweep_hibernates_deeply_idle_paused_environment() {
     // `sweep` no-ops entirely without Traefik configured (idle detection
     // needs its heartbeat) — exercise that real path here.
     let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1811,7 +1811,7 @@ async fn sweep_destroys_expired_environment() {
     // `sweep` no-ops entirely without Traefik configured (idle detection
     // needs its heartbeat) — exercise that real path here.
     let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1839,7 +1839,7 @@ async fn reconcile_marks_a_missing_container_destroyed() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1865,7 +1865,7 @@ async fn reconcile_re_suspends_a_container_a_reboot_brought_back_running() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1903,7 +1903,7 @@ async fn reconcile_closes_out_a_deploy_a_restart_interrupted() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1943,7 +1943,7 @@ async fn reconcile_restarts_a_running_environment_whose_container_stopped() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -1979,7 +1979,7 @@ async fn deploy_or_queue_deploys_immediately_when_capacity_is_available() {
         .await
         .with_resource_defaults(Some(200), None)
         .with_admission_control(Some(100));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let outcome = cp
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
@@ -2003,7 +2003,7 @@ async fn deploy_or_queue_queues_when_the_host_is_already_committed() {
         .await
         .with_resource_defaults(Some(200), None)
         .with_admission_control(Some(50));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     // First deploy fits alone (200MB request <= 250MB usable) and stays
     // Running, committing its 200MB.
@@ -2039,7 +2039,7 @@ async fn deploy_or_queue_rejects_a_request_that_could_never_fit() {
         .await
         .with_resource_defaults(Some(2000), None)
         .with_admission_control(Some(1000));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let err = cp
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
@@ -2054,7 +2054,7 @@ async fn deploy_or_queue_always_deploys_when_admission_control_is_disabled() {
     // Zero capacity by default — if admission control were mistakenly
     // active this would queue or reject, not deploy.
     let cp = cp(FakeOci::default()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let outcome = cp
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
@@ -2078,7 +2078,7 @@ async fn retry_queued_deploys_leaves_the_queue_untouched_when_nothing_fits_yet()
         .await
         .with_resource_defaults(Some(200), None)
         .with_admission_control(Some(50));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     cp.deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
         .await
@@ -2104,7 +2104,7 @@ async fn the_queue_drains_several_deploys_at_a_time() {
     let oci = FakeOci::default();
     *oci.build_delay.lock().unwrap() = Some(std::time::Duration::from_millis(80));
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     // Queued directly: `deploy_or_queue` would deploy them immediately,
     // since nothing here is capacity-constrained.
@@ -2151,7 +2151,7 @@ async fn a_push_that_lands_mid_drain_is_picked_up_by_that_same_drain() {
     let oci = FakeOci::default();
     *oci.build_delay.lock().unwrap() = Some(std::time::Duration::from_millis(150));
     let cp = Arc::new(cp(oci).await);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     cp.store
         .enqueue_deploy(project.id, &BranchName::parse("first").unwrap(), None)
@@ -2190,7 +2190,7 @@ async fn retry_queued_deploys_deploys_once_capacity_frees_up() {
         .await
         .with_resource_defaults(Some(200), None)
         .with_admission_control(Some(50));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let main_env = match cp
         .deploy_or_queue(project.id, BranchName::parse("main").unwrap(), None)
@@ -2235,7 +2235,7 @@ async fn a_failed_build_leaves_a_recorded_environment() {
     let oci = FakeOci::default();
     *oci.fail_build_times.lock().unwrap() = 1;
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let err = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2281,7 +2281,7 @@ async fn a_branch_cannot_steal_another_branchs_subdomain() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let first = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2336,7 +2336,7 @@ async fn a_suspended_environment_wakes_back_onto_its_url() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await.with_traefik("net", "http://daemon");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -2366,7 +2366,7 @@ async fn a_failed_deploy_does_not_hide_the_running_instance() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let branch = BranchName::parse("feature-a").unwrap();
 
     let first = cp.deploy(project.id, branch.clone()).await.unwrap();
@@ -2406,7 +2406,7 @@ async fn the_deployed_commit_is_injected_into_the_container() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -2475,7 +2475,7 @@ async fn waking_a_shared_url_resolves_to_the_environment_that_owns_it() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let live = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2519,7 +2519,7 @@ async fn a_sleeping_environment_does_not_reserve_host_memory() {
         .await
         .with_resource_defaults(Some(256), None)
         .with_admission_control(Some(512));
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let first = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2564,7 +2564,7 @@ async fn a_dependency_the_daemon_lacks_is_not_retried() {
     let repo = repo_dir_with_redis_dependency();
     let oci = FakeOci::default();
     let cp = cp(oci.clone()).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let err = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
@@ -2601,7 +2601,7 @@ async fn waking_triggers_on_gateway_errors_not_on_the_apps_own_500() {
     let cp = cp(oci.clone())
         .await
         .with_traefik("oxid-net", "http://oxid-daemon:8080");
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     cp.deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
         .unwrap();
@@ -2630,7 +2630,7 @@ async fn repeated_heartbeats_do_not_write_on_every_request() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = cp(oci).await;
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
     let env = cp
         .deploy(project.id, BranchName::parse("feature-a").unwrap())
         .await
@@ -2678,7 +2678,7 @@ async fn sibling_branches_deploy_concurrently_without_mixing_trees() {
     let repo = repo_dir_with_config();
     let oci = FakeOci::default();
     let cp = std::sync::Arc::new(cp(oci.clone()).await);
-    let project = cp.register_project(repo.path()).await.unwrap();
+    let project = cp.register_project(repo.path(), None).await.unwrap();
 
     let mut tasks = Vec::new();
     for i in 0..6 {

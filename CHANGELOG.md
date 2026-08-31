@@ -82,6 +82,15 @@ is the breaking position.
   stage copied a binary path Cargo names after the package. Generated image
   sizes: Go 24.5MB, SPA and static 94.5MB, Rust 136MB, FastAPI 209MB, Nest
   215MB, Express 246MB.
+- **Python builds that need a compiler now work.** `python:*-slim` ships
+  none, so any dependency without a wheel — psycopg2, older cryptography,
+  anything from source — failed to install at all. The build stage gets
+  `build-essential` and `libpq-dev`, the runtime gets `libpq5` and neither
+  the compiler nor the headers. Costs about 5MB; verified by deploying a
+  FastAPI service with psycopg2, which could not be deployed before.
+- **Next.js apps with no `public/` directory build.** It is optional in
+  Next.js and `COPY` fails outright on a missing source, so an app with no
+  static assets died at the last step of a slow build.
 - **Generated builds cache their dependencies.** Every generated Dockerfile
   now uses `RUN --mount=type=cache` for its ecosystem's download cache —
   npm, pnpm, yarn and bun stores, Go's module and build caches, cargo's
@@ -93,6 +102,14 @@ is the breaking position.
 - **Base images are fetched at registration**, in the background, so the
   first deploy of a project — the one someone is watching, having just wired
   up a webhook — does not begin with a several-hundred-megabyte download.
+- **A repository can hold several services.** `repo_url` was `UNIQUE`, so
+  "one project per repository" was a rule the schema enforced — right while
+  a repository held one deployable thing, wrong the moment monorepos were
+  understood. `UNIQUE (repo_url, build_context)` replaces it: registration
+  takes an optional `context`, stays idempotent per service, and a push
+  deploys every service of that repository (Oxid cannot know which packages
+  a commit touched, and guessing leaves one running stale code). Deleting a
+  branch destroys every service's environment for it.
 - **Monorepos are understood.** pnpm workspaces, a `workspaces` array in
   the root `package.json`, and `lerna.json` are recognised, with Turborepo
   and Nx reported on top. The deployable services are listed — a package

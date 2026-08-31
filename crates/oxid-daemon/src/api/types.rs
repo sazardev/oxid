@@ -63,6 +63,16 @@ pub struct RegisterBody {
     /// Write-only access token for a *private* repository — encrypted at
     /// rest alongside the project row, never echoed back by any response.
     pub git_token: Option<String>,
+    /// Which part of the repository this project builds, for a monorepo —
+    /// `apps/api`, `services/worker`. Omitted, the detected workspace's
+    /// first deployable service is used, or the whole repository when it
+    /// holds one thing.
+    ///
+    /// This is what lets one repository be registered several times: a
+    /// turborepo's API and web app are two projects that deploy, scale and
+    /// fail independently, and `(repo_url, context)` is what the schema
+    /// makes unique.
+    pub context: Option<String>,
 }
 
 /// The validated form of a [`RegisterBody`].
@@ -71,10 +81,12 @@ pub(crate) enum RegistrationSource {
     Dir {
         dir: String,
         git_token: Option<String>,
+        context: Option<String>,
     },
     Url {
         url: RepoUrl,
         git_token: Option<String>,
+        context: Option<String>,
     },
 }
 
@@ -93,10 +105,16 @@ impl RegisterBody {
             .repo_url
             .map(|v| normalize_git_url(&v))
             .filter(|v| !v.is_empty());
+        let context = self
+            .context
+            .as_deref()
+            .map(|v| v.trim().trim_matches('/').to_owned())
+            .filter(|v| !v.is_empty());
         match (dir, url) {
             (Some(dir), None) => Ok(RegistrationSource::Dir {
                 dir,
                 git_token: self.git_token,
+                context: context.clone(),
             }),
             (None, Some(url)) => {
                 let url = RepoUrl::parse(url.clone())
@@ -104,6 +122,7 @@ impl RegisterBody {
                 Ok(RegistrationSource::Url {
                     url,
                     git_token: self.git_token,
+                    context: context.clone(),
                 })
             }
             (Some(_), Some(_)) => Err(ApiError::from_validation(
