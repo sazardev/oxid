@@ -24,6 +24,7 @@ use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
 use crate::request_context::current_request_id;
+use oxid_core::services::branch_filter::{self, ProjectLoad, SkipReason};
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::stack::{PackageManager, Stack, detect as detect_stack, detect_monorepo};
 use oxid_core::services::subdomain::subdomain_for;
@@ -257,6 +258,55 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
         Ok(failures)
+    }
+
+    /// Whether a *pushed* branch is one this project deploys.
+    ///
+    /// Only webhook pushes go through this. `oxid up <branch>` does not: a
+    /// person naming a branch is asking for that branch, and the filter
+    /// exists to stop a repository's two hundred abandoned branches from
+    /// each becoming an image — not to stop anyone deploying what they
+    /// asked for.
+    ///
+    /// The rules come from the *project row*, not from the commit, because
+    /// this has to answer before the checkout. Reading `[deploy]` out of the
+    /// pushed commit would mean fetching and checking out the branch first,
+    /// which is precisely the work being avoided.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] if the environment list can't be read.
+    pub async fn admit_push(
+        &self,
+        project: &Project,
+        branch: &BranchName,
+    ) -> Result<Result<(), SkipReason>, CpError> {
+        let config = &project.config.deploy;
+        // Nothing configured is the common case and the cheap one: no query.
+        if config.branches.is_empty()
+            && config.ignore.is_empty()
+            && config.max_environments.is_none()
+        {
+            return Ok(Ok(()));
+        }
+
+        let environments = EnvironmentStore::list_by_project(&self.store, project.id).await?;
+        // `BuildFailed` is excluded along with `Destroyed`: it holds no
+        // container, and counting failures against the cap would let a
+        // handful of broken branches lock out the working ones.
+        let live: Vec<_> = environments
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e.state,
+                    EnvironmentState::Destroyed | EnvironmentState::BuildFailed
+                )
+            })
+            .collect();
+        let load = ProjectLoad {
+            live_environments: u32::try_from(live.len()).unwrap_or(u32::MAX),
+            branch_already_live: live.iter().any(|e| &e.branch.name == branch),
+        };
+        Ok(branch_filter::admit(branch.as_str(), config, load))
     }
 
     /// Accepts a push for `branch` without deploying it inline: the deploy

@@ -356,6 +356,30 @@ fn repo_dir_with_config() -> tempfile::TempDir {
     repo_dir_named("app")
 }
 
+/// A repository whose `oxid.toml` carries a `[deploy]` block, for the
+/// branch-filter tests.
+fn repo_dir_with_deploy(deploy: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("oxid.toml"),
+        format!(
+            r#"
+[project]
+name = "app"
+
+[routing]
+base_domain = "app.local.dev"
+port = 8080
+
+[deploy]
+{deploy}
+"#
+        ),
+    )
+    .unwrap();
+    dir
+}
+
 /// Like [`repo_dir_with_config`], but lets tests register several distinct
 /// projects (registration derives the identity from `[project].name`).
 fn repo_dir_named(name: &str) -> tempfile::TempDir {
@@ -3930,4 +3954,180 @@ async fn errors_are_returned_in_the_requested_language() {
     assert!(ask(Some("de-DE")).await.contains("bearer"));
     // And an unknown tag must not stop the search before a known one.
     assert!(ask(Some("de, es")).await.contains("token bearer"));
+}
+
+/// A push to a branch the project does not deploy is *accepted* and does
+/// nothing. It is not an error: the push was valid, and reporting a failure
+/// would paint a Git host's delivery log red for the repository's ordinary
+/// traffic.
+#[tokio::test]
+async fn a_push_to_an_unlisted_branch_is_accepted_and_skipped() {
+    let repo = repo_dir_with_deploy(r#"branches = ["main", "release/*"]"#);
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/feature-carrito",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "skipped", "{value}");
+    assert!(
+        value["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("feature-carrito"),
+        "the reason should name the branch: {value}"
+    );
+
+    // Nothing was built. This is the whole point of the feature.
+    let (_, body) = json_request(&app, "GET", "/api/v1/projects/1/environments", json!({})).await;
+    let envs: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envs.as_array().map(Vec::len), Some(0), "{envs}");
+}
+
+#[tokio::test]
+async fn a_push_to_a_listed_branch_still_deploys() {
+    let repo = repo_dir_with_deploy(r#"branches = ["main", "release/*"]"#);
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/release/1.2",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "queued", "{value}");
+    assert_eq!(wait_for_environments(&app, 1).await.len(), 1);
+}
+
+/// `ignore` beats the allowlist, so the usual "allow everything except the
+/// bot" shape works.
+#[tokio::test]
+async fn an_ignored_branch_is_skipped_even_with_a_wide_allowlist() {
+    let repo = repo_dir_with_deploy("branches = [\"*\"]\nignore = [\"dependabot/*\"]");
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (_, body) = signed_webhook(
+        &app,
+        json!({
+            "ref": "refs/heads/dependabot/npm/lodash",
+            "repository": { "full_name": "org/app" }
+        }),
+    )
+    .await;
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "skipped", "{value}");
+}
+
+/// The filter is for pushes. A person naming a branch is asking for that
+/// branch, and must always get it — otherwise the escape hatch for "I need
+/// to see this one today" does not exist.
+#[tokio::test]
+async fn an_explicit_deploy_ignores_the_branch_filter() {
+    let repo = repo_dir_with_deploy(r#"branches = ["main"]"#);
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/projects/1/deploy",
+        json!({ "branch": "feature-carrito" }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "an explicit deploy must not be filtered, got {status}"
+    );
+}
+
+/// The cap is the backstop for a filter nobody wrote correctly: a typo like
+/// `["relase/*"]` deploys nothing and `["*"]` deploys everything, and only
+/// the cap holds either way.
+#[tokio::test]
+async fn the_environment_cap_refuses_a_new_branch_but_never_a_redeploy() {
+    let repo = repo_dir_with_deploy("max_environments = 1");
+    let (app, _) = test_app().await;
+    json_request(
+        &app,
+        "POST",
+        "/api/v1/projects",
+        json!({ "repo_dir": repo.path().display().to_string() }),
+    )
+    .await;
+
+    // First branch fills the single slot.
+    signed_webhook(
+        &app,
+        json!({ "ref": "refs/heads/main", "repository": { "full_name": "org/app" } }),
+    )
+    .await;
+    assert_eq!(wait_for_environments(&app, 1).await.len(), 1);
+
+    // A second, different branch is refused — with a reason, not an error.
+    let (status, body) = signed_webhook(
+        &app,
+        json!({ "ref": "refs/heads/second", "repository": { "full_name": "org/app" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "skipped", "{value}");
+    assert!(
+        value["skipped"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("max_environments"),
+        "{value}"
+    );
+
+    // But the branch that already holds a slot can still ship updates —
+    // otherwise reaching the cap freezes everything already running.
+    let (_, body) = signed_webhook(
+        &app,
+        json!({ "ref": "refs/heads/main", "repository": { "full_name": "org/app" } }),
+    )
+    .await;
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        value["status"], "queued",
+        "a redeploy must not hit the cap: {value}"
+    );
 }

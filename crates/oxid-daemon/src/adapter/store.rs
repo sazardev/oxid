@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use oxid_core::services::branch_filter::DeployConfig;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 
@@ -851,6 +852,11 @@ fn project_to_binds(project: &Project) -> ProjectBinds<'_> {
             .workspace
             .as_ref()
             .and_then(|w| serde_json::to_string(w).ok()),
+        deploy_branches_json: serde_json::to_string(&project.config.deploy.branches)
+            .expect("serializing Vec<String> cannot fail"),
+        deploy_ignore_json: serde_json::to_string(&project.config.deploy.ignore)
+            .expect("serializing Vec<String> cannot fail"),
+        max_environments: project.config.deploy.max_environments.map(i64::from),
     }
 }
 
@@ -869,15 +875,20 @@ struct ProjectBinds<'a> {
     cpu_limit_millicores: Option<i64>,
     detected_stack: Option<String>,
     workspace: Option<String>,
+    deploy_branches_json: String,
+    deploy_ignore_json: String,
+    max_environments: Option<i64>,
 }
 
 const PROJECT_COLUMNS: &str = "id, name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace";
+     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace, \
+     deploy_branches_json, deploy_ignore_json, max_environments";
 
 const PROJECT_COLUMNS_NO_ID: &str = "name, repo_url, base_domain, pause_after_seconds, \
      destroy_after_seconds, port, dockerfile, build_context, on_start_json, dependencies_json, \
-     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace";
+     memory_limit_mb, cpu_limit_millicores, detected_stack, workspace, \
+     deploy_branches_json, deploy_ignore_json, max_environments";
 
 fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, RepositoryError> {
     let id = id_from_row(row, "id")?;
@@ -908,6 +919,20 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
             .map(|v| u32::try_from(v).map_err(|_| storage("cpu_limit_millicores overflowed u32")))
             .transpose()?,
     };
+    // Patterns that no longer deserialize fall back to empty, which means
+    // "every branch" — the same reasoning as `detected_stack` below, with
+    // one difference that matters: an unreadable filter must fail *open*.
+    // Failing closed would silently stop deploying a project entirely, and
+    // a silent stop is the hardest kind of outage to find.
+    let deploy_branches_json: String = row.try_get("deploy_branches_json").map_err(storage)?;
+    let deploy_ignore_json: String = row.try_get("deploy_ignore_json").map_err(storage)?;
+    let max_environments: Option<i64> = row.try_get("max_environments").map_err(storage)?;
+    let deploy = DeployConfig {
+        branches: serde_json::from_str(&deploy_branches_json).unwrap_or_default(),
+        ignore: serde_json::from_str(&deploy_ignore_json).unwrap_or_default(),
+        max_environments: max_environments.and_then(|v| u32::try_from(v).ok()),
+    };
+
     let config = ProjectConfig::new(
         base_domain,
         Ttl::from_seconds(pause_after).map_err(|e| validation(&e))?,
@@ -916,7 +941,8 @@ fn project_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Project, Repository
         build,
         dependencies,
     )
-    .map_err(|e| validation(&e))?;
+    .map_err(|e| validation(&e))?
+    .with_deploy(deploy);
     let repo_url = RepoUrl::parse(repo_url).map_err(|e| validation(&e))?;
 
     // A stack that no longer deserializes — an older daemon's shape, or a
@@ -941,7 +967,7 @@ impl ProjectStore for SqliteStore {
         let binds = project_to_binds(project);
         let row = sqlx::query(&format!(
             "INSERT INTO projects ({PROJECT_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.name)
         .bind(binds.repo_url)
@@ -957,6 +983,9 @@ impl ProjectStore for SqliteStore {
         .bind(binds.cpu_limit_millicores)
         .bind(binds.detected_stack)
         .bind(binds.workspace)
+        .bind(binds.deploy_branches_json)
+        .bind(binds.deploy_ignore_json)
+        .bind(binds.max_environments)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -1007,7 +1036,9 @@ impl ProjectStore for SqliteStore {
             "UPDATE projects SET name = ?, base_domain = ?, pause_after_seconds = ?, \
              destroy_after_seconds = ?, port = ?, dockerfile = ?, build_context = ?, \
              on_start_json = ?, dependencies_json = ?, memory_limit_mb = ?, \
-             cpu_limit_millicores = ?, detected_stack = ?, workspace = ? WHERE id = ?",
+             cpu_limit_millicores = ?, detected_stack = ?, workspace = ?, \
+             deploy_branches_json = ?, deploy_ignore_json = ?, max_environments = ? \
+             WHERE id = ?",
         )
         .bind(binds.name)
         .bind(binds.base_domain)
@@ -1022,6 +1053,9 @@ impl ProjectStore for SqliteStore {
         .bind(binds.cpu_limit_millicores)
         .bind(binds.detected_stack)
         .bind(binds.workspace)
+        .bind(binds.deploy_branches_json)
+        .bind(binds.deploy_ignore_json)
+        .bind(binds.max_environments)
         .bind(id_as_i64(project.id.0))
         .execute(&self.pool)
         .await

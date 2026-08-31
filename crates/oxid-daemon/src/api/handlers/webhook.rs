@@ -176,7 +176,28 @@ async fn handle_push<
     // redeliveries. The queue is persisted, so an accepted push also
     // survives a daemon restart, which an inline deploy never did.
     let mut queued = Vec::new();
+    let mut skipped = Vec::new();
     for project in &projects {
+        // A branch the project does not deploy is not an error: the push was
+        // valid and was accepted, and the answer is simply that this branch
+        // is not one of the ones being previewed. Reporting it as a failure
+        // would fill a Git host's delivery log with red for the repository's
+        // normal traffic.
+        if let Err(reason) = state.cp.admit_push(project, &branch).await? {
+            let explanation = reason.describe(branch.as_str());
+            tracing::info!(
+                project_id = project.id.0,
+                branch = %branch,
+                reason = %explanation,
+                "push not deployed"
+            );
+            skipped.push(json!({
+                "project_id": project.id.0,
+                "service": project.config.build.context,
+                "reason": explanation,
+            }));
+            continue;
+        }
         let position = state
             .cp
             .enqueue_push(project.id, &branch, event.pusher.as_deref())
@@ -186,6 +207,19 @@ async fn handle_push<
             "service": project.config.build.context,
             "position": position,
         }));
+    }
+
+    // Every service skipped it: answer plainly rather than reporting a queue
+    // position of zero, which reads as "queued first" to anything parsing it.
+    if queued.is_empty() {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "skipped",
+                "branch": branch.as_str(),
+                "skipped": skipped,
+            })),
+        ));
     }
     // The first position, kept for consumers that read it: this response
     // shape predates monorepos and scripts assert on it.
@@ -216,6 +250,7 @@ async fn handle_push<
             "status": "queued",
             "position": position,
             "queued": queued,
+            "skipped": skipped,
         })),
     ))
 }

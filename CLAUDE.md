@@ -69,6 +69,18 @@ Four invariants in that pipeline are load-bearing and easy to undo by accident:
 - **Scale-to-zero stops containers, it does not pause them.** Traefik's Docker provider only publishes routers for `running` containers and ignores pause/unpause events, so a `docker pause`d environment loses its route permanently and 404s instead of waking. `ControlPlane::pause` and the GC both use `stop`; waking dispatches on `container_status`, never on the stored state.
 - **Wake-on-request needs the daemon's catch-all router.** A stopped environment has no router of its own, so the lowest-priority `oxid-wake-catchall` router on the daemon's container is what catches the request and rewrites it to `/api/v1/wake`. It ships in `docker-compose.yml` and `oxid infra status` reports it missing.
 - **The environment row is created before the image build.** It is what gives a failure somewhere to be recorded; every failure path funnels through `record_deploy_failure` so a broken Dockerfile leaves an `EnvironmentState::BuildFailed` row, an audit event and an ERROR line instead of nothing at all. `BuildFailed` is a real state, distinct from `Destroyed`: it means "someone's push is broken", it can only transition onward to `Destroy`/`TtlExpired`, and it is deliberately excluded from `find_environment_by_branch`'s notion of *live* so a failure never hides the instance still serving the branch.
+- **Branch filtering is decided before the checkout, and only for webhooks.**
+  `[deploy].branches`/`ignore`/`max_environments` live on the project row
+  (migration `0016`), not in the per-commit `branch_config`, because the whole
+  point is to skip the fetch and build for a branch nobody wanted — reading the
+  rule from the pushed commit would do the work it exists to avoid.
+  `ControlPlane::admit_push` is called from the webhook handler only;
+  `oxid up <branch>` is never filtered, since a person naming a branch is the
+  escape hatch. The rule reads the branch *name*: a commit-message tag is
+  per-push and has no coherent answer for the second push. An unreadable
+  pattern list fails *open* — a filter that fails closed stops deploying a
+  project silently.
+
 - **Admission is decided once, after the checkout.** `check_admission` runs inside `deploy_at` with the branch's own effective config, because that is the first point the real memory request is known. `AdmissionMode` says what to do when it doesn't fit — enqueue, report (the queue drain already holds the entry), or bypass (rollback). Deciding earlier means weighing a number the deploy won't use.
 
 Per-deploy config comes from the commit: `branch_config` re-reads `oxid.toml` from the checkout for `[build]`, `[routing].port` and `[dependencies]`. `base_domain` and the idle/lifetime policy stay with the project, because those are operator decisions owned by `oxid configure`. Containers are injected `OXID_BRANCH`, `OXID_ENV_URL` and `OXID_COMMIT`.

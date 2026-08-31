@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use oxid_core::services::branch_filter::DeployConfig;
 use oxid_core::services::stack::{Monorepo, RepoManifest, Stack, detect, detect_monorepo};
 use oxid_core::{BuildConfig, Dependency, DomainError, PoolKind, ProjectConfig, Ttl};
 
@@ -86,6 +87,8 @@ struct Config {
     routing: RoutingBlock,
     #[serde(default)]
     dependencies: BTreeMap<String, DependencyBlock>,
+    #[serde(default)]
+    deploy: DeployBlock,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -109,6 +112,18 @@ struct BuildBlock {
 struct RoutingBlock {
     base_domain: Option<String>,
     port: Option<u16>,
+}
+
+/// `[deploy]` — which branches a push may deploy, and how many environments
+/// this project may hold. Every field is optional and an absent block means
+/// "every branch, no cap", which is what a project had before this existed.
+#[derive(Debug, Default, Deserialize)]
+struct DeployBlock {
+    #[serde(default)]
+    branches: Vec<String>,
+    #[serde(default)]
+    ignore: Vec<String>,
+    max_environments: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,7 +195,12 @@ impl Config {
             port,
             build,
             dependencies,
-        )?;
+        )?
+        .with_deploy(DeployConfig {
+            branches: self.deploy.branches,
+            ignore: self.deploy.ignore,
+            max_environments: self.deploy.max_environments,
+        });
 
         Ok(ParsedProject {
             name,

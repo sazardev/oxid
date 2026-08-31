@@ -253,6 +253,11 @@ cd ~/code/app &amp;&amp; oxid up main</pre>
         <span class="tk-gray"># also: /gitlab, /gitea, /gogs</span>
 Secret  <span class="tk-gray">the OXID_WEBHOOK_SECRET the installer printed</span>
         <span class="tk-gray">(or: grep ^OXID_WEBHOOK_SECRET oxid-stack/.env | cut -d= -f2)</span></pre>
+        <p class="note">
+          Got a repository with hundreds of branches? By default <em>every</em> pushed branch gets
+          an environment. See <a href="guide.html#branches">choosing which branches deploy</a> —
+          patterns in <code>oxid.toml</code> plus a hard cap.
+        </p>
         <p>Two things to get right:</p>
         <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.4rem;">
           <li><strong>The port has to be reachable by the Git host</strong> &mdash; see <a href="#setup-network">where it listens</a>. A default Docker install is loopback-only.</li>

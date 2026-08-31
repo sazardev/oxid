@@ -4,6 +4,56 @@ Notable changes per release. Format follows [Keep a Changelog](https://keepachan
 versioning is [SemVer](https://semver.org/) — on the `0.x` line the **minor**
 is the breaking position.
 
+## [Unreleased]
+
+### Added
+
+- **`[deploy]` in `oxid.toml`: which branches a push actually deploys.** Every
+  pushed branch got an environment, which is the product on a normal
+  repository and a problem on one with two hundred branches — most of them
+  someone's abandoned experiment, each costing an image, disk and a queue
+  slot.
+
+  ```toml
+  [deploy]
+  branches = ["main", "develop", "release/*"]
+  ignore   = ["dependabot/*", "wip/*"]
+  max_environments = 25
+  ```
+
+  Also settable without touching the repo: `oxid configure --branches
+  "main,release/*" --ignore "dependabot/*" --max-environments 25`.
+
+  Four decisions in this are load-bearing:
+
+  - **Only webhook pushes are filtered.** `oxid up <branch>` deploys what it
+    names, whatever the patterns say — a person asking for a branch is the
+    escape hatch, and filtering it would remove the only way to preview
+    something that does not match.
+  - **The rule reads the branch name, never the commit message.** A tag like
+    `[oxid]` in a commit is per-push and has no answer for the second push:
+    destroying a live environment and leaving it serving stale code are both
+    wrong, and nobody can predict which they get. A branch name answers the
+    same way on every push of its life, including the one that deletes it.
+  - **The cap never blocks a redeploy** of a branch that already holds an
+    environment. Otherwise reaching it freezes every branch already running,
+    which is the opposite of protecting the host.
+  - **`[deploy]` lives on the project, not the commit**, unlike `[build]` and
+    `[routing]`. The filter has to answer before the checkout — reading it
+    from the pushed commit would mean doing the fetch the filter exists to
+    avoid.
+
+  A skipped push is answered `202 skipped` with the reason naming the branch
+  and the rule, not an error: the push was valid, and failing it would paint
+  a Git host's delivery log red for a repository's ordinary traffic. The same
+  reason is logged at `info`, so "why didn't my branch deploy?" has an answer.
+
+  Unset means what it always did — every branch deploys — so nothing changes
+  for a project that does not configure it. Migration `0016` adds the columns
+  with defaults that say exactly that, and an unreadable pattern list falls
+  back to "deploy everything": a filter failing closed would silently stop
+  deploying a project, and a silent stop is the hardest outage to find.
+
 ## [0.3.1] - 2026-08-31
 
 A patch for the install path itself: v0.3.0 shipped a CLI whose first

@@ -293,6 +293,42 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         Ok(project)
     }
 
+    /// Replaces a project's `[deploy]` rules — which branches a push may
+    /// deploy, and how many environments it may hold.
+    ///
+    /// Lives on the project rather than being re-read from each commit like
+    /// `[build]`, because the filter has to answer before the checkout: its
+    /// whole purpose is to avoid fetching and building a branch nobody
+    /// wanted. `oxid.toml` seeds it at registration; this is how it changes
+    /// afterwards, the same shape as the TTL policy above.
+    ///
+    /// Each argument is optional so a caller only sends what it is changing,
+    /// and `max_environments` takes a nested `Option` because clearing the
+    /// cap and leaving it alone are different requests.
+    ///
+    /// # Errors
+    /// Returns [`CpError::NotFound`] if the project does not exist.
+    pub async fn update_project_deploy(
+        &self,
+        project_id: ProjectId,
+        branches: Option<Vec<String>>,
+        ignore: Option<Vec<String>>,
+        max_environments: Option<Option<u32>>,
+    ) -> Result<Project, CpError> {
+        let mut project = self.ensure_project(project_id).await?;
+        if let Some(branches) = branches {
+            project.config.deploy.branches = branches;
+        }
+        if let Some(ignore) = ignore {
+            project.config.deploy.ignore = ignore;
+        }
+        if let Some(max) = max_environments {
+            project.config.deploy.max_environments = max;
+        }
+        ProjectStore::update(&self.store, &project).await?;
+        Ok(project)
+    }
+
     /// Sets (or, with `token: None`/an empty string, clears) a project's git
     /// access token — required for the daemon to clone/fetch a *private*
     /// repository, since its own git-cache clone is independent of any

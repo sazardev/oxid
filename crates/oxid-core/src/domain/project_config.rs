@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::error::invalid;
 use crate::domain::resource_pool::PoolKind;
+use crate::domain::services::branch_filter::DeployConfig;
 use crate::domain::value_objects::Ttl;
 
 /// Build instructions (`[build]` block).
@@ -67,6 +68,16 @@ pub struct ProjectConfig {
     pub build: BuildConfig,
     /// Shared dependencies to multiplex.
     pub dependencies: Vec<Dependency>,
+    /// Which branches a push may deploy, and how many environments this
+    /// project may hold (`[deploy]` block). Default is unrestricted, so a
+    /// project that never configures it keeps deploying every branch.
+    ///
+    /// Set through [`ProjectConfig::with_deploy`] rather than `new`, whose
+    /// positional signature is used across the workspace and in every
+    /// fixture — a project without a `[deploy]` block is the common case and
+    /// should not have to name it.
+    #[serde(default)]
+    pub deploy: DeployConfig,
 }
 
 impl ProjectConfig {
@@ -110,7 +121,15 @@ impl ProjectConfig {
             port,
             build,
             dependencies,
+            deploy: DeployConfig::default(),
         })
+    }
+
+    /// Returns this configuration with its `[deploy]` rules replaced.
+    #[must_use]
+    pub fn with_deploy(mut self, deploy: DeployConfig) -> Self {
+        self.deploy = deploy;
+        self
     }
 }
 

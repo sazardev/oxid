@@ -42,6 +42,8 @@
         <a href="install.html">Install &amp; setup</a>
         <p class="side-group">Guide</p>
         <a href="guide.html" class="current">How Oxid is used</a>
+        <a href="#branches" class="sub">Which branches deploy</a>
+        <a href="#config" class="sub">oxid.toml</a>
         <a href="stacks.html">Stacks &amp; builds</a>
         <p class="side-group">Modules</p>
         <a href="cli.html">CLI reference</a>
@@ -236,6 +238,11 @@ cpu_limit_millicores = 1000 <span class="tk-gray"># 1000 = one core</span>
 base_domain = "my-app.local.dev"
 port = 8080                <span class="tk-gray"># the port your app listens on inside the container</span>
 
+<span class="tk-gray">[deploy]</span>
+branches = ["main", "release/*"]  <span class="tk-gray"># which pushes deploy. empty = all</span>
+ignore = ["dependabot/*"]         <span class="tk-gray"># refused outright, beats `branches`</span>
+max_environments = 25             <span class="tk-gray"># hard cap. no default</span>
+
 <span class="tk-gray">[dependencies.db]</span>
 type = "postgres"          <span class="tk-gray"># postgres | redis</span>
 shared_instance = "local-pg"
@@ -251,7 +258,7 @@ inject_url_as = "DATABASE_URL"</pre>
           <tbody>
             <tr>
               <td><code>[build]</code>, <code>[routing].port</code>, <code>[dependencies]</code></td>
-              <td><code>[routing].base_domain</code>, <code>pause_after</code>, <code>destroy_after</code></td>
+              <td><code>[routing].base_domain</code>, <code>pause_after</code>, <code>destroy_after</code>, <code>[deploy]</code></td>
             </tr>
             <tr>
               <td>Properties of the code — a branch that adds a dependency or needs more memory gets it.</td>
@@ -260,6 +267,67 @@ inject_url_as = "DATABASE_URL"</pre>
           </tbody>
         </table>
         <pre class="cmd-block"><span class="tk-gray">$</span> oxid configure --pause-after 45m --destroy-after 3d</pre>
+        <p class="note">
+          <code>[deploy]</code> is on the project side for a reason of its own: the filter has to
+          answer <em>before</em> the checkout. Reading it from the pushed commit would mean fetching
+          and checking out the branch first — exactly the work the filter exists to avoid.
+        </p>
+      </section>
+
+      <section class="doc-section" id="branches">
+        <h2>Choosing which branches deploy</h2>
+        <p style="max-width:70ch;">
+          By default every pushed branch gets an environment, because that is the product. On a
+          repository with two hundred branches it stops being what you want: most of them are
+          someone's abandoned experiment, and each one costs an image, disk and a queue slot.
+        </p>
+        <pre class="cmd-block"><span class="tk-gray"># in oxid.toml, versioned with your repo:</span>
+<span class="tk-orange">[deploy]</span>
+branches = [<span class="tk-green">"main"</span>, <span class="tk-green">"develop"</span>, <span class="tk-green">"release/*"</span>]
+ignore   = [<span class="tk-green">"dependabot/*"</span>, <span class="tk-green">"wip/*"</span>]
+max_environments = <span class="tk-green">25</span>
+
+<span class="tk-gray"># or without touching the repo, on a project already registered:</span>
+oxid configure --branches <span class="tk-green">"main,release/*"</span> --ignore <span class="tk-green">"dependabot/*"</span> \
+               --max-environments <span class="tk-green">25</span></pre>
+        <table class="docs-table">
+          <thead><tr><th>Rule</th><th>Behaviour</th></tr></thead>
+          <tbody>
+            <tr><td>Empty <code>branches</code></td><td>Every branch deploys. This is the default, so nothing changes for a project that never configures it.</td></tr>
+            <tr><td><code>ignore</code> beats <code>branches</code></td><td>So the usual shape — allow everything except the bot — works: <code>branches = ["*"]</code> with <code>ignore = ["dependabot/*"]</code>.</td></tr>
+            <tr><td><code>*</code> crosses <code>/</code></td><td><code>feat/*</code> matches <code>feat/team/thing</code>. Someone writing that means everything under <code>feat/</code>, and a filter that quietly skips branches is worse than one slightly too generous.</td></tr>
+            <tr><td><code>max_environments</code></td><td>A new branch past the cap is refused; a <strong>redeploy of a branch that already has an environment never is</strong>, or reaching the cap would freeze everything already running.</td></tr>
+          </tbody>
+        </table>
+        <h3>Two things that are deliberately not how this works</h3>
+        <p>
+          <strong>A manual deploy is never filtered.</strong> <code>oxid up feat/carrito</code>
+          deploys that branch whatever the patterns say. A person naming a branch is asking for it,
+          and that is the escape hatch for &ldquo;I need to see this one today&rdquo;.
+        </p>
+        <p>
+          <strong>The decision comes from the branch name, not the commit message.</strong> A tag
+          like <code>[oxid]</code> in a commit is per-push, so it has no answer for the second push:
+          destroying a live environment and leaving it serving stale code are both wrong, and nobody
+          could predict which they would get. A branch name gives the same answer on every push of
+          its life, including the one that deletes it.
+        </p>
+        <h3>What a skipped push looks like</h3>
+        <p>
+          It is accepted, not failed &mdash; the push was valid, and painting a Git host's delivery
+          log red for a repository's ordinary traffic would be wrong:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray">HTTP 202</span>
+{
+  "status": "skipped",
+  "branch": "feature-carrito",
+  "skipped": [
+    { "project_id": 1, "service": ".",
+      "reason": "branch `feature-carrito` matches no pattern in `[deploy].branches`" }
+  ]
+}</pre>
+        <p>The daemon logs the same reason at <code>info</code>, so a developer asking &ldquo;why
+          didn't my branch deploy?&rdquo; has an answer without guessing.</p>
         <p class="note">
           A malformed <code>oxid.toml</code> on a branch fails that deploy with the parse error, and
           the failure is recorded against the environment. A branch with no config file at all keeps

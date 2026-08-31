@@ -172,6 +172,31 @@ pub struct UpdateProjectBody {
     /// `ControlPlane::set_project_git_token`'s doc comment for why it isn't
     /// a field on `Project` at all).
     git_token: Option<String>,
+    /// Glob patterns a pushed branch must match to deploy. An empty array
+    /// clears the allowlist, which means every branch again.
+    branches: Option<Vec<String>>,
+    /// Glob patterns that refuse a pushed branch outright.
+    ignore: Option<Vec<String>>,
+    /// Most environments this project may hold. Nested so that omitting the
+    /// field and clearing the cap stay distinguishable: absent leaves it
+    /// alone, `null` removes it.
+    #[serde(default, deserialize_with = "present_or_absent")]
+    max_environments: Option<Option<u32>>,
+}
+
+/// Distinguishes "field absent" from "field set to null" for an optional
+/// field whose value is itself optional.
+///
+/// Serde collapses both to `None` on a plain `Option`, which would make
+/// clearing the cap impossible to express: the request to remove it and the
+/// request to leave it alone would arrive identical. The outer `Option` is
+/// the presence of the field, the inner one its value.
+fn present_or_absent<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(de).map(Some)
 }
 
 /// Updates a project's `pause_after`/`destroy_after` policy and/or its git
@@ -203,6 +228,17 @@ pub async fn update_project<
         state
             .cp
             .set_project_git_token(ProjectId(id), Some(git_token).filter(|t| !t.is_empty()))
+            .await?;
+    }
+    if body.branches.is_some() || body.ignore.is_some() || body.max_environments.is_some() {
+        state
+            .cp
+            .update_project_deploy(
+                ProjectId(id),
+                body.branches,
+                body.ignore,
+                body.max_environments,
+            )
             .await?;
     }
     let project = state

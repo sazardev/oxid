@@ -209,6 +209,22 @@ enum Command {
         /// shell. Pass an empty string to clear it.
         #[arg(long)]
         git_token: Option<String>,
+        /// Comma-separated glob patterns a *pushed* branch must match to
+        /// deploy, e.g. `main,release/*`. Only webhook pushes are filtered;
+        /// `oxid up <branch>` always deploys what you name. Pass an empty
+        /// string to clear the list, which deploys every branch again.
+        #[arg(long)]
+        branches: Option<String>,
+        /// Comma-separated glob patterns that refuse a pushed branch
+        /// outright, e.g. `dependabot/*,wip/*`. Checked before --branches,
+        /// so an exclusion wins over a wide allowlist.
+        #[arg(long)]
+        ignore: Option<String>,
+        /// Most environments this project may hold at once. A redeploy of a
+        /// branch that already has one is never blocked. Pass 0 to remove
+        /// the cap.
+        #[arg(long)]
+        max_environments: Option<u32>,
     },
     /// Manage named daemon contexts (`kubectl config`-style), persisted at
     /// `~/.config/oxid/config.toml`, so `--api`/`--token` don't need to be
@@ -739,13 +755,21 @@ async fn main() {
             pause_after,
             destroy_after,
             git_token,
+            branches,
+            ignore,
+            max_environments,
         } => {
             cmd_configure(
                 &client,
                 &base,
-                pause_after.as_deref(),
-                destroy_after.as_deref(),
-                git_token.as_deref(),
+                ConfigureArgs {
+                    pause_after: pause_after.as_deref(),
+                    destroy_after: destroy_after.as_deref(),
+                    git_token: git_token.as_deref(),
+                    branches: branches.as_deref(),
+                    ignore: ignore.as_deref(),
+                    max_environments,
+                },
             )
             .await
         }
@@ -1486,16 +1510,54 @@ async fn cmd_audit(
     Ok(())
 }
 
+/// What `oxid configure` may change. Grouped into a struct because clippy
+/// counts arguments, and six `Option<&str>` in a row is exactly the shape
+/// that invites passing two of them in the wrong order.
+struct ConfigureArgs<'a> {
+    pause_after: Option<&'a str>,
+    destroy_after: Option<&'a str>,
+    git_token: Option<&'a str>,
+    branches: Option<&'a str>,
+    ignore: Option<&'a str>,
+    max_environments: Option<u32>,
+}
+
+/// Splits a comma-separated pattern list, dropping blanks.
+///
+/// An empty string is a deliberate, meaningful input: it clears the list.
+/// That is why this returns an empty `Vec` rather than `None` for it — the
+/// caller has already decided the flag was present.
+fn pattern_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 async fn cmd_configure(
     client: &Client,
     base: &str,
-    pause_after: Option<&str>,
-    destroy_after: Option<&str>,
-    git_token: Option<&str>,
+    args: ConfigureArgs<'_>,
 ) -> Result<(), CliError> {
-    if pause_after.is_none() && destroy_after.is_none() && git_token.is_none() {
+    let ConfigureArgs {
+        pause_after,
+        destroy_after,
+        git_token,
+        branches,
+        ignore,
+        max_environments,
+    } = args;
+    if pause_after.is_none()
+        && destroy_after.is_none()
+        && git_token.is_none()
+        && branches.is_none()
+        && ignore.is_none()
+        && max_environments.is_none()
+    {
         return Err(
-            "nothing to configure — pass --pause-after, --destroy-after and/or --git-token"
+            "nothing to configure — pass --pause-after, --destroy-after, --git-token, \
+             --branches, --ignore and/or --max-environments"
                 .to_owned()
                 .into(),
         );
@@ -1508,11 +1570,25 @@ async fn cmd_configure(
     let url = format!("{base}/api/v1/projects/{project_id}");
     let response = client
         .patch(&url)
-        .json(&json!({
-            "pause_after": pause_after,
-            "destroy_after": destroy_after,
-            "git_token": git_token,
-        }))
+        .json(&{
+            let mut body = json!({
+                "pause_after": pause_after,
+                "destroy_after": destroy_after,
+                "git_token": git_token,
+            });
+            if let Some(raw) = branches {
+                body["branches"] = json!(pattern_list(raw));
+            }
+            if let Some(raw) = ignore {
+                body["ignore"] = json!(pattern_list(raw));
+            }
+            if let Some(max) = max_environments {
+                // 0 is how a shell flag says "remove the cap"; the API
+                // spells that `null`, which it distinguishes from absent.
+                body["max_environments"] = if max == 0 { json!(null) } else { json!(max) };
+            }
+            body
+        })
         .send()
         .await
         .map_err(|e| connect_error(&url, &e))?;
