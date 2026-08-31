@@ -1,3 +1,13 @@
 /target
 *.swp
 .DS_Store
+
+# Windows reserves these as device names, so a checkout on Windows fails
+# outright — `git checkout` reports "invalid path" and stops. A stray `nul`
+# (easy to create with a mistyped `>nul` redirect) was committed once and
+# broke every Windows build until it was found.
+nul
+NUL
+[Cc][Oo][Nn]
+[Pp][Rr][Nn]
+[Aa][Uu][Xx]
