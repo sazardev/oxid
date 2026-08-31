@@ -1032,6 +1032,111 @@ impl SqliteStore {
     ///
     /// # Errors
     /// Returns [`RepositoryError`] on query failure.
+    /// Claims up to `limit` unclaimed (or lease-expired) queue entries for
+    /// `worker`, and returns them.
+    ///
+    /// One statement, so it is atomic under SQLite's single-writer model —
+    /// no `BEGIN IMMEDIATE` needed here, unlike `rotate_master_key` where
+    /// the transaction spans several. Two drains racing therefore get
+    /// disjoint sets rather than both deploying the same push, which is
+    /// what the in-process mutex could only promise inside one process.
+    ///
+    /// A claim is a *lease*: a worker that dies mid-build stops renewing,
+    /// the lease expires, and the entry becomes claimable again. Without
+    /// that, one crash would strand a push in the queue for ever.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn claim_deploy_queue(
+        &self,
+        worker: &str,
+        lease_secs: i64,
+        limit: u32,
+    ) -> Result<Vec<QueuedDeploy>, RepositoryError> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let rows = sqlx::query(
+            "UPDATE deploy_queue \
+                SET claimed_by = ?, claimed_at = ?, lease_expires_at = ? \
+              WHERE id IN ( \
+                    SELECT id FROM deploy_queue \
+                     WHERE lease_expires_at IS NULL OR lease_expires_at < ? \
+                     ORDER BY id ASC LIMIT ?) \
+              RETURNING id, project_id, branch, operator, requested_at, attempts",
+        )
+        .bind(worker)
+        .bind(now)
+        .bind(now + lease_secs)
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(queued_from_row).collect()
+    }
+
+    /// Extends the lease on entries still being worked on.
+    ///
+    /// A real first build can take minutes, far longer than any lease short
+    /// enough to recover from a crash quickly. Renewing while the work is
+    /// in flight is what lets the lease be both.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn renew_deploy_leases(
+        &self,
+        ids: &[u64],
+        lease_secs: i64,
+    ) -> Result<(), RepositoryError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let expires = OffsetDateTime::now_utc().unix_timestamp() + lease_secs;
+        // A small, bounded IN list built from integers — no user input
+        // reaches this string.
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql =
+            format!("UPDATE deploy_queue SET lease_expires_at = ? WHERE id IN ({placeholders})");
+        let mut query = sqlx::query(&sql).bind(expires);
+        for id in ids {
+            query = query.bind(id_as_i64(*id));
+        }
+        query.execute(&self.pool).await.map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Releases a claim so the entry can be picked up again, no earlier
+    /// than `retry_at`.
+    ///
+    /// Used when admission says the deploy does not fit right now: the
+    /// entry must go back, but immediately would busy-spin the drain on the
+    /// one thing that cannot run.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn release_deploy_claim(
+        &self,
+        id: u64,
+        retry_in_secs: i64,
+    ) -> Result<(), RepositoryError> {
+        let retry_at = OffsetDateTime::now_utc().unix_timestamp() + retry_in_secs;
+        sqlx::query(
+            "UPDATE deploy_queue SET claimed_by = NULL, claimed_at = NULL, \
+             lease_expires_at = ? WHERE id = ?",
+        )
+        .bind(retry_at)
+        .bind(id_as_i64(id))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Every queued deploy, oldest first — for reporting, not for
+    /// draining. The drain claims entries instead, so two of them never
+    /// read the same row.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
     pub async fn list_deploy_queue(&self) -> Result<Vec<QueuedDeploy>, RepositoryError> {
         let rows = sqlx::query(
             "SELECT id, project_id, branch, operator, requested_at, attempts \
@@ -1040,27 +1145,7 @@ impl SqliteStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        rows.iter()
-            .map(|r| {
-                let id: i64 = r.try_get("id").map_err(storage)?;
-                let project_id: i64 = r.try_get("project_id").map_err(storage)?;
-                let branch: String = r.try_get("branch").map_err(storage)?;
-                let operator: Option<String> = r.try_get("operator").map_err(storage)?;
-                let requested_at = ts_from_row(r, "requested_at")?;
-                Ok(QueuedDeploy {
-                    id: u64::try_from(id).map_err(|_| storage("queue id overflowed u64"))?,
-                    project_id: ProjectId(
-                        u64::try_from(project_id)
-                            .map_err(|_| storage("project id overflowed u64"))?,
-                    ),
-                    branch,
-                    operator,
-                    requested_at,
-                    attempts: u32::try_from(r.try_get::<i64, _>("attempts").unwrap_or(0))
-                        .unwrap_or(0),
-                })
-            })
-            .collect()
+        rows.iter().map(queued_from_row).collect()
     }
 
     /// Records one more failed drain of a queued deploy, leaving the entry
@@ -1090,6 +1175,23 @@ impl SqliteStore {
             .map_err(map_sqlx)?;
         Ok(())
     }
+}
+
+/// Builds a [`QueuedDeploy`] from a row. Shared by the listing and the
+/// claim so the two can never disagree about the shape.
+fn queued_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<QueuedDeploy, RepositoryError> {
+    let id: i64 = r.try_get("id").map_err(storage)?;
+    let project_id: i64 = r.try_get("project_id").map_err(storage)?;
+    Ok(QueuedDeploy {
+        id: u64::try_from(id).map_err(|_| storage("queue id overflowed u64"))?,
+        project_id: ProjectId(
+            u64::try_from(project_id).map_err(|_| storage("project id overflowed u64"))?,
+        ),
+        branch: r.try_get("branch").map_err(storage)?,
+        operator: r.try_get("operator").map_err(storage)?,
+        requested_at: ts_from_row(r, "requested_at")?,
+        attempts: u32::try_from(r.try_get::<i64, _>("attempts").unwrap_or(0)).unwrap_or(0),
+    })
 }
 
 /// A deploy request queued because it didn't fit host capacity at request
@@ -2648,5 +2750,122 @@ mod concurrency_tests {
         }
         // Two running environments of a project limited to 256 MB each.
         assert_eq!(store.committed_memory_mb(512, None).await.unwrap(), 512);
+    }
+
+    /// The property the in-process mutex could never give: two drains,
+    /// possibly in two processes, must not both pick up the same push.
+    #[tokio::test]
+    async fn two_drains_claim_disjoint_sets_of_the_queue() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        for branch in ["a", "b", "c", "d"] {
+            store
+                .enqueue_deploy(project, &BranchName::parse(branch).unwrap(), None)
+                .await
+                .unwrap();
+        }
+
+        let first = store.claim_deploy_queue("worker-1", 120, 2).await.unwrap();
+        let second = store.claim_deploy_queue("worker-2", 120, 4).await.unwrap();
+
+        assert_eq!(first.len(), 2, "a claim honours its limit");
+        assert_eq!(second.len(), 2, "and the second sees only what is left");
+        let ids: std::collections::HashSet<u64> =
+            first.iter().chain(second.iter()).map(|q| q.id).collect();
+        assert_eq!(ids.len(), 4, "no entry was handed to both workers");
+
+        // Nothing left to claim while the leases hold.
+        assert!(
+            store
+                .claim_deploy_queue("worker-3", 120, 4)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a claimed entry is invisible to another worker"
+        );
+    }
+
+    /// A worker that dies mid-build stops renewing. Without expiry that
+    /// push would sit in the queue for ever, which is worse than deploying
+    /// it twice.
+    #[tokio::test]
+    async fn an_expired_lease_is_claimable_again_and_a_renewed_one_is_not() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        store
+            .enqueue_deploy(project, &BranchName::parse("a").unwrap(), None)
+            .await
+            .unwrap();
+
+        // A lease already in the past: the shape a crashed worker leaves.
+        let claimed = store.claim_deploy_queue("dead", -1, 4).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let reclaimed = store.claim_deploy_queue("alive", 120, 4).await.unwrap();
+        assert_eq!(reclaimed.len(), 1, "an expired lease must come back");
+
+        // Renewing keeps it held.
+        store
+            .renew_deploy_leases(&[reclaimed[0].id], 120)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_deploy_queue("other", 120, 4)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a renewed lease is not up for grabs"
+        );
+    }
+
+    /// A deploy that does not fit goes back, but not instantly — otherwise
+    /// the next drain picks up the one entry it already knows cannot run.
+    #[tokio::test]
+    async fn a_released_claim_is_deferred_rather_than_immediately_reclaimable() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        store
+            .enqueue_deploy(project, &BranchName::parse("a").unwrap(), None)
+            .await
+            .unwrap();
+
+        let claimed = store.claim_deploy_queue("w", 120, 4).await.unwrap();
+        store.release_deploy_claim(claimed[0].id, 60).await.unwrap();
+        assert!(
+            store
+                .claim_deploy_queue("w", 120, 4)
+                .await
+                .unwrap()
+                .is_empty(),
+            "released with a delay, not straight back into the next wave"
+        );
+
+        // With no delay it is immediately available again.
+        store.release_deploy_claim(claimed[0].id, -1).await.unwrap();
+        assert_eq!(
+            store.claim_deploy_queue("w", 120, 4).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// Minimal project so a queue entry has something to reference.
+    async fn seed_project(store: &SqliteStore) -> ProjectId {
+        let config = oxid_core::ProjectConfig::new(
+            "example.dev",
+            Ttl::parse("30m").unwrap(),
+            Ttl::parse("7d").unwrap(),
+            8080,
+            oxid_core::BuildConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let project = Project::new(
+            ProjectId(0),
+            "queued".to_owned(),
+            RepoUrl::parse("https://example.com/org/repo.git").unwrap(),
+            config,
+        )
+        .unwrap();
+        ProjectStore::create(store, &project).await.unwrap()
     }
 }

@@ -85,10 +85,18 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// route on plain HTTP, which is what an install that never configured
     /// ACME gets.
     acme: Option<(oxid_core::AcmeConfig, u16)>,
-    /// Single-flights the forge-notification drain, for the same reason
-    /// `deploy_drain_lock` exists: two passes would read the same pending
-    /// row and comment twice.
+    /// Single-flights the forge-notification drain: two passes would read
+    /// the same pending row and comment twice.
+    ///
+    /// Still an in-process lock, unlike the deploy queue's database claim,
+    /// and that is a deliberate difference of stakes rather than an
+    /// oversight — the worst case here is a duplicate comment, not a
+    /// duplicate deploy. If a second daemon ever becomes ordinary rather
+    /// than a restart artefact, this wants the same treatment.
     forge_drain_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Random per-process value, so a restarted daemon never mistakes a
+    /// claim it made in a previous life for one a live worker holds.
+    boot_nonce: u64,
     /// Serializes every state-mutating lifecycle operation on environments —
     /// `deploy`, `pause`, `wake`, `destroy`, and each action a GC `sweep`
     /// applies — across every project. `Arc`-wrapped because `ControlPlane`
@@ -119,13 +127,6 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// A single mutex gave the same guarantees but also made every deploy on
     /// the node wait for every other one.
     lifecycle_lock: Arc<crate::service::keyed_lock::KeyedLocks<LockKey>>,
-    /// Ensures only one deploy-queue drain runs at a time. The scheduler
-    /// drains on every tick and each accepted webhook kicks off a drain of
-    /// its own, so without this two drains could read the same pending row
-    /// before either removed it and deploy the same push twice.
-    /// `try_lock`-ed, never awaited: if a drain is already in flight it will
-    /// pick up the row that was just enqueued anyway.
-    deploy_drain_lock: Arc<tokio::sync::Mutex<()>>,
     /// One in-flight `git fetch` per project, shared by everyone who asked
     /// for fresh refs at the same time. A fetch brings down every branch of
     /// a repository, so a burst of pushes to one project needs one of them,
@@ -211,8 +212,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
             acme: None,
             forge_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
+            boot_nonce: rand::RngCore::next_u64(&mut rand::rngs::OsRng),
             lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
-            deploy_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             deploy_concurrency: default_deploy_concurrency(),
             git_fetches: Arc::new(crate::service::refresh_coalescer::RefreshCoalescer::default()),
             postgres_url: None,

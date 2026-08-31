@@ -42,6 +42,21 @@ use oxid_core::{
 /// upstream doesn't get retried on every scheduler tick forever.
 const MAX_DEPLOY_ATTEMPTS: u32 = 5;
 
+/// How long a claim on a queue entry lasts before another worker may take
+/// it.
+///
+/// Long enough that a build finishing normally never races the expiry, and
+/// short enough that a crashed worker's entry comes back while somebody is
+/// still watching. Renewed while the work is in flight, so a genuinely long
+/// build is never interrupted by it.
+const DEPLOY_LEASE_SECS: i64 = 120;
+
+/// How long a deploy that did not fit waits before being claimable again.
+///
+/// Not zero: releasing it instantly makes the next drain pick up the one
+/// entry it already knows cannot run, and spin.
+const DEPLOY_REQUEUE_SECS: i64 = 30;
+
 /// Whether a failed deploy is worth trying again later.
 ///
 /// Only failures that happened *before* the deploy could really begin
@@ -146,22 +161,41 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] if the queue or host capacity itself can't be
     /// read at all.
+    /// This process's identity in a claim, unique per run.
+    ///
+    /// The boot nonce matters: a restarted daemon must not mistake its own
+    /// stale claims for a live worker's, which a bare hostname or pid could
+    /// let it do.
+    fn worker_id(&self) -> String {
+        format!(
+            "{}-{}-{}",
+            std::env::var("HOSTNAME").unwrap_or_else(|_| "host".to_owned()),
+            std::process::id(),
+            self.boot_nonce
+        )
+    }
+
+    /// The drain's wave size, as the claim query wants it.
+    fn deploy_concurrency_u32(&self) -> u32 {
+        u32::try_from(self.deploy_concurrency).unwrap_or(u32::MAX)
+    }
+
     pub async fn retry_queued_deploys(&self) -> Result<Vec<(u64, CpError)>, CpError> {
-        // Both the scheduler and every accepted webhook call this. Only one
-        // drain may run at a time or two of them can read the same pending
-        // row before either removes it and deploy the same push twice;
-        // bailing out is correct rather than merely safe, because the drain
-        // already running will reach anything just enqueued.
-        let Ok(_drain) = self.deploy_drain_lock.try_lock() else {
-            tracing::debug!("deploy queue drain already in progress; skipping");
-            return Ok(Vec::new());
-        };
+        // Both the scheduler and every accepted webhook call this, and two
+        // drains reading the same pending row would deploy the same push
+        // twice. That used to be prevented by an in-process mutex, which
+        // can only promise it inside one process — and two daemons on one
+        // data directory is not exotic: restarting a container while the
+        // old one is still shutting down is exactly that, for exactly long
+        // enough. Entries are now *claimed* in the database, which is the
+        // only thing both processes share.
         let mut failures = Vec::new();
-        // Ids this pass has already tried. A bumped entry stays in the
-        // queue on purpose, so without this the re-read below would retry
-        // it immediately, forever.
-        let mut seen = std::collections::HashSet::new();
-        let mut queue = self.store.list_deploy_queue().await?.into_iter();
+        let worker = self.worker_id();
+        let mut queue = self
+            .store
+            .claim_deploy_queue(&worker, DEPLOY_LEASE_SECS, self.deploy_concurrency_u32())
+            .await?
+            .into_iter();
 
         // Drained in waves rather than one at a time.
         //
@@ -179,9 +213,32 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             if wave.is_empty() {
                 break;
             }
+            // Keep the claims alive while the wave runs: a real first
+            // build can take minutes, far longer than a lease short enough
+            // to recover from a crash quickly.
+            let claimed: Vec<u64> = wave.iter().map(|q| q.id).collect();
+            let renewer = {
+                let store = self.store.clone();
+                let ids = claimed.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                        (DEPLOY_LEASE_SECS / 3).max(1).cast_unsigned(),
+                    ));
+                    loop {
+                        tick.tick().await;
+                        if store
+                            .renew_deploy_leases(&ids, DEPLOY_LEASE_SECS)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            };
+
             let mut running = Vec::new();
             for queued in wave {
-                seen.insert(queued.id);
                 let branch = match BranchName::parse(&queued.branch) {
                     Ok(b) => b,
                     Err(e) => {
@@ -214,7 +271,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     Ok(DeployOutcome::Deployed(_, _)) => {
                         self.store.remove_from_deploy_queue(queued.id).await?;
                     }
-                    Ok(DeployOutcome::Queued { .. }) => full = true,
+                    Ok(DeployOutcome::Queued { .. }) => {
+                        // It does not fit right now. Put it back, but not
+                        // instantly, or the next drain busy-spins on the one
+                        // entry that cannot run.
+                        self.store
+                            .release_deploy_claim(queued.id, DEPLOY_REQUEUE_SECS)
+                            .await?;
+                        full = true;
+                    }
                     Err(e) => {
                         let attempts = queued.attempts + 1;
                         if is_retryable(&e) && attempts < MAX_DEPLOY_ATTEMPTS {
@@ -232,6 +297,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     }
                 }
             }
+            renewer.abort();
             if full {
                 break;
             }
@@ -243,14 +309,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             // used to wait out a whole scheduler tick before anyone looked
             // again: measured on fifteen simultaneous pushes, sixteen of the
             // twenty-eight seconds were that wait, with the node idle.
+            //
+            // Claiming makes the old `seen` set unnecessary: an entry this
+            // pass already holds is invisible to the next claim, and one it
+            // deferred carries a `lease_expires_at` in the future.
             if queue.len() == 0 {
-                let fresh: Vec<_> = self
+                let fresh = self
                     .store
-                    .list_deploy_queue()
-                    .await?
-                    .into_iter()
-                    .filter(|q| !seen.contains(&q.id))
-                    .collect();
+                    .claim_deploy_queue(&worker, DEPLOY_LEASE_SECS, self.deploy_concurrency_u32())
+                    .await?;
                 if fresh.is_empty() {
                     break;
                 }

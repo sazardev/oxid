@@ -57,6 +57,21 @@ is the breaking position.
   legitimately be read-only, and quietly requiring it to gain write access
   to somebody's issues would be a security regression nobody asked for.
 
+- **The deploy queue is claimed in the database, not guarded by a mutex.**
+  The drain was single-flighted by an in-process lock whose own comment
+  admitted what happens without it: two drains read the same pending row and
+  the same push deploys twice. An in-process lock can only promise that
+  inside one process, and two daemons on one data directory is not exotic —
+  restarting a container while the old one is still shutting down is exactly
+  that, for exactly long enough.
+
+  Entries now carry a claim with a lease. Two drains get disjoint sets; a
+  worker that dies mid-build stops renewing and its entry comes back rather
+  than being stranded; a deploy that does not fit is released with a delay
+  so the next drain does not spin on the one thing that cannot run. The
+  in-process lock is gone — the claim is strictly stronger, and keeping both
+  would leave two mechanisms to reason about.
+
 ### Fixed
 
 - **`oxid infra setup` failed on any host that had never pulled Traefik.**
