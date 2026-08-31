@@ -452,10 +452,11 @@ fn the_rust_binary_is_named_from_the_manifest_not_assumed() {
     let cargo = "[package]\nname = \"billing-worker\"\nversion = \"0.1.0\"\n\n[dependencies]\naxum = \"0.7\"\n";
     let stack = detect(&repo(&[("Cargo.toml", cargo)])).unwrap();
     assert_eq!(stack.build_target.as_deref(), Some("billing-worker"));
+    // Copied out of the cache mount, then into the runtime stage.
     assert!(
         stack
             .dockerfile()
-            .contains("/src/target/release/billing-worker"),
+            .contains("cp target/release/billing-worker /out/billing-worker"),
         "{}",
         stack.dockerfile()
     );
@@ -580,7 +581,7 @@ fn a_workspace_build_installs_from_the_root_and_filters_to_the_target() {
     );
     // Manifests before source, or the install layer dies on every commit —
     // which in a monorepo is where all the build time is.
-    let install = dockerfile.find("RUN npm ci").unwrap();
+    let install = dockerfile.find("npm ci").unwrap();
     assert!(
         install < dockerfile.find("COPY . .").unwrap(),
         "{dockerfile}"
@@ -654,4 +655,140 @@ fn a_workspace_member_ships_the_tree_it_needs_to_run() {
             .contains("node_modules"),
         "{df}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// build speed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_generated_build_caches_its_dependency_downloads() {
+    // The layer cache only survives while nothing above it changes: touch a
+    // lockfile and the whole install runs again, re-downloading every
+    // package. A cache mount is not part of a layer, so it survives that —
+    // and it is shared between branches, which is where a preview
+    // environment's build time goes.
+    let cases = [
+        (
+            repo(&[("package.json", NEST_PACKAGE), ("package-lock.json", "")]),
+            "/root/.npm",
+        ),
+        (
+            repo(&[("package.json", NEST_PACKAGE), ("pnpm-lock.yaml", "")]),
+            "pnpm/store",
+        ),
+        (
+            repo(&[("package.json", NEST_PACKAGE), ("yarn.lock", "")]),
+            "yarn",
+        ),
+        (repo(&[("go.mod", "module x\n\ngo 1.23\n")]), "/go/pkg/mod"),
+        (
+            repo(&[("requirements.txt", "fastapi\n")]),
+            "/root/.cache/pip",
+        ),
+        (
+            repo(&[(
+                "Cargo.toml",
+                "[package]\nname = \"svc\"\n\n[dependencies]\naxum = \"0.7\"\n",
+            )]),
+            "cargo/registry",
+        ),
+    ];
+    for (manifest, expected) in cases {
+        let stack = detect(&manifest).unwrap();
+        let dockerfile = stack.dockerfile();
+        assert!(
+            dockerfile.contains("--mount=type=cache"),
+            "{}: nothing is cached between builds\n{dockerfile}",
+            stack.label()
+        );
+        assert!(
+            dockerfile.contains(expected),
+            "{}: expected a cache for `{expected}`\n{dockerfile}",
+            stack.label()
+        );
+    }
+}
+
+#[test]
+fn pip_is_not_told_to_throw_its_cache_away() {
+    // `--no-cache-dir` is right without BuildKit — it keeps the cache out of
+    // the image layer. With a cache mount the cache is not in a layer at
+    // all, so the flag only discards work between builds.
+    let dockerfile = detect(&repo(&[("requirements.txt", "fastapi\n")]))
+        .unwrap()
+        .dockerfile();
+    assert!(!dockerfile.contains("--no-cache-dir"), "{dockerfile}");
+}
+
+#[test]
+fn the_rust_binary_survives_its_own_target_cache() {
+    // The trap: `target` as a cache mount is not part of any layer, so a
+    // later `COPY --from=build /src/target/...` finds nothing. The binary
+    // has to be copied out inside the same `RUN`, while the mount exists.
+    let dockerfile = detect(&repo(&[(
+        "Cargo.toml",
+        "[package]\nname = \"billing\"\n\n[dependencies]\naxum = \"0.7\"\n",
+    )]))
+    .unwrap()
+    .dockerfile();
+
+    assert!(dockerfile.contains("target=/src/target"), "{dockerfile}");
+    assert!(
+        dockerfile.contains("cp target/release/billing /out/billing"),
+        "the artifact is never taken out of the cache mount\n{dockerfile}"
+    );
+    assert!(
+        dockerfile.contains("COPY --from=build /out/billing"),
+        "still copies from a path the cache mount owns\n{dockerfile}"
+    );
+    assert!(
+        !dockerfile.contains("COPY --from=build /src/target"),
+        "{dockerfile}"
+    );
+    // Cargo locks a target directory anyway; saying so makes two concurrent
+    // branch builds queue explicitly rather than surprisingly.
+    assert!(dockerfile.contains("sharing=locked"), "{dockerfile}");
+}
+
+#[test]
+fn the_images_a_build_needs_are_knowable_before_it_runs() {
+    // Registration is when Oxid learns what a project is built with, and it
+    // is usually a long time before the first push. Naming the images here
+    // is what lets that gap be spent on the download instead of the person
+    // watching their first deploy.
+    let spa = detect(&repo(&[("package.json", VITE_PACKAGE)])).unwrap();
+    // A SPA builds with Node and ships behind nginx — both, or the second
+    // stage still stalls.
+    assert_eq!(spa.base_images(), vec!["node:22-alpine", "nginx:alpine"]);
+
+    let nest = detect(&repo(&[("package.json", NEST_PACKAGE), (".nvmrc", "20")])).unwrap();
+    assert_eq!(nest.base_images(), vec!["node:20-alpine"]);
+
+    let go = detect(&repo(&[("go.mod", "module x\n\ngo 1.21\n")])).unwrap();
+    assert_eq!(
+        go.base_images(),
+        vec!["golang:1.21-alpine", "alpine:latest"]
+    );
+
+    // Every name must be one the Dockerfile actually uses: two readings of
+    // the same fact drift, and this is the one nothing else would catch.
+    for manifest in [
+        repo(&[("package.json", VITE_PACKAGE)]),
+        repo(&[("package.json", NEST_PACKAGE)]),
+        repo(&[("go.mod", "module x\n\ngo 1.23\n")]),
+        repo(&[("requirements.txt", "fastapi\n")]),
+        repo(&[("Cargo.toml", "[package]\nname = \"svc\"\n")]),
+        repo(&[("index.html", "<h1>hi</h1>")]),
+    ] {
+        let stack = detect(&manifest).unwrap();
+        let dockerfile = stack.dockerfile();
+        for image in stack.base_images() {
+            assert!(
+                dockerfile.contains(&format!("FROM {image}")),
+                "{}: pre-fetches `{image}`, which its Dockerfile never uses\n{dockerfile}",
+                stack.label()
+            );
+        }
+    }
 }

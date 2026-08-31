@@ -82,6 +82,17 @@ is the breaking position.
   stage copied a binary path Cargo names after the package. Generated image
   sizes: Go 24.5MB, SPA and static 94.5MB, Rust 136MB, FastAPI 209MB, Nest
   215MB, Express 246MB.
+- **Generated builds cache their dependencies.** Every generated Dockerfile
+  now uses `RUN --mount=type=cache` for its ecosystem's download cache —
+  npm, pnpm, yarn and bun stores, Go's module and build caches, cargo's
+  registry and `target`, pip's cache. BuildKit was already the builder; the
+  generated files were not using it. A one-line change to an Axum service
+  went from **17s to 2s**, because the layer cache dies the moment anything
+  above the install changes while a cache mount does not, and is shared
+  between branches of the same project.
+- **Base images are fetched at registration**, in the background, so the
+  first deploy of a project — the one someone is watching, having just wired
+  up a webhook — does not begin with a several-hundred-megabyte download.
 - **Monorepos are understood.** pnpm workspaces, a `workspaces` array in
   the root `package.json`, and `lerna.json` are recognised, with Turborepo
   and Nx reported on top. The deployable services are listed — a package

@@ -198,6 +198,28 @@ impl PackageManager {
         }
     }
 
+    /// A `BuildKit` cache mount for this manager's download cache.
+    ///
+    /// The layer cache only survives while nothing above it changes: touch
+    /// the lockfile and the whole install runs again, re-downloading every
+    /// package. A cache mount is not part of any layer, so it survives that
+    /// — and it is shared between branches of the same project, which is
+    /// where preview environments spend most of their build time.
+    ///
+    /// Left `shared` (the default) deliberately: these caches are
+    /// content-addressed, so concurrent branch builds reading and writing
+    /// them at once is safe, and serialising would undo the concurrency the
+    /// deploy queue was built for.
+    #[must_use]
+    fn cache_mount(self) -> &'static str {
+        match self {
+            Self::Npm => "--mount=type=cache,target=/root/.npm",
+            Self::Pnpm => "--mount=type=cache,target=/root/.local/share/pnpm/store",
+            Self::Yarn => "--mount=type=cache,target=/root/.yarn/berry/cache",
+            Self::Bun => "--mount=type=cache,target=/root/.bun/install/cache",
+        }
+    }
+
     #[must_use]
     fn lockfile(self) -> &'static str {
         match self {
@@ -973,13 +995,14 @@ impl Monorepo {
              # that does not change a dependency.\n\
              COPY package.json *lock* pnpm-workspace.yaml* ./\n\
              COPY {path}/package.json {path}/\n\
-             RUN {install}\n\
+             RUN {mount} {install}\n\
              COPY . .\n\
              RUN {build}\n\
              \n\
              {final_stage}\
              EXPOSE {port}\n\
              {cmd}",
+            mount = pm.cache_mount(),
             kind = match self.kind {
                 WorkspaceKind::Pnpm => "pnpm",
                 WorkspaceKind::PackageJson => "npm/yarn/bun",
@@ -1013,6 +1036,42 @@ impl Stack {
             Runtime::Python => self.python_dockerfile(),
             Runtime::Rust => self.rust_dockerfile(),
             Runtime::Static => Self::static_dockerfile(),
+        }
+    }
+
+    /// The images this stack's build pulls, so they can be fetched before
+    /// anyone is waiting on them.
+    ///
+    /// Derived from the same values the Dockerfile is built with rather
+    /// than parsed back out of it: two readings of the same fact drift, and
+    /// the one that drifts silently is the one nothing checks.
+    #[must_use]
+    pub fn base_images(&self) -> Vec<String> {
+        let node = || {
+            format!(
+                "node:{}-alpine",
+                self.runtime_version.as_deref().unwrap_or("22")
+            )
+        };
+        match self.runtime {
+            Runtime::Node => match self.framework {
+                // A SPA builds with Node and ships behind nginx.
+                Framework::SinglePageApp => vec![node(), "nginx:alpine".to_owned()],
+                _ => vec![node()],
+            },
+            Runtime::Go => vec![
+                format!(
+                    "golang:{}-alpine",
+                    self.runtime_version.as_deref().unwrap_or("1.23")
+                ),
+                "alpine:latest".to_owned(),
+            ],
+            Runtime::Python => vec![format!(
+                "python:{}-slim",
+                self.runtime_version.as_deref().unwrap_or("3.12")
+            )],
+            Runtime::Rust => vec!["rust:1-slim".to_owned(), "debian:stable-slim".to_owned()],
+            Runtime::Static => vec!["nginx:alpine".to_owned()],
         }
     }
 
@@ -1058,7 +1117,7 @@ impl Stack {
                  FROM {base} AS build\n\
                  WORKDIR /app\n\
                  COPY package.json {lock}* ./\n\
-                 RUN {install}\n\
+                 RUN {mount} {install}\n\
                  COPY . .\n\
                  RUN {build}\n\
                  \n\
@@ -1069,6 +1128,7 @@ impl Stack {
                  EXPOSE {port}\n",
                 lock = pm.lockfile(),
                 install = pm.install(self.locked),
+                mount = pm.cache_mount(),
                 build = pm.run("build"),
             ),
             // Next.js in standalone output mode ships a self-contained
@@ -1079,7 +1139,7 @@ impl Stack {
                  FROM {base} AS build\n\
                  WORKDIR /app\n\
                  COPY package.json {lock}* ./\n\
-                 RUN {install}\n\
+                 RUN {mount} {install}\n\
                  COPY . .\n\
                  RUN {build}\n\
                  \n\
@@ -1096,6 +1156,7 @@ impl Stack {
                  CMD [\"node\", \"server.js\"]\n",
                 lock = pm.lockfile(),
                 install = pm.install(self.locked),
+                mount = pm.cache_mount(),
                 build = pm.run("build"),
                 pm_name = pm.as_str(),
             ),
@@ -1106,7 +1167,7 @@ impl Stack {
                  FROM {base} AS build\n\
                  WORKDIR /app\n\
                  COPY package.json {lock}* ./\n\
-                 RUN {install}\n\
+                 RUN {mount} {install}\n\
                  COPY . .\n\
                  RUN {build}\n\
                  \n\
@@ -1114,12 +1175,13 @@ impl Stack {
                  WORKDIR /app\n\
                  ENV NODE_ENV=production\n\
                  COPY package.json {lock}* ./\n\
-                 RUN {prod_install}\n\
+                 RUN {mount} {prod_install}\n\
                  COPY --from=build /app/dist ./dist\n\
                  EXPOSE {port}\n\
                  CMD [\"node\", \"dist/main.js\"]\n",
                 lock = pm.lockfile(),
                 install = pm.install(self.locked),
+                mount = pm.cache_mount(),
                 build = pm.run("build"),
                 prod_install = pm.prod_install(self.locked),
             ),
@@ -1132,12 +1194,13 @@ impl Stack {
                  WORKDIR /app\n\
                  ENV NODE_ENV=production\n\
                  COPY package.json {lock}* ./\n\
-                 RUN {prod_install}\n\
+                 RUN {mount} {prod_install}\n\
                  COPY . .\n\
                  EXPOSE {port}\n\
                  CMD [\"{pm_name}\", \"start\"]\n",
                 lock = pm.lockfile(),
                 prod_install = pm.prod_install(self.locked),
+                mount = pm.cache_mount(),
                 pm_name = pm.as_str(),
             ),
         }
@@ -1152,11 +1215,17 @@ impl Stack {
              FROM golang:{version}-alpine AS build\n\
              WORKDIR /src\n\
              COPY go.mod go.sum* ./\n\
-             RUN go mod download\n\
+             # Cache mounts, not layers: the module cache and the compiler's\n\
+             # own build cache survive a lockfile change and are shared\n\
+             # between branches of the same project, which is where a\n\
+             # preview environment's build time actually goes.\n\
+             RUN --mount=type=cache,target=/go/pkg/mod go mod download\n\
              COPY . .\n\
              # CGO off: without it the binary links against musl and will not\n\
              # run in the scratch stage below.\n\
-             RUN CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o /out/app {target}\n\
+             RUN --mount=type=cache,target=/go/pkg/mod \\\n\
+             \x20   --mount=type=cache,target=/root/.cache/go-build \\\n\
+             \x20   CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o /out/app {target}\n\
              \n\
              FROM alpine:latest\n\
              RUN apk add --no-cache ca-certificates\n\
@@ -1172,10 +1241,14 @@ impl Stack {
 
     fn python_dockerfile(&self) -> String {
         let version = self.runtime_version.as_deref().unwrap_or("3.12");
+        // `--no-cache-dir` is the usual advice, and it is the right advice
+        // without BuildKit: it keeps pip's cache out of the image layer.
+        // With a cache mount the cache is not in a layer at all, so the flag
+        // only throws away work between builds.
         let install = if self.evidence.iter().any(|e| e == "pyproject.toml") {
-            "pip install --no-cache-dir ."
+            "pip install ."
         } else {
-            "pip install --no-cache-dir -r requirements.txt"
+            "pip install -r requirements.txt"
         };
         let copy = if self.evidence.iter().any(|e| e == "pyproject.toml") {
             "COPY pyproject.toml ./"
@@ -1204,11 +1277,12 @@ impl Stack {
              WORKDIR /app\n\
              ENV PYTHONUNBUFFERED=1\n\
              {copy}\n\
-             RUN {install}\n\
+             RUN {mount} {install}\n\
              COPY . .\n\
              EXPOSE {port}\n\
              {cmd}\n",
             header = self.header(),
+            mount = "--mount=type=cache,target=/root/.cache/pip",
             port = self.port,
         )
     }
@@ -1219,12 +1293,22 @@ impl Stack {
              FROM rust:1-slim AS build\n\
              WORKDIR /src\n\
              COPY . .\n\
-             RUN cargo build --release\n\
+             # `target` is a cache mount, so it is not part of any layer —\n\
+             # which means the binary it holds cannot be reached by a later\n\
+             # `COPY --from`. It is copied out inside the same `RUN`, while\n\
+             # the mount is still there. Locked rather than shared: cargo\n\
+             # takes its own lock on a target directory, so two concurrent\n\
+             # branch builds would queue on it anyway, and saying so here\n\
+             # makes that explicit instead of surprising.\n\
+             RUN --mount=type=cache,target=/usr/local/cargo/registry \\\n\
+             \x20   --mount=type=cache,target=/src/target,sharing=locked \\\n\
+             \x20   cargo build --release && mkdir -p /out \\\n\
+             \x20   && cp target/release/{binary} /out/{binary}\n\
              \n\
              FROM debian:stable-slim\n\
              RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \\\n\
              \x20   && rm -rf /var/lib/apt/lists/*\n\
-             COPY --from=build /src/target/release/{binary} /app\n\
+             COPY --from=build /out/{binary} /app\n\
              EXPOSE {port}\n\
              CMD [\"/app\"]\n",
             header = self.header(),

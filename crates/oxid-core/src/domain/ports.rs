@@ -421,6 +421,20 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::Failure`] on build failure.
     async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError>;
+    /// Fetches an image so a later build does not have to.
+    ///
+    /// Registering a project is the moment Oxid learns which base images
+    /// that project will need, and it is minutes to hours before the first
+    /// push arrives. Spending that gap on the pull means the first deploy —
+    /// the one someone is watching, having just wired up a webhook — does
+    /// not begin with a download.
+    ///
+    /// Best-effort by contract: callers are expected to log a failure and
+    /// carry on, since the build would pull the image anyway.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] if the image cannot be fetched.
+    async fn pull_image(&self, image: &str) -> Result<(), OciError>;
     /// Creates and starts a container. Returns the host port actually bound
     /// when `spec.network` is `None` (Docker picks it — see
     /// [`ContainerSpec::network`]), or `None` when attached to a Traefik

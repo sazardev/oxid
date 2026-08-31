@@ -27,7 +27,53 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on config, git or persistence failures.
-    pub async fn register_project(&self, repo_dir: &Path) -> Result<Project, CpError> {
+    /// Fetches the base images this project's builds will need, in the
+    /// background.
+    ///
+    /// Registration is the moment Oxid learns what a project is built with,
+    /// and it is usually minutes or hours before the first push arrives.
+    /// Spending that gap on the pull means the first deploy — the one
+    /// someone is watching, having just wired up a webhook — does not open
+    /// with a download of several hundred megabytes.
+    ///
+    /// Detached and best-effort on purpose. Registration must not wait on a
+    /// registry, and a failure here costs nothing: the build pulls the image
+    /// itself, exactly as it did before. Only the images a *detected* stack
+    /// named are fetched — a project with its own Dockerfile could be built
+    /// on anything, and guessing at `FROM` lines to pre-fetch the wrong
+    /// image would waste bandwidth on every registration.
+    fn prewarm_base_images(&self, project: &Project)
+    where
+        O: Clone + Send + Sync + 'static,
+    {
+        let Some(stack) = &project.detected_stack else {
+            return;
+        };
+        let images = stack.base_images();
+        if images.is_empty() {
+            return;
+        }
+        let oci = self.oci.clone();
+        let name = project.name.clone();
+        tokio::spawn(async move {
+            for image in images {
+                match oci.pull_image(&image).await {
+                    Ok(()) => tracing::info!(project = %name, %image, "base image ready"),
+                    Err(e) => tracing::debug!(
+                        project = %name,
+                        %image,
+                        error = %e,
+                        "could not pre-fetch a base image; the build will pull it"
+                    ),
+                }
+            }
+        });
+    }
+
+    pub async fn register_project(&self, repo_dir: &Path) -> Result<Project, CpError>
+    where
+        O: Clone + Send + Sync + 'static,
+    {
         let repo_url = self.git.remote_url(repo_dir).await?;
 
         if let Some(existing) = self.find_project_by_repo(&repo_url).await? {
@@ -41,6 +87,7 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         match ProjectStore::create(&self.store, &project).await {
             Ok(id) => {
                 project.id = id;
+                self.prewarm_base_images(&project);
                 Ok(project)
             }
             Err(RepositoryError::Conflict(_)) => self
@@ -75,7 +122,10 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         &self,
         repo_url: &RepoUrl,
         git_token: Option<&str>,
-    ) -> Result<Project, CpError> {
+    ) -> Result<Project, CpError>
+    where
+        O: Clone + Send + Sync + 'static,
+    {
         if let Some(existing) = self.find_project_by_repo(repo_url).await? {
             return Ok(existing);
         }
@@ -104,6 +154,7 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
                 if let Some(token) = git_token.filter(|t| !t.is_empty()) {
                     self.store.set_git_token(project.id, Some(token)).await?;
                 }
+                self.prewarm_base_images(&project);
                 Ok(project)
             }
             Err(RepositoryError::Conflict(_)) => self

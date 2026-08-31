@@ -91,6 +91,12 @@ struct FakeOci {
 }
 
 impl ContainerPort for FakeOci {
+    async fn pull_image(&self, image: &str) -> Result<(), OciError> {
+        self.calls.lock().unwrap().push(format!("pull:{image}"));
+        let _ = image;
+        Ok(())
+    }
+
     async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         {
             let mut remaining = self.fail_build_times.lock().unwrap();

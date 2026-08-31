@@ -149,6 +149,21 @@ impl BuildProgress {
 }
 
 impl ContainerPort for DockerClient {
+    async fn pull_image(&self, image: &str) -> Result<(), OciError> {
+        // `create_image` is Docker's pull. An image already present is not
+        // re-downloaded — the daemon answers from its own store — so this
+        // is cheap to call on every registration.
+        let options = bollard::image::CreateImageOptions {
+            from_image: image.to_owned(),
+            ..Default::default()
+        };
+        let mut stream = self.docker.create_image(Some(options), None, None);
+        while let Some(item) = stream.next().await {
+            item.map_err(|e| OciError::Failure(format!("pulling `{image}` failed: {e}")))?;
+        }
+        Ok(())
+    }
+
     async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         let options = BuildImageOptions {
             dockerfile: spec.dockerfile.clone(),

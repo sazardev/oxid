@@ -104,6 +104,11 @@ impl FakeOci {
 }
 
 impl ContainerPort for FakeOci {
+    async fn pull_image(&self, image: &str) -> Result<(), OciError> {
+        let _ = image;
+        Ok(())
+    }
+
     async fn build(&self, spec: &BuildSpec) -> Result<BuildReport, OciError> {
         self.calls
             .lock()

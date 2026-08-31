@@ -131,6 +131,36 @@ The result is stored on the project (`detected_stack`, migration `0013`) and
 shown as a tag in the dashboard and an `oxid ps` column. Null is the normal
 case: the project answered for itself.
 
+### Build speed
+
+Every generated Dockerfile uses `RUN --mount=type=cache` for its
+ecosystem's download cache — npm/pnpm/yarn/bun stores, `GOMODCACHE` and
+`GOCACHE`, cargo's registry and `target`, pip's cache. BuildKit was already
+requested by `adapter::oci` (`BuilderVersion::BuilderBuildKit`); the
+generated files simply were not exploiting it. The layer cache dies the
+moment a lockfile changes; a cache mount is not part of a layer and is
+shared between branches of the same project. Measured on a one-line change
+to an Axum service: **17s to 2s**.
+
+Two things are easy to get wrong here:
+
+- **Cargo's `target` is a cache mount, so `COPY --from=build /src/target/...`
+  finds nothing** — the mount is not part of any layer. The binary is copied
+  out inside the same `RUN`. It is also `sharing=locked`, because cargo takes
+  its own lock on a target directory and concurrent branch builds would
+  queue anyway.
+- **`pip install --no-cache-dir` is the right advice without BuildKit and
+  wrong with it**: the cache is no longer in a layer, so the flag only
+  discards work between builds.
+
+`Stack::base_images` names what a build will pull, and
+`ControlPlane::prewarm_base_images` fetches them in a detached task at
+registration — minutes to hours before the first push, so the first deploy
+does not open with a download. Best-effort by contract: only images a
+*detected* stack named are fetched (a project with its own Dockerfile could
+be built on anything), and a failure is logged at debug since the build
+pulls the image itself.
+
 ### Monorepos
 
 `detect_monorepo` recognises pnpm workspaces, a `workspaces` array in the
