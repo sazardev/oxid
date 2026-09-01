@@ -476,6 +476,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
             self.release_dependencies(env.project_id, &env.branch.name)
                 .await?;
+            // Same reason as the leases: the table's `ON DELETE CASCADE`
+            // never fires, because Oxid never SQL-deletes an environment.
+            self.store.delete_services(env.id).await?;
         }
 
         env.transition(transition, now).map_err(|e| state_err(&e))?;

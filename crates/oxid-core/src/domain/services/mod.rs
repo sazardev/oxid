@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod branch_filter;
+pub mod compose_plan;
 pub mod forge;
 pub mod gc;
 pub mod placement;

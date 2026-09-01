@@ -2,6 +2,14 @@ use oxid_core::{BranchName, DomainError, Environment, Project};
 
 use super::error::CpError;
 
+/// The service name a single-service environment uses.
+///
+/// A repository with a plain `Dockerfile` has no compose file and therefore
+/// no service *names*, but it still needs one to be addressed by — so it
+/// gets this. It is also what `oxid logs` defaults to, which is why it
+/// reads as a word rather than as a placeholder.
+pub(crate) const PRIMARY_SERVICE: &str = "app";
+
 /// Converts a domain state error into a control-plane error.
 pub(crate) fn state_err(err: &oxid_core::EnvironmentStateError) -> CpError {
     CpError::Domain(DomainError::Invalid(err.to_string()))

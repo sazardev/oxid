@@ -1101,6 +1101,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             if prev.transition(StateTransition::Destroy, now).is_ok() {
                 let _ = EnvironmentStore::update(&self.store, &prev).await;
             }
+            // And forget what it ran. The row is retired but never
+            // SQL-deleted (Oxid keeps the deploy history), so the service
+            // rows hanging off it are not cleaned up by any cascade —
+            // without this a branch redeployed a hundred times accumulates
+            // a hundred rows describing containers that stopped existing at
+            // the cutover. Found by redeploying twice and counting.
+            let _ = self.store.delete_services(prev.id).await;
         }
 
         tracing::info!(%project_id, %branch, environment_id = %env.id, "deploy succeeded");

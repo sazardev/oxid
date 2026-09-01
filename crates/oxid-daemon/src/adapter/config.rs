@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use oxid_core::services::branch_filter::DeployConfig;
+use oxid_core::services::compose_plan;
 use oxid_core::services::stack::{Monorepo, RepoManifest, Stack, detect, detect_monorepo};
 use oxid_core::{BuildConfig, Dependency, DomainError, PoolKind, ProjectConfig, Ttl};
 
@@ -289,19 +290,39 @@ pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
     ] {
         let compose_path = repo_dir.join(candidate);
         if compose_path.exists() {
-            let service = crate::adapter::compose::parse(&compose_path)?;
-            let port = service
+            let stack = crate::adapter::compose::parse(&compose_path)?;
+            let plan = compose_plan::plan(&stack.services, None);
+            // The primary is the service that takes the branch URL, and the
+            // one this project's single `[build]`/`[routing].port` describe.
+            // `compose::parse` refuses a stack with nothing to build, and
+            // `plan` only ever nominates a buildable service, so a primary
+            // exists here by construction.
+            let primary = plan.primary().ok_or_else(|| ConfigError::Compose {
+                path: compose_path.clone(),
+                reason: "no service could be deployed".to_owned(),
+            })?;
+            let compose_plan::Disposition::Build(build) = &primary.disposition else {
+                return Err(ConfigError::Compose {
+                    path: compose_path.clone(),
+                    reason: "the primary service does not build".to_owned(),
+                });
+            };
+            let port = primary
                 .port
                 .or_else(|| {
-                    read_exposed_port(&repo_dir.join(&service.context).join(&service.dockerfile))
+                    read_exposed_port(&repo_dir.join(&build.context).join(&build.dockerfile))
                 })
                 .unwrap_or(DEFAULT_ZERO_CONFIG_PORT);
-            return zero_config_project(name, Some(service.dockerfile), service.context, port).map(
-                |mut parsed| {
-                    parsed.monorepo = monorepo;
-                    parsed
-                },
-            );
+            return zero_config_project(
+                name,
+                Some(build.dockerfile.clone()),
+                build.context.clone(),
+                port,
+            )
+            .map(|mut parsed| {
+                parsed.monorepo = monorepo;
+                parsed
+            });
         }
     }
 

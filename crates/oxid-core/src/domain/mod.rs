@@ -17,7 +17,7 @@ mod value_objects;
 
 pub use audit::AuditEvent;
 pub use branch::{Branch, BranchName};
-pub use environment::{Environment, EnvironmentId};
+pub use environment::{Environment, EnvironmentId, EnvironmentService};
 pub use error::DomainError;
 pub use infra::{
     AcmeChallenge, AcmeConfig, HttpProvider, Limitation, NetworkStatus, RuntimeFlavor, RuntimeInfo,

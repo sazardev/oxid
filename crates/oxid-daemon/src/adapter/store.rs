@@ -18,10 +18,10 @@ use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
     AuditEvent, AuditFilter, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError,
-    EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore, HostCapacity,
-    Node, NodeEndpoint, NodeId, NodeState, NodeTls, OffsetDateTime, PoolKind, Project,
-    ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext, SecretStore,
-    SecretValue, StateTransition, Ttl,
+    EnvVarScope, Environment, EnvironmentId, EnvironmentService, EnvironmentState,
+    EnvironmentStore, HostCapacity, Node, NodeEndpoint, NodeId, NodeState, NodeTls, OffsetDateTime,
+    PoolKind, Project, ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError,
+    SecretContext, SecretStore, SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::crypto::{Cipher, CryptoError};
@@ -354,6 +354,138 @@ impl SqliteStore {
         .await
         .map_err(map_sqlx)?;
         Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    // -----------------------------------------------------------------
+    // environment services
+    // -----------------------------------------------------------------
+
+    /// Every container belonging to one environment, primary first.
+    ///
+    /// Empty for an environment deployed before migration `0021`, which
+    /// means "one service" — every caller falls back to the scalar columns
+    /// on `environments`, which is the answer that was already true.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn services_for(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<Vec<EnvironmentService>, RepositoryError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {SERVICE_COLUMNS} FROM environment_services \
+             WHERE environment_id = ? ORDER BY is_primary DESC, id"
+        ))
+        .bind(id_as_i64(environment_id.0))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(service_from_row).collect()
+    }
+
+    /// The same, for many environments at once.
+    ///
+    /// The GC sweep and startup reconciliation both walk every environment
+    /// there is, and asking per environment would put a query per row on
+    /// paths that already exist to be cheap. One query, grouped in memory.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn services_for_many(
+        &self,
+        environments: &[EnvironmentId],
+    ) -> Result<std::collections::HashMap<EnvironmentId, Vec<EnvironmentService>>, RepositoryError>
+    {
+        if environments.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        // Built rather than bound as a list because SQLite has no array
+        // type; the values are `u64` ids from our own database, never user
+        // input, so there is nothing here to inject.
+        let ids = environments
+            .iter()
+            .map(|id| id_as_i64(id.0).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = sqlx::query(&format!(
+            "SELECT {SERVICE_COLUMNS} FROM environment_services \
+             WHERE environment_id IN ({ids}) ORDER BY is_primary DESC, id"
+        ))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut grouped: std::collections::HashMap<EnvironmentId, Vec<EnvironmentService>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let service = service_from_row(row)?;
+            grouped
+                .entry(service.environment_id)
+                .or_default()
+                .push(service);
+        }
+        Ok(grouped)
+    }
+
+    /// Replaces an environment's service list wholesale.
+    ///
+    /// Replace rather than upsert, in one transaction: a redeploy is
+    /// allowed to *change* which services exist — someone deletes a worker
+    /// from the compose file — and merging would leave a row for a
+    /// container that is never created again and that teardown would then
+    /// hunt for forever.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn replace_services(
+        &self,
+        environment_id: EnvironmentId,
+        services: &[EnvironmentService],
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query("DELETE FROM environment_services WHERE environment_id = ?")
+            .bind(id_as_i64(environment_id.0))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        for service in services {
+            sqlx::query(&format!(
+                "INSERT INTO environment_services ({SERVICE_COLUMNS_NO_ID}) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            ))
+            .bind(id_as_i64(environment_id.0))
+            .bind(&service.name)
+            .bind(&service.container_name)
+            .bind(&service.image)
+            .bind(service.container_port.map(i64::from))
+            .bind(service.host_port.map(i64::from))
+            .bind(i64::from(service.is_primary))
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Forgets an environment's services. Called by `destroy`, alongside
+    /// the leases, for the same reason: the `ON DELETE CASCADE` never fires
+    /// because Oxid never SQL-deletes an `environments` row.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn delete_services(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM environment_services WHERE environment_id = ?")
+            .bind(id_as_i64(environment_id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -1843,6 +1975,34 @@ impl ProjectStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// environment service mapping
+// ---------------------------------------------------------------------------
+
+const SERVICE_COLUMNS: &str = "environment_id, service_name, container_name, image, \
+     container_port, host_port, is_primary, created_at";
+
+const SERVICE_COLUMNS_NO_ID: &str = SERVICE_COLUMNS;
+
+fn service_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<EnvironmentService, RepositoryError> {
+    let environment_id = id_from_row(row, "environment_id")?;
+    let name: String = row.try_get("service_name").map_err(storage)?;
+    let container_name: String = row.try_get("container_name").map_err(storage)?;
+    let image: String = row.try_get("image").map_err(storage)?;
+    let container_port: Option<i64> = row.try_get("container_port").map_err(storage)?;
+    let host_port: Option<i64> = row.try_get("host_port").map_err(storage)?;
+    let is_primary: i64 = row.try_get("is_primary").map_err(storage)?;
+    Ok(EnvironmentService {
+        environment_id: EnvironmentId(environment_id),
+        name,
+        container_name,
+        image,
+        container_port: container_port.and_then(|p| u16::try_from(p).ok()),
+        host_port: host_port.and_then(|p| u16::try_from(p).ok()),
+        is_primary: is_primary != 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // node mapping
 // ---------------------------------------------------------------------------
 
@@ -3245,6 +3405,159 @@ mod concurrency_tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         format!("b{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn service(env: EnvironmentId, name: &str, primary: bool) -> EnvironmentService {
+        EnvironmentService {
+            environment_id: env,
+            name: name.to_owned(),
+            container_name: format!("oxid-app-feat-{}-{name}", env.0),
+            image: format!("oxid/app/{name}"),
+            container_port: primary.then_some(8080),
+            host_port: None,
+            is_primary: primary,
+        }
+    }
+
+    /// An environment deployed before migration `0021` has no rows, and
+    /// that means one service — every reader falls back to the scalar
+    /// columns, which is the answer that was already true.
+    #[tokio::test]
+    async fn an_environment_with_no_service_rows_reads_as_empty_not_as_an_error() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        assert!(
+            store
+                .services_for(EnvironmentId(1))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The primary comes first, because every caller that wants "the"
+    /// container wants that one.
+    #[tokio::test]
+    async fn services_round_trip_with_the_primary_first() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let env = seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+
+        store
+            .replace_services(
+                env,
+                &[service(env, "worker", false), service(env, "api", true)],
+            )
+            .await
+            .unwrap();
+
+        let loaded = store.services_for(env).await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded[0].is_primary);
+        assert_eq!(loaded[0].name, "api");
+        assert_eq!(loaded[0].container_port, Some(8080));
+        assert_eq!(loaded[1].name, "worker");
+        assert_eq!(loaded[1].container_port, None, "a worker answers nothing");
+    }
+
+    /// A redeploy may *remove* a service — someone deletes the worker from
+    /// the compose file. Merging would leave a row for a container that is
+    /// never created again and that teardown would then hunt for for ever.
+    #[tokio::test]
+    async fn replacing_services_forgets_the_ones_that_are_gone() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let env = seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+
+        store
+            .replace_services(
+                env,
+                &[service(env, "api", true), service(env, "worker", false)],
+            )
+            .await
+            .unwrap();
+        store
+            .replace_services(env, &[service(env, "api", true)])
+            .await
+            .unwrap();
+
+        let loaded = store.services_for(env).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "api");
+    }
+
+    /// The sweep and startup reconciliation both walk every environment
+    /// there is; asking per environment would put a query per row on the
+    /// two paths that exist to be cheap.
+    #[tokio::test]
+    async fn services_for_many_groups_in_one_query() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let a = seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+        let b = seed_environment(
+            &store,
+            project,
+            "feature-b",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+        store
+            .replace_services(a, &[service(a, "api", true), service(a, "worker", false)])
+            .await
+            .unwrap();
+        store
+            .replace_services(b, &[service(b, "api", true)])
+            .await
+            .unwrap();
+
+        let grouped = store.services_for_many(&[a, b]).await.unwrap();
+        assert_eq!(grouped[&a].len(), 2);
+        assert_eq!(grouped[&b].len(), 1);
+        // An empty request must not become a malformed `IN ()`.
+        assert!(store.services_for_many(&[]).await.unwrap().is_empty());
+    }
+
+    /// Teardown must forget them: the table's `ON DELETE CASCADE` never
+    /// fires, because Oxid never SQL-deletes an `environments` row.
+    #[tokio::test]
+    async fn deleting_services_leaves_nothing_behind() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let env = seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+        store
+            .replace_services(env, &[service(env, "api", true)])
+            .await
+            .unwrap();
+        store.delete_services(env).await.unwrap();
+        assert!(store.services_for(env).await.unwrap().is_empty());
     }
 
     /// The property every upgrade depends on: after migrating, there is a

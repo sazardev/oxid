@@ -407,6 +407,11 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         }
         self.release_dependencies(env.project_id, &env.branch.name)
             .await?;
+        // The service rows go with it, for the same reason the leases do:
+        // Oxid never SQL-deletes an `environments` row, so the table's
+        // `ON DELETE CASCADE` never fires and anything not removed here
+        // stays for ever, pointing at containers that are gone.
+        self.store.delete_services(env.id).await?;
 
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::Destroy, now)

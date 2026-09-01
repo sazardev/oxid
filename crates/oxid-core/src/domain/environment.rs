@@ -80,6 +80,38 @@ pub struct Environment {
     pub node_id: NodeId,
 }
 
+/// One container belonging to an environment.
+///
+/// An environment used to be one container, and its scalar
+/// `container_name`/`host_port`/`public_port` still describe **the primary
+/// service** — the one that takes the branch URL. This is the rest: the
+/// workers, the sidecars, and any image a compose file asked for that has
+/// no shared pool to be folded into.
+///
+/// Rows exist only for environments deployed after migration `0021`. None
+/// means one service, which is what those environments actually are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentService {
+    /// Which environment this belongs to.
+    pub environment_id: EnvironmentId,
+    /// The compose key — `api`, `worker`, `db`. Also the hostname siblings
+    /// resolve it by inside the environment's own network, which is why it
+    /// is stored rather than derived.
+    pub name: String,
+    /// The Docker container name.
+    pub container_name: String,
+    /// The image it runs.
+    pub image: String,
+    /// The port it listens on inside the container, if any. `None` is a
+    /// worker: something that does work and answers nothing.
+    pub container_port: Option<u16>,
+    /// The host port Docker published for it, in direct-publish mode.
+    pub host_port: Option<u16>,
+    /// Whether this is the service the branch URL points at. Exactly one
+    /// per environment.
+    pub is_primary: bool,
+}
+
 impl Environment {
     /// Validates and constructs an environment.
     ///

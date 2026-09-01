@@ -13,8 +13,8 @@ use std::sync::Arc;
 use super::ControlPlane;
 use super::error::CpError;
 use super::helpers::{
-    hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
-    sanitize_label, state_err,
+    PRIMARY_SERVICE, hash_token, image_name, lowest_free_index, resolved_container_name,
+    sanitize_identifier, sanitize_label, state_err,
 };
 use super::types::{Admission, DeployOutcome, GcSummary, InfraStatus, NodeStats};
 use crate::adapter::config;
@@ -125,7 +125,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         ));
         let spec = ContainerSpec {
             name: name.clone(),
-            image,
+            image: image.clone(),
             env: env_vars,
             container_port: project.config.port,
             labels,
@@ -208,6 +208,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             // replacement landed.
             let _ = self.oci_for(prev.node_id)?.remove(&prev_name).await;
         }
+
+        // Record what this environment actually runs.
+        //
+        // One row today — the primary — because that is all a deploy
+        // creates. It is written anyway rather than left until there is
+        // more than one, so teardown, the GC and reconciliation can be
+        // taught to read *this* instead of re-deriving a container name,
+        // and the change of source is provable before the change of
+        // cardinality lands on top of it.
+        let services = vec![oxid_core::EnvironmentService {
+            environment_id: env.id,
+            name: PRIMARY_SERVICE.to_owned(),
+            container_name: name.clone(),
+            image,
+            container_port: Some(project.config.port),
+            host_port: env.host_port,
+            is_primary: true,
+        }];
+        self.store.replace_services(env.id, &services).await?;
 
         // Which node ran it, in the audit trail — but only when that is
         // news. A single-node install's history stays byte-for-byte what it

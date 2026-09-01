@@ -2174,6 +2174,61 @@ async fn a_branch_that_cannot_be_rebuilt_stays_and_is_reported() {
     );
 }
 
+/// A deploy records what the environment runs, and a redeploy does not
+/// accumulate the records of what it used to run.
+///
+/// The environment row is retired rather than SQL-deleted — Oxid keeps the
+/// deploy history — so nothing cascades, and the first version left one
+/// service row per redeploy for ever, each describing a container that
+/// stopped existing at the cutover. Found by redeploying twice against real
+/// Docker and counting the rows.
+#[tokio::test]
+async fn a_redeploy_does_not_accumulate_service_rows() {
+    let repo = repo_dir_with_config();
+    let cp = cp(FakeOci::default()).await;
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+
+    let first = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    let services = cp.store.services_for(first.id).await.unwrap();
+    assert_eq!(services.len(), 1, "a deploy records what it runs");
+    assert!(services[0].is_primary);
+    assert_eq!(
+        services[0].container_name,
+        format!("oxid-app-feature-a-{}", first.id.0)
+    );
+
+    let second = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_ne!(first.id, second.id, "a redeploy is a new environment row");
+    assert!(
+        cp.store.services_for(first.id).await.unwrap().is_empty(),
+        "the retired environment must not keep describing containers that are gone"
+    );
+    assert_eq!(cp.store.services_for(second.id).await.unwrap().len(), 1);
+}
+
+/// Destroying an environment forgets its services, for the same reason the
+/// leases are deleted explicitly: the `ON DELETE CASCADE` never fires.
+#[tokio::test]
+async fn destroying_an_environment_forgets_its_services() {
+    let repo = repo_dir_with_config();
+    let cp = cp(FakeOci::default()).await;
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(cp.store.services_for(env.id).await.unwrap().len(), 1);
+
+    cp.destroy(env.id, false).await.unwrap();
+    assert!(cp.store.services_for(env.id).await.unwrap().is_empty());
+}
+
 /// A partitioned node must not hold up a deploy aimed at a healthy one.
 ///
 /// This is a liveness bug, not a correctness one, and it took a real
