@@ -535,14 +535,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
-    pub async fn logs(&self, environment_id: EnvironmentId) -> Result<String, CpError> {
+    pub async fn logs(
+        &self,
+        environment_id: EnvironmentId,
+        service: Option<&str>,
+    ) -> Result<String, CpError> {
         let env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
             .oci_for(env.node_id)?
-            .logs(&resolved_container_name(&project, &env))
+            .logs(&self.container_for(&project, &env, service).await?)
             .await?)
     }
 
@@ -551,15 +555,74 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ///
     /// # Errors
     /// Returns [`CpError`] on missing records or Docker failures.
-    pub async fn stream_logs(&self, environment_id: EnvironmentId) -> Result<LogStream, CpError> {
+    pub async fn stream_logs(
+        &self,
+        environment_id: EnvironmentId,
+        service: Option<&str>,
+    ) -> Result<LogStream, CpError> {
         let env = self.ensure_environment(environment_id).await?;
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
             .oci_for(env.node_id)?
-            .stream_logs(&resolved_container_name(&project, &env))
+            .stream_logs(&self.container_for(&project, &env, service).await?)
             .await?)
+    }
+
+    /// The services an environment runs, primary first.
+    ///
+    /// Empty for an environment deployed before migration `0021`, which
+    /// means one service — callers that need a name fall back to the
+    /// derived one, which is what it actually has.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on a store failure.
+    pub async fn environment_services(
+        &self,
+        environment_id: EnvironmentId,
+    ) -> Result<Vec<oxid_core::EnvironmentService>, CpError> {
+        Ok(self.store.services_for(environment_id).await?)
+    }
+
+    /// The container a log request means.
+    ///
+    /// `None` is the primary — the thing the branch URL points at, which is
+    /// what someone typing `oxid logs feature-x` is asking about. A named
+    /// service is looked up among the rows the deploy wrote, so asking for
+    /// one that is not there says which ones *are*, rather than returning
+    /// an empty log that reads like a silent application.
+    ///
+    /// # Errors
+    /// [`CpError::NotFound`] naming the services that do exist.
+    async fn container_for(
+        &self,
+        project: &Project,
+        env: &Environment,
+        service: Option<&str>,
+    ) -> Result<String, CpError> {
+        let services = self.store.services_for(env.id).await?;
+        let Some(wanted) = service else {
+            return Ok(services.iter().find(|s| s.is_primary).map_or_else(
+                || resolved_container_name(project, env),
+                |s| s.container_name.clone(),
+            ));
+        };
+        services
+            .iter()
+            .find(|s| s.name == wanted)
+            .map(|s| s.container_name.clone())
+            .ok_or_else(|| {
+                let known = services
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                CpError::NotFound(crate::i18n::tf(
+                    "notFound.service",
+                    &[("service", wanted), ("known", &known)],
+                ))
+            })
     }
 
     pub(crate) async fn ensure_environment(

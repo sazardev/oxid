@@ -1190,10 +1190,10 @@ async fn pause_wake_and_logs() {
         .unwrap();
     assert_eq!(woken.state, EnvironmentState::Running);
 
-    let logs = cp.logs(env.id).await.unwrap();
+    let logs = cp.logs(env.id, None).await.unwrap();
     assert_eq!(logs, "build log");
 
-    let mut stream = cp.stream_logs(env.id).await.unwrap();
+    let mut stream = cp.stream_logs(env.id, None).await.unwrap();
     let first = futures_util::StreamExt::next(&mut stream).await;
     assert_eq!(first, Some(Ok("build log".to_owned())));
 }

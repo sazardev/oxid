@@ -85,6 +85,16 @@ pub async fn wake<
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Which of an environment's services a log request means.
+#[derive(Debug, serde::Deserialize)]
+pub struct ServiceQuery {
+    /// Compose service name. Omitted means the primary — the one the
+    /// branch URL points at, which is what somebody asking for "the logs"
+    /// is asking about.
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
 pub async fn logs<
     G: GitPort + Clone + Send + Sync + 'static,
     O: ContainerPort + Clone + Send + Sync + 'static,
@@ -92,13 +102,17 @@ pub async fn logs<
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
+    Query(query): Query<ServiceQuery>,
 ) -> ApiResult<Json<Value>> {
     let project_id = state
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
     authorize(&authed, Capability::Read, Some(project_id.0))?;
-    let logs = state.cp.logs(EnvironmentId(env_id)).await?;
+    let logs = state
+        .cp
+        .logs(EnvironmentId(env_id), query.service.as_deref())
+        .await?;
     Ok(Json(json!({ "logs": logs })))
 }
 
@@ -111,13 +125,17 @@ pub async fn stream_logs<
     State(state): State<ApiState<G, O>>,
     Path(env_id): Path<u64>,
     authed: Option<Extension<AuthedAs>>,
+    Query(query): Query<ServiceQuery>,
 ) -> ApiResult<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>> {
     let project_id = state
         .cp
         .environment_project_id(EnvironmentId(env_id))
         .await?;
     authorize(&authed, Capability::Read, Some(project_id.0))?;
-    let log_stream = state.cp.stream_logs(EnvironmentId(env_id)).await?;
+    let log_stream = state
+        .cp
+        .stream_logs(EnvironmentId(env_id), query.service.as_deref())
+        .await?;
     let events = log_stream.map(|item| {
         Ok(match item {
             Ok(line) => Event::default().data(line),

@@ -166,6 +166,7 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         // -- fleet ----------------------------------------------------------------------
         "node.partialTls" => "a node needs all three of --tls-ca, --tls-cert and --tls-key, or none of them — two out of three is not a usable client",
         "notFound.node" => "node `{id}` not found",
+        "notFound.service" => "this environment has no service called `{service}` — it runs: {known}",
         // -- deploy ---------------------------------------------------------------------
         "deploy.subdomainTaken" => "branch `{branch}` resolves to `{url}`, which branch `{other}` is already using — DNS labels can't tell `/`, `_` and `.` apart from `-`. Rename one of the two branches, or destroy the other environment first.",
         "deploy.containerGone" => "container `{name}` no longer exists; redeploy this branch to recreate it",
@@ -209,6 +210,7 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         // -- flota ----------------------------------------------------------------------
         "node.partialTls" => "un nodo necesita las tres rutas --tls-ca, --tls-cert y --tls-key, o ninguna — dos de tres no forman un cliente utilizable",
         "notFound.node" => "nodo `{id}` no encontrado",
+        "notFound.service" => "este entorno no tiene ningún servicio llamado `{service}` — corre: {known}",
         // -- deploy ---------------------------------------------------------------------
         "deploy.subdomainTaken" => "la rama `{branch}` resuelve a `{url}`, que ya usa la rama `{other}` — las etiquetas DNS no distinguen `/`, `_` ni `.` de `-`. Renombra una de las dos ramas, o destruye primero el otro entorno.",
         "deploy.containerGone" => "el contenedor `{name}` ya no existe; vuelve a desplegar esta rama para recrearlo",

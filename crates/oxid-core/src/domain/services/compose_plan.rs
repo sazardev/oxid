@@ -49,6 +49,14 @@ pub struct ComposeService {
     pub image: Option<String>,
     /// Container-side port from the first `ports:` entry.
     pub port: Option<u16>,
+    /// The service's `environment:` block, in file order.
+    ///
+    /// Read for one reason: to find out what the application already calls
+    /// a dependency. A compose file that says
+    /// `DATABASE_URL: postgres://app@db:5432/app` has *told* us which
+    /// variable points at the `db` service, and honouring that is better
+    /// than guessing a conventional name and hoping.
+    pub environment: Vec<(String, String)>,
 }
 
 /// A service's `build:` block.
@@ -67,7 +75,12 @@ pub enum Disposition {
     Build(ComposeBuild),
     /// Folded into a shared instance: no container, a lease and an injected
     /// connection URL instead.
-    Multiplex(PoolKind),
+    Multiplex {
+        /// Which shared pool it becomes a slice of.
+        kind: PoolKind,
+        /// The environment variable the connection string is injected as.
+        inject_as: String,
+    },
     /// Run from its image, per branch, as written.
     RunAsIs(String),
 }
@@ -107,11 +120,14 @@ impl ServicePlan {
             .filter(|s| matches!(s.disposition, Disposition::Build(_)))
     }
 
-    /// Dependency kinds that should be leased from a shared pool instead of
-    /// run, paired with the service name they stood in for.
-    pub fn multiplexed(&self) -> impl Iterator<Item = (&str, PoolKind)> {
-        self.services.iter().filter_map(|s| match s.disposition {
-            Disposition::Multiplex(kind) => Some((s.name.as_str(), kind)),
+    /// Services that become a slice of a shared instance rather than a
+    /// container: the service name, the pool, and the variable its
+    /// connection string is injected as.
+    pub fn multiplexed(&self) -> impl Iterator<Item = (&str, PoolKind, &str)> {
+        self.services.iter().filter_map(|s| match &s.disposition {
+            Disposition::Multiplex { kind, inject_as } => {
+                Some((s.name.as_str(), *kind, inject_as.as_str()))
+            }
             _ => None,
         })
     }
@@ -136,6 +152,42 @@ pub fn pool_for_image(image: &str) -> Option<PoolKind> {
     }
 }
 
+/// The variable a pool's connection string is injected as when the compose
+/// file gives no hint. The names all but every framework already reads.
+#[must_use]
+pub const fn conventional_variable(kind: PoolKind) -> &'static str {
+    match kind {
+        PoolKind::Postgres => "DATABASE_URL",
+        PoolKind::Redis => "REDIS_URL",
+    }
+}
+
+/// Finds what the application already calls a service.
+///
+/// A compose file that says `DATABASE_URL: postgres://app@db:5432/app` has
+/// *told* us which variable points at `db`, and honouring that beats
+/// guessing a conventional name and hoping. Matched on the host position of
+/// a URL — `@db:`, `//db:`, `//db/` — so a variable that merely mentions the
+/// word elsewhere (`DB_POOL_SIZE=10`) is not mistaken for a connection
+/// string.
+fn declared_variable(services: &[ComposeService], target: &str) -> Option<String> {
+    let needles = [
+        format!("@{target}:"),
+        format!("@{target}/"),
+        format!("//{target}:"),
+        format!("//{target}/"),
+    ];
+    services
+        .iter()
+        .flat_map(|s| s.environment.iter())
+        .find_map(|(key, value)| {
+            needles
+                .iter()
+                .any(|needle| value.contains(needle.as_str()))
+                .then(|| key.clone())
+        })
+}
+
 /// Builds the plan.
 ///
 /// `preferred_primary` is an explicit `oxid.toml` choice and always wins.
@@ -143,18 +195,35 @@ pub fn pool_for_image(image: &str) -> Option<PoolKind> {
 /// port; failing that, the first buildable service at all — a stack whose
 /// only service forgot its `ports:` should still get a URL rather than
 /// none.
+///
+/// `available_pools` is what this daemon can actually multiplex onto. A
+/// `postgres:16` is only folded into a shared instance if there *is* one:
+/// otherwise it is deployed as written, because a compose file that used to
+/// deploy must not start failing because an operator never configured
+/// `OXID_POSTGRES_URL`. Multiplexing is an optimisation, and an
+/// optimisation that turns a working deploy into an error is a bug.
 #[must_use]
-pub fn plan(services: &[ComposeService], preferred_primary: Option<&str>) -> ServicePlan {
+pub fn plan(
+    services: &[ComposeService],
+    preferred_primary: Option<&str>,
+    available_pools: &[PoolKind],
+) -> ServicePlan {
     let dispositions: Vec<Disposition> = services
         .iter()
         .map(|service| match (&service.build, &service.image) {
             // A `build:` wins even when an `image:` sits beside it — that
             // pair means "build this and tag it thus", not "pull this".
             (Some(build), _) => Disposition::Build(build.clone()),
-            (None, Some(image)) => pool_for_image(image).map_or_else(
-                || Disposition::RunAsIs(image.clone()),
-                Disposition::Multiplex,
-            ),
+            (None, Some(image)) => pool_for_image(image)
+                .filter(|kind| available_pools.contains(kind))
+                .map_or_else(
+                    || Disposition::RunAsIs(image.clone()),
+                    |kind| Disposition::Multiplex {
+                        kind,
+                        inject_as: declared_variable(services, &service.name)
+                            .unwrap_or_else(|| conventional_variable(kind).to_owned()),
+                    },
+                ),
             // Neither: nothing to run. Compose would reject this file
             // itself, so it is not worth a special error here.
             (None, None) => Disposition::RunAsIs(String::new()),
@@ -196,6 +265,7 @@ mod tests {
             }),
             image: None,
             port,
+            environment: Vec::new(),
         }
     }
 
@@ -205,8 +275,12 @@ mod tests {
             build: None,
             image: Some(image.to_owned()),
             port: None,
+            environment: Vec::new(),
         }
     }
+
+    /// Every pool a fully configured daemon offers.
+    const ALL: [PoolKind; 2] = [PoolKind::Postgres, PoolKind::Redis];
 
     /// The case the old parser got wrong: three services, one deployed.
     #[test]
@@ -218,6 +292,7 @@ mod tests {
                 image("db", "postgres:16"),
             ],
             None,
+            &ALL,
         );
         assert_eq!(plan.services.len(), 3);
         assert_eq!(plan.built().count(), 2);
@@ -229,10 +304,14 @@ mod tests {
     /// one per branch is the whole product.
     #[test]
     fn a_known_database_image_is_multiplexed_rather_than_run() {
-        let plan = plan(&[built("api", Some(80)), image("db", "postgres:16")], None);
+        let plan = plan(
+            &[built("api", Some(80)), image("db", "postgres:16")],
+            None,
+            &ALL,
+        );
         assert_eq!(
             plan.multiplexed().collect::<Vec<_>>(),
-            [("db", PoolKind::Postgres)]
+            [("db", PoolKind::Postgres, "DATABASE_URL")]
         );
     }
 
@@ -240,13 +319,84 @@ mod tests {
     /// would turn a great many real compose files into an error message.
     #[test]
     fn an_image_with_no_pool_is_run_as_written() {
-        let plan = plan(&[built("api", Some(80)), image("mq", "rabbitmq:3")], None);
+        let plan = plan(
+            &[built("api", Some(80)), image("mq", "rabbitmq:3")],
+            None,
+            &ALL,
+        );
         let mq = &plan.services[1];
         assert_eq!(
             mq.disposition,
             Disposition::RunAsIs("rabbitmq:3".to_owned())
         );
         assert_eq!(plan.multiplexed().count(), 0);
+    }
+
+    /// An optimisation that turns a working deploy into an error is a bug.
+    /// Without a shared instance to fold it into, the database is deployed
+    /// as written — which is what the compose file asked for anyway.
+    #[test]
+    fn without_a_pool_to_fold_into_a_database_is_deployed_as_written() {
+        let services = [built("api", Some(80)), image("db", "postgres:16")];
+        assert_eq!(
+            plan(&services, None, &[]).services[1].disposition,
+            Disposition::RunAsIs("postgres:16".to_owned())
+        );
+        // Redis configured but not Postgres: only the one there is a home
+        // for is folded in.
+        let plan = plan(&services, None, &[PoolKind::Redis]);
+        assert_eq!(
+            plan.services[1].disposition,
+            Disposition::RunAsIs("postgres:16".to_owned())
+        );
+        assert_eq!(plan.multiplexed().count(), 0);
+    }
+
+    /// The compose file usually says what the application calls its
+    /// database. Honouring that beats guessing a conventional name.
+    #[test]
+    fn the_variable_the_app_already_names_wins_over_the_convention() {
+        let mut api = built("api", Some(80));
+        api.environment = vec![
+            ("DB_POOL_SIZE".to_owned(), "10".to_owned()),
+            (
+                "MAIN_DATABASE".to_owned(),
+                "postgres://app@db:5432/app".to_owned(),
+            ),
+        ];
+        let plan = plan(&[api, image("db", "postgres:16")], None, &ALL);
+        assert_eq!(
+            plan.multiplexed().collect::<Vec<_>>(),
+            [("db", PoolKind::Postgres, "MAIN_DATABASE")],
+            "the variable that actually points at the service, not the one that merely says `DB`"
+        );
+    }
+
+    /// No hint in the file means the name all but every framework reads.
+    #[test]
+    fn with_no_hint_the_conventional_variable_is_used() {
+        let plan = plan(
+            &[built("api", Some(80)), image("cache", "redis:7")],
+            None,
+            &ALL,
+        );
+        assert_eq!(
+            plan.multiplexed().collect::<Vec<_>>(),
+            [("cache", PoolKind::Redis, "REDIS_URL")]
+        );
+    }
+
+    /// A variable that merely mentions the service name is not a connection
+    /// string, and injecting over it would replace someone's real setting.
+    #[test]
+    fn a_variable_that_only_mentions_the_name_is_not_matched() {
+        let mut api = built("api", Some(80));
+        api.environment = vec![("DB_KIND".to_owned(), "db".to_owned())];
+        let plan = plan(&[api, image("db", "postgres:16")], None, &ALL);
+        assert_eq!(
+            plan.multiplexed().collect::<Vec<_>>(),
+            [("db", PoolKind::Postgres, "DATABASE_URL")]
+        );
     }
 
     /// The registry and tag must not stop a database being recognised.
@@ -276,7 +426,11 @@ mod tests {
     /// Exactly one service is public, and a worker is not it.
     #[test]
     fn the_primary_is_the_first_buildable_service_with_a_port() {
-        let plan = plan(&[built("worker", None), built("api", Some(3000))], None);
+        let plan = plan(
+            &[built("worker", None), built("api", Some(3000))],
+            None,
+            &ALL,
+        );
         assert_eq!(plan.primary().unwrap().name, "api");
         assert_eq!(plan.services.iter().filter(|s| s.is_primary).count(), 1);
     }
@@ -285,19 +439,22 @@ mod tests {
     /// URL rather than none.
     #[test]
     fn a_buildable_service_without_a_port_still_becomes_primary_alone() {
-        let plan = plan(&[built("app", None)], None);
+        let plan = plan(&[built("app", None)], None, &ALL);
         assert_eq!(plan.primary().unwrap().name, "app");
     }
 
     #[test]
     fn an_explicit_choice_wins_over_the_convention() {
         let services = [built("api", Some(3000)), built("web", Some(80))];
-        assert_eq!(plan(&services, None).primary().unwrap().name, "api");
-        assert_eq!(plan(&services, Some("web")).primary().unwrap().name, "web");
+        assert_eq!(plan(&services, None, &ALL).primary().unwrap().name, "api");
+        assert_eq!(
+            plan(&services, Some("web"), &ALL).primary().unwrap().name,
+            "web"
+        );
         // Naming something that is not there falls back rather than
         // producing a stack nobody can reach.
         assert_eq!(
-            plan(&services, Some("ghost")).primary().unwrap().name,
+            plan(&services, Some("ghost"), &ALL).primary().unwrap().name,
             "api"
         );
     }
@@ -309,6 +466,7 @@ mod tests {
         let plan = plan(
             &[image("db", "postgres:16"), image("mq", "rabbitmq:3")],
             None,
+            &ALL,
         );
         assert!(plan.primary().is_none());
         assert_eq!(plan.built().count(), 0);
@@ -325,8 +483,9 @@ mod tests {
             }),
             image: Some("postgres:16".to_owned()),
             port: Some(80),
+            environment: Vec::new(),
         };
-        let plan = plan(&[service], None);
+        let plan = plan(&[service], None, &ALL);
         assert!(matches!(
             plan.services[0].disposition,
             Disposition::Build(_)

@@ -291,7 +291,10 @@ pub fn parse_project(repo_dir: &Path) -> Result<ParsedProject, ConfigError> {
         let compose_path = repo_dir.join(candidate);
         if compose_path.exists() {
             let stack = crate::adapter::compose::parse(&compose_path)?;
-            let plan = compose_plan::plan(&stack.services, None);
+            // Registration only needs the primary, so which pools this
+            // daemon offers does not matter here — that decision belongs to
+            // the deploy, which is the only place that knows.
+            let plan = compose_plan::plan(&stack.services, None, &[]);
             // The primary is the service that takes the branch URL, and the
             // one this project's single `[build]`/`[routing].port` describe.
             // `compose::parse` refuses a stack with nothing to build, and

@@ -133,6 +133,10 @@ enum Command {
         /// one-shot snapshot.
         #[arg(long, short)]
         follow: bool,
+        /// Which service's logs, for an environment that runs several.
+        /// Defaults to the primary — the one the branch URL points at.
+        #[arg(long)]
+        service: Option<String>,
     },
     /// Show the audit trail (deploy/pause/wake/destroy history).
     Audit {
@@ -879,7 +883,11 @@ async fn main() {
                 branch,
             } => cmd_env_delete(&client, &base, &name, &scope, project, branch.as_deref()).await,
         },
-        Command::Logs { branch, follow } => cmd_logs(&client, &base, &branch, follow).await,
+        Command::Logs {
+            branch,
+            follow,
+            service,
+        } => cmd_logs(&client, &base, &branch, follow, service.as_deref()).await,
         Command::Audit {
             branch,
             limit,
@@ -1662,11 +1670,20 @@ async fn post_empty(client: &Client, url: String) -> Result<(), CliError> {
 /// Fetches an environment's logs. Without `follow`, a one-shot snapshot;
 /// with `follow`, consumes the daemon's SSE `/logs/stream` endpoint and
 /// prints each `data:` line as it arrives — a real live stream, not polling.
-async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Result<(), CliError> {
+async fn cmd_logs(
+    client: &Client,
+    base: &str,
+    branch: &str,
+    follow: bool,
+    service: Option<&str>,
+) -> Result<(), CliError> {
     let (env_id, _) = resolve_environment(client, base, branch).await?;
+    // Appended rather than always present so a daemon predating
+    // multi-service environments answers the same request it always did.
+    let query = service.map_or_else(String::new, |name| format!("?service={name}"));
 
     if !follow {
-        let url = format!("{base}/api/v1/environments/{env_id}/logs");
+        let url = format!("{base}/api/v1/environments/{env_id}/logs{query}");
         let value = get_json(client, url).await?;
         if emit_json(&value) {
             return Ok(());
@@ -1678,7 +1695,7 @@ async fn cmd_logs(client: &Client, base: &str, branch: &str, follow: bool) -> Re
         return Ok(());
     }
 
-    let url = format!("{base}/api/v1/environments/{env_id}/logs/stream");
+    let url = format!("{base}/api/v1/environments/{env_id}/logs/stream{query}");
     let response = client
         .get(&url)
         .send()
@@ -4104,7 +4121,7 @@ mod tests {
     fn parses_logs_with_follow() {
         let cli = Cli::try_parse_from(["oxid", "logs", "feature-a", "-f"]).unwrap();
         match cli.command {
-            Command::Logs { branch, follow } => {
+            Command::Logs { branch, follow, .. } => {
                 assert_eq!(branch, "feature-a");
                 assert!(follow);
             }

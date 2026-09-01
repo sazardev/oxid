@@ -67,6 +67,7 @@ pub fn parse(compose_path: &Path) -> Result<ComposeStack, ConfigError> {
             build: build_of(&service["build"]),
             image: service["image"].as_str().map(str::to_owned),
             port: first_port(&service["ports"]),
+            environment: environment_of(&service["environment"]),
         });
     }
 
@@ -104,6 +105,38 @@ fn build_of(build: &Yaml) -> Option<ComposeBuild> {
         // No `build:` at all — an `image:`-only service. What happens to it
         // is the plan's decision, not this function's.
         _ => None,
+    }
+}
+
+/// Reads `environment:` in either of Compose's notations: a mapping
+/// (`KEY: value`) or a list of `KEY=value` strings.
+///
+/// Values are taken verbatim — `${VAR}` interpolation is *not* performed,
+/// and deliberately: Oxid injects its own values for the things it
+/// provisions, and half-resolving someone's shell substitution would be
+/// worse than not touching it. What this is for is finding out which
+/// variable the application already points at a service.
+fn environment_of(environment: &Yaml) -> Vec<(String, String)> {
+    match environment {
+        Yaml::Hash(entries) => entries
+            .iter()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.as_str()?.to_owned(),
+                    // A bare `KEY:` with no value means "pass it through
+                    // from the host", which is a value we do not have.
+                    value.as_str().unwrap_or_default().to_owned(),
+                ))
+            })
+            .collect(),
+        Yaml::Array(entries) => entries
+            .iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.as_str()?.split_once('=')?;
+                Some((key.to_owned(), value.to_owned()))
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

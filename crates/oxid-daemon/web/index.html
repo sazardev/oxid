@@ -299,6 +299,15 @@
             </div>
 
             <div x-show="query.tab === 'logs'">
+              <div class="tabs" x-show="envServices.length > 1">
+                <template x-for="svc in envServices" :key="svc.name">
+                  <a href="#" :class="logService===svc.name&&'active'"
+                     @click.prevent="selectLogService(environment.id, svc.name)">
+                    <span x-text="svc.name"></span>
+                    <span class="muted" x-show="svc.is_primary" x-text="t('env.primaryService')"></span>
+                  </a>
+                </template>
+              </div>
               <pre class="log-output" x-ref="logOutput" x-text="logLines.join('\n')"></pre>
             </div>
 

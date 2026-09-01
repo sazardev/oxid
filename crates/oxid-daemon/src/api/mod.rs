@@ -236,6 +236,10 @@ pub fn router<
             delete(handlers::secrets::delete_project_secret),
         )
         .route(
+            "/api/v1/environments/{env_id}/services",
+            get(handlers::environment::list_services),
+        )
+        .route(
             "/api/v1/environments/{env_id}/pause",
             post(handlers::lifecycle::pause),
         )

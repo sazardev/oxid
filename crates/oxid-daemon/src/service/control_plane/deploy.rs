@@ -474,7 +474,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// succeeded for this project, and refusing to deploy because a compose
     /// file this daemon does not need became unreadable would turn a
     /// cosmetic problem into an outage.
-    fn planned_services(repo_dir: &Path) -> (String, Vec<compose_plan::PlannedService>) {
+    fn planned_services(
+        &self,
+        repo_dir: &Path,
+    ) -> (String, Vec<compose_plan::PlannedService>, Vec<Dependency>) {
         let Some(compose_path) = [
             "docker-compose.yml",
             "docker-compose.yaml",
@@ -484,15 +487,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         .into_iter()
         .map(|name| repo_dir.join(name))
         .find(|path| path.exists()) else {
-            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+            return (PRIMARY_SERVICE.to_owned(), Vec::new(), Vec::new());
         };
 
         let Ok(stack) = crate::adapter::compose::parse(&compose_path) else {
-            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+            return (PRIMARY_SERVICE.to_owned(), Vec::new(), Vec::new());
         };
-        let plan = compose_plan::plan(&stack.services, None);
+        let plan = compose_plan::plan(&stack.services, None, &self.available_pools());
         let Some(primary) = plan.primary() else {
-            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+            return (PRIMARY_SERVICE.to_owned(), Vec::new(), Vec::new());
         };
         let primary_name = primary.name.clone();
         let extras = plan
@@ -507,7 +510,44 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             })
             .cloned()
             .collect();
-        (primary_name, extras)
+
+        // A database in the compose file becomes a logical database on the
+        // shared instance, and the application is told where it is — which
+        // is the half that was missing: until now such a service was
+        // correctly *not* deployed and nothing injected the connection, so
+        // the app started and failed on a database it could not find.
+        //
+        // The shared instance is named `compose` rather than borrowing a
+        // name from the file, because the file names a *container* and this
+        // is not one. It is the lease key, so it only has to be stable.
+        let dependencies = plan
+            .multiplexed()
+            .map(|(_, kind, inject_as)| Dependency {
+                kind,
+                shared_instance: "compose".to_owned(),
+                inject_url_as: inject_as.to_owned(),
+            })
+            .collect();
+
+        (primary_name, extras, dependencies)
+    }
+
+    /// The shared pools this daemon can actually fold a service into.
+    ///
+    /// Consulted by the plan so that a `postgres:` in a compose file is
+    /// multiplexed only when there is somewhere to multiplex it *to*. An
+    /// install with no `OXID_POSTGRES_URL` deploys the container instead,
+    /// because a compose file that used to work must not start failing over
+    /// an optimisation.
+    fn available_pools(&self) -> Vec<PoolKind> {
+        let mut pools = Vec::new();
+        if self.postgres_url.is_some() {
+            pools.push(PoolKind::Postgres);
+        }
+        if self.redis_url.is_some() {
+            pools.push(PoolKind::Redis);
+        }
+        pools
     }
 
     /// Produces the image one non-primary service will run.
@@ -548,7 +588,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             // Never reached: `planned_services` filters these out, because
             // a multiplexed dependency is a lease and a connection string,
             // not a container.
-            compose_plan::Disposition::Multiplex(_) => {
+            compose_plan::Disposition::Multiplex { .. } => {
                 return Err(CpError::Validation(
                     "a multiplexed dependency has no image to run".to_owned(),
                 ));
@@ -1066,7 +1106,30 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // reason `[build]` and `[dependencies]` are: the set of services is
         // a property of the commit. Someone adding a worker to the compose
         // file expects that push to deploy a worker.
-        let (primary_name, extra_services) = Self::planned_services(&repo_dir);
+        let (primary_name, extra_services, compose_dependencies) = self.planned_services(&repo_dir);
+
+        // A compose-derived dependency never overrides an explicit one. An
+        // `oxid.toml` that declares `[dependencies.database]` is somebody
+        // saying exactly what they want, and inferring over it would make
+        // the file they wrote stop meaning what it says.
+        let mut project = project;
+        for dependency in compose_dependencies {
+            if project
+                .config
+                .dependencies
+                .iter()
+                .any(|declared| declared.inject_url_as == dependency.inject_url_as)
+            {
+                continue;
+            }
+            tracing::info!(
+                project_id = %project.id,
+                kind = %dependency.kind,
+                variable = %dependency.inject_url_as,
+                "compose declares a shared dependency; leasing it and injecting the URL"
+            );
+            project.config.dependencies.push(dependency);
+        }
 
         let capture_context = if workspace.is_some() || !extra_services.is_empty() {
             // A sibling service lives somewhere else in the tree, so the

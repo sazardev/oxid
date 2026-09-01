@@ -64,6 +64,11 @@ function dashboard() {
     projectSettingsForm: { pause_after: "", destroy_after: "" },
     _settingsFormProjectId: null,
     logLines: [],
+    // The services this environment runs, and which one the log pane is
+    // showing. Empty for a single-service environment, which is most of
+    // them — the selector only appears when there is a choice to make.
+    envServices: [],
+    logService: null,
     historyEvents: [],
     secretsList: [],
     secretForm: { name: "", scope: "global", value: "", branch: "" },
@@ -313,6 +318,10 @@ function dashboard() {
           this.historyEvents =
             (await this.apiGetQuiet(`/api/v1/environments/${this.route.params.id}/audit`)) ?? [];
           if (this.query.tab === "logs") {
+            // Which services exist before opening a stream, so the selector
+            // is populated and the default lands on the primary rather than
+            // on whatever the previous environment happened to be showing.
+            await this.loadEnvServices(this.route.params.id);
             this.openLogStream(this.route.params.id);
           }
         }
@@ -1545,12 +1554,45 @@ function dashboard() {
     // `Authorization` header this API requires.
     // ------------------------------------------------------------------
 
+    /**
+     * Loads which services an environment runs.
+     *
+     * Best-effort and silent: a daemon older than multi-service
+     * environments has no such route, and the log pane must still work
+     * against it — it simply shows the one container it always did.
+     */
+    async loadEnvServices(envId) {
+      try {
+        const services = await this.apiGet(`/api/v1/environments/${envId}/services`);
+        this.envServices = Array.isArray(services) ? services : [];
+      } catch {
+        this.envServices = [];
+      }
+      const primary = this.envServices.find((s) => s.is_primary);
+      this.logService = primary ? primary.name : null;
+    },
+
+    /** Switches the log pane to another service and reopens the stream. */
+    async selectLogService(envId, name) {
+      this.logService = name;
+      this.closeLogStream();
+      await this.openLogStream(envId);
+    },
+
     async openLogStream(envId) {
       this.logLines = ["[loading log stream...]"];
       const controller = new AbortController();
       this._logAbort = controller;
+      // Only sent when a non-primary service is selected, so the request a
+      // single-service environment makes is byte-for-byte the one it made
+      // before this existed.
+      const primary = this.envServices.find((s) => s.is_primary);
+      const wanted =
+        this.logService && (!primary || this.logService !== primary.name)
+          ? `?service=${encodeURIComponent(this.logService)}`
+          : "";
       try {
-        const res = await fetch(`${this.apiBase}/api/v1/environments/${envId}/logs/stream`, {
+        const res = await fetch(`${this.apiBase}/api/v1/environments/${envId}/logs/stream${wanted}`, {
           headers: this.authHeaders(),
           signal: controller.signal,
           cache: "no-store",

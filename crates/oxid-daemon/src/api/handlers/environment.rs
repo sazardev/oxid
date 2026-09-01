@@ -100,3 +100,26 @@ pub async fn list_environments<
     };
     Ok(Json(envs))
 }
+
+/// The services one environment runs.
+///
+/// Backs the dashboard's log selector and `oxid logs --service`. Scoped to
+/// the environment's own project, like every other read about it — this is
+/// not fleet-wide information.
+pub async fn list_services<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    Path(env_id): Path<u64>,
+    authed: Option<Extension<AuthedAs>>,
+) -> ApiResult<Json<Vec<oxid_core::EnvironmentService>>> {
+    let project_id = state
+        .cp
+        .environment_project_id(EnvironmentId(env_id))
+        .await?;
+    authorize(&authed, Capability::Read, Some(project_id.0))?;
+    Ok(Json(
+        state.cp.environment_services(EnvironmentId(env_id)).await?,
+    ))
+}
