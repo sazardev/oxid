@@ -343,6 +343,36 @@ pub struct HostCapacity {
     pub cpu_count: u32,
 }
 
+/// One network a container joins, and the names it answers to on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAttachment {
+    /// The Docker network's name.
+    pub name: String,
+    /// Extra names this container resolves as on that network. Empty means
+    /// the container name alone, which is Docker's default.
+    pub aliases: Vec<String>,
+}
+
+impl NetworkAttachment {
+    /// Joins `name` with no extra aliases.
+    #[must_use]
+    pub fn plain(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            aliases: Vec::new(),
+        }
+    }
+
+    /// Joins `name`, answering to `alias` as well as to the container name.
+    #[must_use]
+    pub fn aliased(name: impl Into<String>, alias: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            aliases: vec![alias.into()],
+        }
+    }
+}
+
 /// Inputs for a container image build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildSpec {
@@ -400,14 +430,28 @@ pub struct ContainerSpec {
     /// Labels used for routing/inventory (e.g. `oxid.project`), including
     /// the Traefik router/service/middleware labels when `network` is set.
     pub labels: BTreeMap<String, String>,
-    /// Docker network shared with Traefik and the daemon
-    /// (`OXID_DOCKER_NETWORK`). When set, the container is attached to it
-    /// and no host port is published (SPEC.md §3.2). When `None`,
-    /// `container_port` is published on a host port Docker picks itself
-    /// (SPEC.md "Eficiencia Absoluta" — a busy port should never block a
-    /// deploy) — the fallback used when no Traefik instance is configured;
-    /// [`ContainerPort::run`] reports back which port was actually bound.
-    pub network: Option<String>,
+    /// Networks the container joins, with the names it answers to on each.
+    ///
+    /// A list rather than one optional name because an environment can be
+    /// several containers that must reach *each other*: they share a
+    /// per-environment network and each answers to its compose service name
+    /// on it, which is what makes `postgres://db:5432` work from inside
+    /// `api` without anyone configuring an address.
+    ///
+    /// `OXID_DOCKER_NETWORK` (SPEC.md §3.2) is one of these; an
+    /// environment's own network is another.
+    pub networks: Vec<NetworkAttachment>,
+    /// Whether to publish `container_port` on a host port Docker picks
+    /// itself (SPEC.md "Eficiencia Absoluta" — a busy port should never
+    /// block a deploy); [`ContainerPort::run`] reports which one it bound.
+    ///
+    /// Stated rather than inferred from `networks` being empty, which is
+    /// what it used to be. Once an environment is several containers they
+    /// all share a network so they can resolve each other, and exactly one
+    /// of them — the primary, the one the branch URL points at — still has
+    /// to be reachable from the host. Deriving it from the network list
+    /// made those two facts contradict each other.
+    pub publish_port: bool,
     /// Memory limit in megabytes, already resolved from the project's
     /// `[build]` config or the daemon's `OXID_DEFAULT_MEMORY_LIMIT_MB`.
     /// `None` means genuinely unbounded (both were unset).
@@ -548,6 +592,19 @@ pub trait ContainerPort {
     /// # Errors
     /// [`OciError::Failure`] on a Docker communication failure.
     async fn ensure_network(&self, name: &str) -> Result<NetworkStatus, OciError>;
+    /// Removes a network, tolerating one that is already gone.
+    ///
+    /// An environment gets a network of its own so its containers can
+    /// resolve each other by service name; teardown has to take it away
+    /// again, or a daemon that has destroyed a thousand branches leaves a
+    /// thousand bridges behind and eventually runs the host out of address
+    /// space.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] on a Docker communication failure. A network
+    /// that does not exist is **not** an error — teardown is allowed to run
+    /// twice.
+    async fn remove_network(&self, name: &str) -> Result<(), OciError>;
     /// Idempotently ensures the built-in Traefik container described by
     /// `spec` exists and is running — step 2 of the manual bootstrap
     /// (`docker run traefik:v3.3 ...`). Creates and starts it if missing,

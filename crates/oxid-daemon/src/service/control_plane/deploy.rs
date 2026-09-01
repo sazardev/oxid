@@ -14,17 +14,19 @@ use super::ControlPlane;
 use super::LockKey;
 use super::error::CpError;
 use super::helpers::{
-    hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
-    sanitize_label, state_err,
+    PRIMARY_SERVICE, hash_token, image_name, lowest_free_index, resolved_container_name,
+    sanitize_identifier, sanitize_label, sanitize_label_str, state_err,
 };
 use super::types::{
-    Admission, AdmissionMode, DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats,
+    Admission, AdmissionMode, DeployOutcome, DeployReport, DeployableService, GcSummary,
+    InfraStatus, NodeStats,
 };
 use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
 use crate::request_context::current_request_id;
 use oxid_core::services::branch_filter::{self, ProjectLoad, SkipReason};
+use oxid_core::services::compose_plan;
 use oxid_core::services::gc::{self, GcAction};
 use oxid_core::services::stack::{PackageManager, Stack, detect as detect_stack, detect_monorepo};
 use oxid_core::services::subdomain::subdomain_for;
@@ -461,6 +463,105 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// all keeps the project's settings and only warns: dropping the file is
     /// a normal thing to do on a branch, and `parse_project` already falls
     /// back to a `docker-compose.yml`/`Dockerfile` when one is present.
+    /// What this commit asks to be deployed, beyond the primary.
+    ///
+    /// Returns the primary's service name and every *other* runnable
+    /// service. A repository with no compose file has neither: it is one
+    /// service called `app`, which is what every environment has been until
+    /// now, and it takes the untouched single-container path.
+    ///
+    /// A parse failure is not an error here. `parse_project` has already
+    /// succeeded for this project, and refusing to deploy because a compose
+    /// file this daemon does not need became unreadable would turn a
+    /// cosmetic problem into an outage.
+    fn planned_services(repo_dir: &Path) -> (String, Vec<compose_plan::PlannedService>) {
+        let Some(compose_path) = [
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ]
+        .into_iter()
+        .map(|name| repo_dir.join(name))
+        .find(|path| path.exists()) else {
+            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+        };
+
+        let Ok(stack) = crate::adapter::compose::parse(&compose_path) else {
+            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+        };
+        let plan = compose_plan::plan(&stack.services, None);
+        let Some(primary) = plan.primary() else {
+            return (PRIMARY_SERVICE.to_owned(), Vec::new());
+        };
+        let primary_name = primary.name.clone();
+        let extras = plan
+            .services
+            .iter()
+            .filter(|service| {
+                !service.is_primary
+                    && matches!(
+                        service.disposition,
+                        compose_plan::Disposition::Build(_) | compose_plan::Disposition::RunAsIs(_)
+                    )
+            })
+            .cloned()
+            .collect();
+        (primary_name, extras)
+    }
+
+    /// Produces the image one non-primary service will run.
+    ///
+    /// A service that builds is built from the same captured tree the
+    /// primary came from, scoped to its own context — which is why the
+    /// capture widens to the repository root the moment there is more than
+    /// one service. A service that is a pinned image is pulled, so a
+    /// failure to reach the registry is reported here rather than as a
+    /// container that will not start.
+    async fn build_extra_service(
+        &self,
+        project: &Project,
+        branch: &BranchName,
+        captured: &Path,
+        service: &compose_plan::PlannedService,
+        node: oxid_core::NodeId,
+    ) -> Result<DeployableService, CpError> {
+        let image = match &service.disposition {
+            compose_plan::Disposition::Build(build) => {
+                let image = format!(
+                    "{}-{}",
+                    image_name(project, branch),
+                    sanitize_label_str(&service.name).to_ascii_lowercase()
+                );
+                let spec = BuildSpec {
+                    context: captured.join(build.context.trim_start_matches("./")),
+                    dockerfile: build.dockerfile.clone(),
+                    image: image.clone(),
+                };
+                self.oci_for(node)?.build(&spec).await?;
+                image
+            }
+            compose_plan::Disposition::RunAsIs(image) => {
+                self.oci_for(node)?.pull_image(image).await?;
+                image.clone()
+            }
+            // Never reached: `planned_services` filters these out, because
+            // a multiplexed dependency is a lease and a connection string,
+            // not a container.
+            compose_plan::Disposition::Multiplex(_) => {
+                return Err(CpError::Validation(
+                    "a multiplexed dependency has no image to run".to_owned(),
+                ));
+            }
+        };
+        Ok(DeployableService {
+            name: service.name.clone(),
+            image,
+            container_port: service.port,
+            is_primary: false,
+        })
+    }
+
     fn branch_config(&self, project: &Project, repo_dir: &Path) -> Result<Project, CpError> {
         // Only an `oxid.toml` on the commit overrides anything.
         //
@@ -959,7 +1060,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .cloned()
                 .map(|member| (mono, member))
         });
-        let capture_context = if workspace.is_some() {
+        // What else this commit asks to be deployed.
+        //
+        // Read from the checkout rather than the project row, for the same
+        // reason `[build]` and `[dependencies]` are: the set of services is
+        // a property of the commit. Someone adding a worker to the compose
+        // file expects that push to deploy a worker.
+        let (primary_name, extra_services) = Self::planned_services(&repo_dir);
+
+        let capture_context = if workspace.is_some() || !extra_services.is_empty() {
+            // A sibling service lives somewhere else in the tree, so the
+            // copy has to be the whole repository rather than the primary's
+            // own subdirectory — the same reason a workspace member is
+            // built from the root.
             "."
         } else {
             project.config.build.context.as_str()
@@ -1061,6 +1174,33 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         };
 
+        // Everything else the plan asks for: sibling services built from
+        // the same captured tree, and pinned images pulled as written.
+        //
+        // The primary is built above by the path that has always existed —
+        // context capture, Dockerfile generation, monorepo scoping — and is
+        // deliberately left alone. A repository with a single service never
+        // reaches this loop at all.
+        let mut services = vec![DeployableService {
+            name: primary_name,
+            image: image.clone(),
+            container_port: Some(project.config.port),
+            is_primary: true,
+        }];
+        for extra in &extra_services {
+            match self
+                .build_extra_service(&project, &branch, context.path(), extra, env.node_id)
+                .await
+            {
+                Ok(service) => services.push(service),
+                Err(err) => {
+                    self.record_deploy_failure(&mut env, operator.as_ref(), &err)
+                        .await;
+                    return Err(err);
+                }
+            }
+        }
+
         // 4-7: resolve secrets, run the container, run `on_start` hooks,
         // wait for it to be ready, then cut over from `previous` (if any)
         // and activate. Everything from here on can fail (a bad secret, a
@@ -1076,7 +1216,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .run_and_activate(
                 &project,
                 &branch,
-                image,
+                &services,
                 url,
                 &mut env,
                 previous.as_ref(),

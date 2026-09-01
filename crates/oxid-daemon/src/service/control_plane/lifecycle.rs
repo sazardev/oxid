@@ -245,6 +245,19 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         let name = resolved_container_name(&project, &env);
+        // Sidecars come up first, so nothing can reach the primary before
+        // what it depends on is running. Their failures are not fatal: a
+        // worker that will not start is a degraded environment, and refusing
+        // to wake the branch at all would be a worse answer than a branch
+        // that serves with one part missing.
+        for container in self.container_names(&project, &env).await {
+            if container == name {
+                continue;
+            }
+            if let Err(e) = self.oci_for(env.node_id)?.start(&container).await {
+                tracing::warn!(%container, error = %e, "could not wake a sidecar");
+            }
+        }
         // Wake against what Docker *actually* reports, never against the
         // state this database happens to hold. The two drift constantly in
         // practice — a container crashes, is OOM-killed, gets stopped by an
@@ -373,20 +386,32 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let project = ProjectStore::get(&self.store, env.project_id)
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
-        let name = resolved_container_name(&project, &env);
         // A container that isn't there is the desired end state, not an
         // error. `BuildFailed` environments frequently have none at all
         // (the image build never produced one), and an operator may have
         // removed one by hand — refusing to tear down the record in either
         // case would leave a row nothing could ever clean up.
-        match self.oci_for(env.node_id)?.stop(&name).await {
-            Ok(()) | Err(OciError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
+        // Every container the environment owns, not just the primary — a
+        // worker left running after `oxid down` is a leak nothing would
+        // ever reap, because the row that described it is about to be
+        // retired.
+        let oci = self.oci_for(env.node_id)?;
+        for container in self.container_names(&project, &env).await {
+            match oci.stop(&container).await {
+                Ok(()) | Err(OciError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+            match oci.remove(&container).await {
+                Ok(()) | Err(OciError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-        match self.oci_for(env.node_id)?.remove(&name).await {
-            Ok(()) | Err(OciError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
-        }
+        // And the network they shared. Absent for a single-service
+        // environment, which never had one — `remove_network` tolerates
+        // that by contract.
+        let _ = oci
+            .remove_network(&super::environment_network(env.id))
+            .await;
         // Best-effort: an image that never finished building (a deploy that
         // failed at the `build` step) simply won't exist yet.
         match self

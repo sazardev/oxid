@@ -27,7 +27,7 @@ pub use node::{Node, NodeEndpoint, NodeId, NodeState, NodeTls};
 pub use ports::{
     AuditFilter, AuditStore, BuildReport, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
     ContainerStatus, EnvironmentStore, ForgePort, ForgeRequest, GitError, GitPort, HostCapacity,
-    LogStream, OciError, ProjectStore, RepositoryError, SecretStore,
+    LogStream, NetworkAttachment, OciError, ProjectStore, RepositoryError, SecretStore,
 };
 pub use project::{Project, ProjectId};
 pub use project_config::{BuildConfig, Dependency, ProjectConfig};

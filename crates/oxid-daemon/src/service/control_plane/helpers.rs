@@ -62,6 +62,15 @@ pub(crate) fn image_name(project: &Project, branch: &BranchName) -> String {
     format!("oxid/{}/{}", project.name, sanitize_label(branch)).to_ascii_lowercase()
 }
 
+/// The same rule as [`sanitize_label`], for a name that is not a branch —
+/// a compose service, say. Docker's container names accept
+/// `[A-Za-z0-9][A-Za-z0-9_.-]*`, so anything else becomes a dash.
+pub(crate) fn sanitize_label_str(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 pub(crate) fn sanitize_label(branch: &BranchName) -> String {
     branch
         .to_string()

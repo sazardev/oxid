@@ -30,6 +30,15 @@ pub use error::CpError;
 pub use node::{NodeConnector, NodeView};
 pub use types::{DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
 
+/// A branch's own Docker network, so its containers resolve each other by
+/// service name. Only created when an environment has more than one
+/// container: a single-service deploy needs no network it did not already
+/// have, and creating one would change the topology of every existing
+/// install for nothing.
+pub(crate) fn environment_network(env_id: oxid_core::EnvironmentId) -> String {
+    format!("oxid-env-{}", env_id.0)
+}
+
 /// What a lifecycle operation is exclusive *against*.
 ///
 /// One process-wide mutex used to serialize all of them. That closed real
@@ -510,6 +519,33 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// The Docker client for node `id`.
     pub(crate) fn oci_for(&self, id: NodeId) -> Result<std::sync::Arc<O>, CpError> {
         Ok(std::sync::Arc::clone(&self.node(id)?.oci))
+    }
+
+    /// Every container name an environment owns, primary first.
+    ///
+    /// Read from the rows the deploy wrote rather than re-derived, which is
+    /// the whole point of having written them: a sidecar's name cannot be
+    /// worked out from the project and the branch, because its *service*
+    /// name comes from a compose file that may since have changed.
+    ///
+    /// Falls back to the single derived name for an environment deployed
+    /// before migration `0021` — which had exactly one container, so that
+    /// is not a guess, it is the answer.
+    pub(crate) async fn container_names(
+        &self,
+        project: &oxid_core::Project,
+        env: &oxid_core::Environment,
+    ) -> Vec<String> {
+        let services = self.store.services_for(env.id).await.unwrap_or_default();
+        if services.is_empty() {
+            return vec![
+                crate::service::control_plane::helpers::resolved_container_name(project, env),
+            ];
+        }
+        services
+            .into_iter()
+            .map(|service| service.container_name)
+            .collect()
     }
 
     /// Where the branch proxy should send traffic for an environment.

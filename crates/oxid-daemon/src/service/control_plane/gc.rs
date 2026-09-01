@@ -419,7 +419,6 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let transition = action
             .transition()
             .expect("Keep is filtered out before calling apply_gc_action");
-        let name = resolved_container_name(project, &env);
 
         // Every suspending action stops the container. `Pause` used to call
         // `docker pause` instead, which Traefik's Docker provider cannot
@@ -434,16 +433,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `gc::evaluate` above, this is belt-and-suspenders.
         match action {
             GcAction::Pause | GcAction::Hibernate | GcAction::Destroy => {
-                if let Err(e) = self.oci_for(env.node_id)?.stop(&name).await {
-                    let msg = e.to_string();
-                    if matches!(e, OciError::NotFound(_))
-                        || msg.contains("already stopped")
-                        || msg.contains("is already stopped")
-                        || msg.contains("304")
-                    {
-                        tracing::debug!(%name, "container already stopped, treating as success");
-                    } else {
-                        return Err(e.into());
+                // Every container the environment owns. Suspending only
+                // the primary would leave a worker running while the branch
+                // is asleep — which is the memory scale-to-zero exists to
+                // give back.
+                for container in self.container_names(project, &env).await {
+                    if let Err(e) = self.oci_for(env.node_id)?.stop(&container).await {
+                        let msg = e.to_string();
+                        if matches!(e, OciError::NotFound(_))
+                            || msg.contains("already stopped")
+                            || msg.contains("is already stopped")
+                            || msg.contains("304")
+                        {
+                            tracing::debug!(
+                                %container,
+                                "container already stopped, treating as success"
+                            );
+                        } else {
+                            return Err(e.into());
+                        }
                     }
                 }
             }
@@ -459,10 +467,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
         if action == GcAction::Destroy {
-            match self.oci_for(env.node_id)?.remove(&name).await {
-                Ok(()) | Err(OciError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
+            for container in self.container_names(project, &env).await {
+                match self.oci_for(env.node_id)?.remove(&container).await {
+                    Ok(()) | Err(OciError::NotFound(_)) => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
+            // And the network they shared. Absent for a single-service
+            // environment, which never had one.
+            let _ = self
+                .oci_for(env.node_id)?
+                .remove_network(&super::environment_network(env.id))
+                .await;
             // The image was built on the node that ran the container, and
             // that is the only copy this fleet has: images are not
             // distributed, each node builds its own.

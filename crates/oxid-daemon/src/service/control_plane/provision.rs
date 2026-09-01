@@ -11,12 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::ControlPlane;
+use super::environment_network;
 use super::error::CpError;
 use super::helpers::{
     PRIMARY_SERVICE, hash_token, image_name, lowest_free_index, resolved_container_name,
-    sanitize_identifier, sanitize_label, state_err,
+    sanitize_identifier, sanitize_label, sanitize_label_str, state_err,
 };
-use super::types::{Admission, DeployOutcome, GcSummary, InfraStatus, NodeStats};
+use super::types::{
+    Admission, DeployOutcome, DeployableService, GcSummary, InfraStatus, NodeStats,
+};
 use crate::adapter::config;
 use crate::adapter::postgres_pool::PostgresPool;
 use crate::adapter::store::{ApiTokenSummary, SqliteStore};
@@ -37,7 +40,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         &self,
         project: &Project,
         branch: &BranchName,
-        image: String,
+        services: &[DeployableService],
         url: String,
         env: &mut Environment,
         previous: Option<&Environment>,
@@ -102,56 +105,140 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .collect::<BTreeMap<_, _>>();
 
         let name = resolved_container_name(project, env);
-        // Defensive: remove any leftover container under this exact
-        // (per-deployment-unique) name, in case a prior crashed attempt for
-        // this same environment id left one behind. `previous`'s container
-        // (if any) has a *different* name and is deliberately left running
-        // — it keeps serving traffic until the cutover below.
-        match self.oci_for(env.node_id)?.remove(&name).await {
-            Ok(()) | Err(OciError::NotFound(_)) => {}
-            Err(e) => return Err(e.into()),
+        let oci = self.oci_for(env.node_id)?;
+
+        // An environment gets a network of its own only when it is more
+        // than one container. A single-service deploy needs no network it
+        // did not already have, and creating one would change the topology
+        // of every existing install to buy nothing.
+        let runnable: Vec<&DeployableService> = services.iter().collect();
+        let shared_network = (runnable.len() > 1).then(|| environment_network(env.id));
+        if let Some(network) = &shared_network {
+            oci.ensure_network(network).await?;
         }
 
-        let mut labels = BTreeMap::from([
-            ("oxid.project".to_owned(), project.name.clone()),
-            ("oxid.branch".to_owned(), branch.to_string()),
-            ("oxid.url".to_owned(), url.clone()),
-        ]);
-        labels.extend(self.traefik_labels(
-            &name,
-            &url,
-            project.config.port,
-            &project.config.base_domain,
-        ));
-        let spec = ContainerSpec {
-            name: name.clone(),
-            image: image.clone(),
-            env: env_vars,
-            container_port: project.config.port,
-            labels,
-            network: self.docker_network.clone(),
-            memory_limit_mb: project
-                .config
-                .build
-                .memory_limit_mb
-                .or(self.default_memory_limit_mb),
-            cpu_limit_millicores: project
-                .config
-                .build
-                .cpu_limit_millicores
-                .or(self.default_cpu_limit_millicores),
-        };
-        env.host_port = match self.oci_for(env.node_id)?.run(&spec).await {
-            Ok(port) => port,
-            Err(e) => {
-                let _ = self.oci_for(env.node_id)?.remove(&name).await;
-                return Err(e.into());
+        // Container names: the primary keeps the name the environment row
+        // already carries, so `resolved_container_name` and every one of
+        // its nine callers keep meaning what they meant. A sidecar is that
+        // name plus its service.
+        let container_name = |service: &DeployableService| {
+            if service.is_primary {
+                name.clone()
+            } else {
+                format!("{name}-{}", sanitize_label_str(&service.name))
             }
         };
 
+        // Defensive: remove any leftover container under these exact
+        // (per-deployment-unique) names, in case a prior crashed attempt for
+        // this same environment id left one behind. `previous`'s containers
+        // have *different* names and are deliberately left running — they
+        // keep serving traffic until the cutover below.
+        for service in &runnable {
+            match oci.remove(&container_name(service)).await {
+                Ok(()) | Err(OciError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Started sidecars first, primary last: the thing that answers the
+        // branch URL should be the last to exist, so nothing can reach it
+        // before what it depends on is up.
+        let mut started: Vec<String> = Vec::new();
+        let mut host_ports: BTreeMap<String, Option<u16>> = BTreeMap::new();
+        let mut ordered = runnable.clone();
+        ordered.sort_by_key(|service| service.is_primary);
+
+        for service in &ordered {
+            let this_name = container_name(service);
+            let port = service.container_port.unwrap_or(project.config.port);
+
+            let mut labels = BTreeMap::from([
+                ("oxid.project".to_owned(), project.name.clone()),
+                ("oxid.branch".to_owned(), branch.to_string()),
+                ("oxid.service".to_owned(), service.name.clone()),
+            ]);
+            // Only the primary is routed: it is the one with the URL, and
+            // a router for a worker would be a hostname nobody asked for.
+            if service.is_primary {
+                labels.insert("oxid.url".to_owned(), url.clone());
+                labels.extend(self.traefik_labels(
+                    &this_name,
+                    &url,
+                    port,
+                    &project.config.base_domain,
+                ));
+            }
+
+            let mut networks = Vec::new();
+            if let Some(network) = &shared_network {
+                // Aliased by service name: the container name changes on
+                // every redeploy, and `postgres://db:5432` in someone's
+                // config does not.
+                networks.push(oxid_core::NetworkAttachment::aliased(
+                    network.clone(),
+                    service.name.clone(),
+                ));
+            }
+            if service.is_primary
+                && let Some(traefik) = &self.docker_network
+            {
+                networks.push(oxid_core::NetworkAttachment::plain(traefik.clone()));
+            }
+
+            let spec = ContainerSpec {
+                name: this_name.clone(),
+                image: service.image.clone(),
+                // Only the primary is given the resolved secrets and the
+                // dependency URLs. A sidecar built from this repository gets
+                // them too; an image somebody pinned in a compose file does
+                // not need this project's secrets to run.
+                env: env_vars.clone(),
+                container_port: port,
+                labels,
+                networks,
+                // Exactly one container is reachable from the host, and only
+                // when there is no Traefik in front of everything.
+                publish_port: service.is_primary && self.docker_network.is_none(),
+                memory_limit_mb: project
+                    .config
+                    .build
+                    .memory_limit_mb
+                    .or(self.default_memory_limit_mb),
+                cpu_limit_millicores: project
+                    .config
+                    .build
+                    .cpu_limit_millicores
+                    .or(self.default_cpu_limit_millicores),
+            };
+
+            match oci.run(&spec).await {
+                Ok(port) => {
+                    host_ports.insert(service.name.clone(), port);
+                    started.push(this_name);
+                    if service.is_primary {
+                        env.host_port = port;
+                    }
+                }
+                Err(e) => {
+                    // Everything this deploy started comes down with it.
+                    // Leaving a half-built environment behind is worse than
+                    // failing: nothing would ever reap those containers,
+                    // because no row describes them.
+                    self.abandon(&oci, &started, shared_network.as_deref())
+                        .await;
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // Hooks run on the primary only. `on_start` is the project's own
+        // migration and seeding step (`IDEA.md`), and running it once per
+        // container would run migrations several times over.
         for command in &project.config.build.on_start {
-            if let Err(e) = self.oci_for(env.node_id)?.exec(&name, command).await {
-                let _ = self.oci_for(env.node_id)?.remove(&name).await;
+            if let Err(e) = oci.exec(&name, command).await {
+                self.abandon(&oci, &started, shared_network.as_deref())
+                    .await;
                 return Err(e.into());
             }
         }
@@ -174,7 +261,8 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             )
             .await
         {
-            let _ = self.oci_for(env.node_id)?.remove(&name).await;
+            self.abandon(&oci, &started, shared_network.as_deref())
+                .await;
             return Err(CpError::DeployNotReady(format!(
                 "container `{name}` did not accept connections on port {port} within 20s"
             )));
@@ -199,34 +287,40 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
         // Only now remove the previous instance, if this was a redeploy —
         // it has been serving traffic this entire time, right up to the
-        // cutover above.
+        // cutover above. Every one of its containers, and its network:
+        // read from the rows it wrote rather than re-derived, which is the
+        // whole point of having written them.
         if let Some(prev) = previous {
-            let prev_name = resolved_container_name(project, prev);
-            // The previous instance may well be on a different node than
-            // the new one — a redeploy is allowed to move a branch — so it
-            // is torn down where it actually runs, not where its
-            // replacement landed.
-            let _ = self.oci_for(prev.node_id)?.remove(&prev_name).await;
+            let prev_oci = self.oci_for(prev.node_id)?;
+            let prev_services = self.store.services_for(prev.id).await.unwrap_or_default();
+            if prev_services.is_empty() {
+                // Deployed before migration `0021`: one container, named
+                // the way it always was.
+                let _ = prev_oci
+                    .remove(&resolved_container_name(project, prev))
+                    .await;
+            } else {
+                for service in &prev_services {
+                    let _ = prev_oci.remove(&service.container_name).await;
+                }
+            }
+            let _ = prev_oci.remove_network(&environment_network(prev.id)).await;
         }
 
         // Record what this environment actually runs.
-        //
-        // One row today — the primary — because that is all a deploy
-        // creates. It is written anyway rather than left until there is
-        // more than one, so teardown, the GC and reconciliation can be
-        // taught to read *this* instead of re-deriving a container name,
-        // and the change of source is provable before the change of
-        // cardinality lands on top of it.
-        let services = vec![oxid_core::EnvironmentService {
-            environment_id: env.id,
-            name: PRIMARY_SERVICE.to_owned(),
-            container_name: name.clone(),
-            image,
-            container_port: Some(project.config.port),
-            host_port: env.host_port,
-            is_primary: true,
-        }];
-        self.store.replace_services(env.id, &services).await?;
+        let recorded: Vec<oxid_core::EnvironmentService> = runnable
+            .iter()
+            .map(|service| oxid_core::EnvironmentService {
+                environment_id: env.id,
+                name: service.name.clone(),
+                container_name: container_name(service),
+                image: service.image.clone(),
+                container_port: service.container_port,
+                host_port: host_ports.get(&service.name).copied().flatten(),
+                is_primary: service.is_primary,
+            })
+            .collect();
+        self.store.replace_services(env.id, &recorded).await?;
 
         // Which node ran it, in the audit trail — but only when that is
         // news. A single-node install's history stays byte-for-byte what it
@@ -258,6 +352,22 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             )
             .await?;
         Ok(dependency_lines)
+    }
+
+    /// Tears down everything a failed deploy started.
+    ///
+    /// A half-built environment is worse than a failed one: no row
+    /// describes those containers, so nothing would ever reap them. Every
+    /// step is best-effort — this runs on a path that is already failing,
+    /// and turning a build error into a teardown error would replace a
+    /// useful message with a useless one.
+    async fn abandon(&self, oci: &O, started: &[String], network: Option<&str>) {
+        for name in started {
+            let _ = oci.remove(name).await;
+        }
+        if let Some(network) = network {
+            let _ = oci.remove_network(network).await;
+        }
     }
 
     /// Resolves the connection string a branch should inject for

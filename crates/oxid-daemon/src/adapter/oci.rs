@@ -339,7 +339,7 @@ impl ContainerPort for DockerClient {
         // on the host): a deploy should never fail just because a specific
         // port happened to be busy. The actual bound port is read back below
         // via `inspect_container` once the container is running.
-        let port_bindings = spec.network.is_none().then(|| {
+        let port_bindings = spec.publish_port.then(|| {
             let mut bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
             bindings.insert(
                 container_port_key.clone(),
@@ -351,9 +351,26 @@ impl ContainerPort for DockerClient {
             bindings
         });
 
+        // Aliases are what make a sibling reachable as `db` rather than as
+        // `oxid-app-feat-x-41-db`: the container name is per deployment and
+        // changes on every redeploy, while the compose service name is what
+        // the application's configuration actually says.
         let networking_config: Option<NetworkingConfig<String>> =
-            spec.network.as_ref().map(|network| NetworkingConfig {
-                endpoints_config: HashMap::from([(network.clone(), EndpointSettings::default())]),
+            (!spec.networks.is_empty()).then(|| NetworkingConfig {
+                endpoints_config: spec
+                    .networks
+                    .iter()
+                    .map(|attachment| {
+                        (
+                            attachment.name.clone(),
+                            EndpointSettings {
+                                aliases: (!attachment.aliases.is_empty())
+                                    .then(|| attachment.aliases.clone()),
+                                ..EndpointSettings::default()
+                            },
+                        )
+                    })
+                    .collect(),
             });
 
         let config = Config {
@@ -405,7 +422,7 @@ impl ContainerPort for DockerClient {
             .await
             .map_err(map_err)?;
 
-        if spec.network.is_some() {
+        if !spec.publish_port {
             return Ok(None);
         }
         let bound_port = self
@@ -635,6 +652,19 @@ impl ContainerPort for DockerClient {
             .await
             .map_err(map_err)?;
         Ok(NetworkStatus::Created)
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<(), OciError> {
+        // Already gone is the desired end state, not a failure: teardown is
+        // allowed to run twice, and a network Docker cleaned up on its own
+        // must not fail a destroy that has otherwise succeeded.
+        match self.docker.remove_network(name).await {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(map_err(e)),
+        }
     }
 
     async fn ensure_traefik(&self, spec: TraefikSpec) -> Result<TraefikStatus, OciError> {
@@ -1248,7 +1278,8 @@ mod tests {
             env: std::collections::BTreeMap::default(),
             container_port: 8080,
             labels: std::collections::BTreeMap::default(),
-            network: None,
+            networks: Vec::new(),
+            publish_port: true,
             memory_limit_mb: None,
             cpu_limit_millicores: None,
         };
@@ -1351,7 +1382,8 @@ mod tests {
             env: std::collections::BTreeMap::default(),
             container_port: 8080,
             labels: std::collections::BTreeMap::default(),
-            network: None,
+            networks: Vec::new(),
+            publish_port: true,
             memory_limit_mb: None,
             cpu_limit_millicores: None,
         };
@@ -1410,7 +1442,8 @@ mod tests {
             env: std::collections::BTreeMap::default(),
             container_port: 8080,
             labels: std::collections::BTreeMap::default(),
-            network: None,
+            networks: Vec::new(),
+            publish_port: true,
             memory_limit_mb: None,
             cpu_limit_millicores: None,
         };

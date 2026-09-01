@@ -303,3 +303,20 @@ pub(crate) enum Admission {
     /// With one node this is the same "the host is full" it always was.
     Queue,
 }
+
+/// A service the deploy is about to run, with the image it will run.
+///
+/// The plan (`oxid_core::services::compose_plan`) says *what* each service
+/// is; this pairs that with the image the build step produced or the
+/// compose file named, which is the only thing the plan cannot know.
+#[derive(Debug, Clone)]
+pub(crate) struct DeployableService {
+    /// The compose service name — and the hostname siblings resolve it by.
+    pub name: String,
+    /// The image reference to run.
+    pub image: String,
+    /// Port it listens on inside the container. `None` is a worker.
+    pub container_port: Option<u16>,
+    /// Whether the branch URL points at this one.
+    pub is_primary: bool,
+}

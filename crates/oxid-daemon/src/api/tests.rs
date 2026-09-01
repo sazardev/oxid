@@ -139,7 +139,7 @@ impl ContainerPort for FakeOci {
             .lock()
             .unwrap()
             .push(format!("run:{}:env={:?}", spec.name, spec.env));
-        Ok(spec.network.is_none().then_some(65535))
+        Ok(spec.networks.is_empty().then_some(65535))
     }
     async fn published_port(
         &self,
@@ -221,6 +221,14 @@ impl ContainerPort for FakeOci {
             .push(format!("network_exists:{name}"));
         Ok(self.networks.lock().unwrap().contains(name))
     }
+    async fn remove_network(&self, name: &str) -> Result<(), OciError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("remove_network:{name}"));
+        Ok(())
+    }
+
     async fn ensure_network(&self, name: &str) -> Result<oxid_core::NetworkStatus, OciError> {
         self.calls
             .lock()
