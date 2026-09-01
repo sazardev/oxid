@@ -1397,6 +1397,35 @@ fn row_matches_filter(branch_or_name: &str, state: Option<&str>, filter: &str) -
     branch_or_name.to_lowercase().contains(&filter)
 }
 
+/// Node id to node name, when there is a fleet worth naming.
+///
+/// Empty on a single-node install, which is what keeps `oxid status`
+/// byte-identical there — a NODE column repeating "local" on every row is
+/// noise, and the column has to earn its width.
+///
+/// Best-effort, and silent on failure: the fleet routes are node-wide, so a
+/// project-scoped token is refused them. Somebody with access to one project
+/// must still be able to run `oxid status`; they simply do not get the
+/// column.
+async fn fleet_names(client: &Client, base: &str) -> std::collections::HashMap<u64, String> {
+    let Ok(value) = get_json_quiet(client, format!("{base}/api/v1/nodes")).await else {
+        return std::collections::HashMap::new();
+    };
+    let nodes = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    if nodes.len() < 2 {
+        return std::collections::HashMap::new();
+    }
+    nodes
+        .iter()
+        .filter_map(|n| {
+            Some((
+                n["id"].as_u64()?,
+                n["name"].as_str().unwrap_or("?").to_owned(),
+            ))
+        })
+        .collect()
+}
+
 async fn cmd_status(
     client: &Client,
     base: &str,
@@ -1419,15 +1448,19 @@ async fn cmd_status(
     // most recent row per branch reflects what's actually live. `envs` is
     // returned in ascending id order, so a later entry always overwrites an
     // earlier one for the same branch here.
-    let mut latest: Vec<(&str, &str, String, Vec<i64>)> = Vec::new();
+    let nodes = fleet_names(client, base).await;
+    let mut latest: Vec<(&str, &str, String, Vec<i64>, u64)> = Vec::new();
     for env in envs {
         let branch = env["branch"]["name"].as_str().unwrap_or("?");
         let state = env["state"].as_str().unwrap_or("?");
         let address = env_display_address(base, env);
         let updated = timestamp_sort_key(&env["updated_at"]);
+        // Absent on a daemon older than the fleet, which is node 1 by
+        // definition — the same answer its rows resolve to server-side.
+        let node = env["node_id"].as_u64().unwrap_or(1);
         match latest.iter_mut().find(|(b, ..)| *b == branch) {
-            Some(entry) => *entry = (branch, state, address, updated),
-            None => latest.push((branch, state, address, updated)),
+            Some(entry) => *entry = (branch, state, address, updated, node),
+            None => latest.push((branch, state, address, updated, node)),
         }
     }
     if let Some(filter) = filter {
@@ -1442,10 +1475,11 @@ async fn cmd_status(
     if emit_json(&json!(
         latest
             .iter()
-            .map(|(branch, state, address, _)| json!({
+            .map(|(branch, state, address, _, node)| json!({
                 "branch": branch,
                 "state": state,
                 "url": address,
+                "node_id": node,
             }))
             .collect::<Vec<_>>()
     )) {
@@ -1458,14 +1492,36 @@ async fn cmd_status(
         ));
         return Ok(());
     }
-    println!(
-        "{:<24} {:<24} {}",
-        t("table.branch"),
-        t("table.state"),
-        t("table.url")
-    );
-    for (branch, state, address, _) in latest {
-        println!("{:<24} {:<33} {}", branch, colored_state(state), address);
+    if nodes.is_empty() {
+        println!(
+            "{:<24} {:<24} {}",
+            t("table.branch"),
+            t("table.state"),
+            t("table.url")
+        );
+        for (branch, state, address, ..) in latest {
+            println!("{:<24} {:<33} {}", branch, colored_state(state), address);
+        }
+    } else {
+        // With a fleet, "where does this branch actually run" is the first
+        // question anyone asks, and it was the one thing `status` could not
+        // answer.
+        println!(
+            "{:<24} {:<24} {:<14} {}",
+            t("table.branch"),
+            t("table.state"),
+            t("table.node"),
+            t("table.url")
+        );
+        for (branch, state, address, _, node) in latest {
+            println!(
+                "{:<24} {:<33} {:<14} {}",
+                branch,
+                colored_state(state),
+                nodes.get(&node).map_or("?", String::as_str),
+                address
+            );
+        }
     }
     Ok(())
 }
@@ -2726,6 +2782,38 @@ fn print_node_stats(node_stats: &Value) {
                 format!("{} MB", node["committed_memory_mb"].as_u64().unwrap_or(0)),
                 node["environments_live"].as_u64().unwrap_or(0),
             );
+        }
+
+        // A verdict, not just a table. `doctor` is what someone runs when
+        // something is wrong, and a node that stopped answering is the
+        // answer they are looking for — it should not be a row they have to
+        // notice. Named individually, with how many environments are
+        // stranded on each, because that is the number that decides whether
+        // this is an inconvenience or an incident.
+        let unwell: Vec<&Value> = nodes
+            .iter()
+            .filter(|n| {
+                n["state"].as_str() == Some("down") || !n["connected"].as_bool().unwrap_or(true)
+            })
+            .collect();
+        for node in &unwell {
+            bg(tf(
+                "node.unhealthy",
+                &[
+                    ("name", node["name"].as_str().unwrap_or("?")),
+                    ("state", node["state"].as_str().unwrap_or("?")),
+                    (
+                        "envs",
+                        &node["environments_live"].as_u64().unwrap_or(0).to_string(),
+                    ),
+                ],
+            ));
+        }
+        if unwell.is_empty() {
+            ok(tf(
+                "node.allHealthy",
+                &[("count", &nodes.len().to_string())],
+            ));
         }
     }
 }

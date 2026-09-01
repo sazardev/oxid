@@ -240,7 +240,14 @@ oxid up main --repo https://github.com/you/private.git --git-token ghp_xxx</pre>
               <tr><td><code>--filter &lt;text&gt;</code></td><td>Keep rows whose state matches exactly or whose branch contains the text (case-insensitive).</td></tr>
             </tbody>
           </table>
-        </article>
+                  <p class="note">
+            With more than one node registered, a <code>NODE</code> column says where each
+            branch actually runs — the first question anyone asks on a fleet. A single-node
+            install gets exactly the table it always had, and <code>--json</code> carries
+            <code>node_id</code> either way. A project-scoped token, which is refused the
+            node-wide routes, simply does not get the column.
+          </p>
+</article>
 
         <article class="doc-entry">
           <h3><code>oxid ps [--sort] [--filter]</code></h3>
@@ -287,7 +294,10 @@ listening on 0.0.0.0:3000 ...</pre>
           <p>
             What the node has and what it is using: CPUs and memory as Docker reports them, plus a
             count per environment state. The same numbers the dashboard's top strip shows.
-            With more than one node registered, a per-node breakdown comes with it.
+            With more than one node registered, a per-node breakdown comes with it, plus a
+            verdict: a node that stopped answering is called out by name with how many
+            environments are stranded on it, rather than left as a row to notice.
+            <code>oxid doctor</code> shows the same section.
           </p>
         </article>
       </section>

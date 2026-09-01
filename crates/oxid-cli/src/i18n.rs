@@ -227,6 +227,9 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "table.memory" => "MEMORY",
         "table.envs" => "ENVS",
         "table.committed" => "COMMITTED",
+        "table.node" => "NODE",
+        "node.unhealthy" => "Node {name} is {state} — {envs} environment(s) are on it, and they are left exactly as they are",
+        "node.allHealthy" => "All {count} nodes are answering",
         // -- fleet ---------------------------------------------------------------------------
         "node.added" => "Node {name} registered ({cpus} CPUs, {memory})",
         "node.draining" => "Node {name} is draining — it keeps serving what it runs and takes nothing new",
@@ -338,6 +341,9 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "table.memory" => "MEMORIA",
         "table.envs" => "ENTORNOS",
         "table.committed" => "COMPROMETIDA",
+        "table.node" => "NODO",
+        "node.unhealthy" => "El nodo {name} está {state} — tiene {envs} entorno(s), que se quedan exactamente como están",
+        "node.allHealthy" => "Los {count} nodos responden",
         // -- flota ---------------------------------------------------------------------------
         "node.added" => "Nodo {name} registrado ({cpus} CPUs, {memory})",
         "node.draining" => "El nodo {name} está drenando — sigue sirviendo lo que ya corre y no acepta nada nuevo",
