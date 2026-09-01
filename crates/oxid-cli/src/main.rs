@@ -348,7 +348,13 @@ enum NodeAction {
         reserved_memory_mb: Option<u64>,
     },
     /// List the fleet.
-    Ls,
+    Ls {
+        /// Also list what each node is actually running, across every
+        /// project. `oxid status` is per repository, so this is the only
+        /// way to answer "what is on this machine" before emptying it.
+        #[arg(long)]
+        envs: bool,
+    },
     /// Stop sending new environments to a node, without touching what it
     /// already runs.
     Drain {
@@ -1002,7 +1008,7 @@ async fn main() {
                 )
                 .await
             }
-            NodeAction::Ls => cmd_node_ls(&client, &base).await,
+            NodeAction::Ls { envs } => cmd_node_ls(&client, &base, envs).await,
             NodeAction::Drain { node, evacuate } => {
                 cmd_node_state(&client, &base, &node, "draining", evacuate).await
             }
@@ -2987,9 +2993,21 @@ async fn cmd_node_add(
 const STATE_WIDTH: usize = 10;
 
 /// `GET /api/v1/nodes`.
-async fn cmd_node_ls(client: &Client, base: &str) -> Result<(), CliError> {
+async fn cmd_node_ls(client: &Client, base: &str, envs: bool) -> Result<(), CliError> {
     let value = get_json(client, format!("{base}/api/v1/nodes")).await?;
-    if emit_json(&value) {
+    // Fetched before the early JSON return so `--json --envs` carries the
+    // occupancy too: a script asking what is on a machine should not have to
+    // make the join itself.
+    let occupancy = if envs {
+        fleet_environments(client, base).await?
+    } else {
+        std::collections::HashMap::new()
+    };
+    if envs {
+        if emit_json(&json!({ "nodes": value, "environments": occupancy_json(&occupancy) })) {
+            return Ok(());
+        }
+    } else if emit_json(&value) {
         return Ok(());
     }
     let nodes = value.as_array().cloned().unwrap_or_default();
@@ -3023,8 +3041,80 @@ async fn cmd_node_ls(client: &Client, base: &str) -> Result<(), CliError> {
         if !connected && state != "down" {
             bg(format!("    {}", t("node.disconnected")));
         }
+        if envs {
+            let id = node["id"].as_u64().unwrap_or(0);
+            match occupancy.get(&id) {
+                Some(rows) if !rows.is_empty() => {
+                    for (project, branch, state) in rows {
+                        println!("      {project}/{branch}  {}", colored_state(state));
+                    }
+                }
+                _ => bg(format!("      {}", t("node.empty"))),
+            }
+        }
     }
     Ok(())
+}
+
+/// What each node is running: node id -> (project, branch, state).
+///
+/// Joined here rather than server-side because the environment rows carry a
+/// project *id* and a person needs the name — and the project list is
+/// already an endpoint. Two requests, one join, no new server shape.
+async fn fleet_environments(
+    client: &Client,
+    base: &str,
+) -> Result<std::collections::HashMap<u64, Vec<(String, String, String)>>, CliError> {
+    let projects = get_json(client, format!("{base}/api/v1/projects")).await?;
+    let names: std::collections::HashMap<u64, String> = projects
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|p| Some((p["id"].as_u64()?, p["name"].as_str()?.to_owned())))
+        .collect();
+
+    let envs = get_json(client, format!("{base}/api/v1/environments")).await?;
+    let mut out: std::collections::HashMap<u64, Vec<(String, String, String)>> =
+        std::collections::HashMap::new();
+    for env in envs.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let node = env["node_id"].as_u64().unwrap_or(1);
+        let project = env["project_id"].as_u64().unwrap_or(0);
+        out.entry(node).or_default().push((
+            names
+                .get(&project)
+                .cloned()
+                .unwrap_or_else(|| format!("project-{project}")),
+            env["branch"]["name"].as_str().unwrap_or("?").to_owned(),
+            env["state"].as_str().unwrap_or("?").to_owned(),
+        ));
+    }
+    for rows in out.values_mut() {
+        rows.sort();
+    }
+    Ok(out)
+}
+
+/// The occupancy map as JSON, for `--json --envs`.
+fn occupancy_json(
+    occupancy: &std::collections::HashMap<u64, Vec<(String, String, String)>>,
+) -> Value {
+    let mut by_node = serde_json::Map::new();
+    for (node, rows) in occupancy {
+        by_node.insert(
+            node.to_string(),
+            json!(
+                rows.iter()
+                    .map(|(project, branch, state)| json!({
+                        "project": project,
+                        "branch": branch,
+                        "state": state,
+                    }))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    Value::Object(by_node)
 }
 
 /// Same palette as an environment state: draining is the "asleep" look,

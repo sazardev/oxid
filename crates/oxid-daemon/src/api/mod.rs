@@ -271,6 +271,10 @@ pub fn router<
             "/api/v1/nodes/{id}",
             patch(handlers::node::update_node).delete(handlers::node::remove_node),
         )
+        .route(
+            "/api/v1/environments",
+            get(handlers::node::list_fleet_environments),
+        )
         .route("/api/v1/stats", get(handlers::infra::stats))
         .route("/api/v1/infra/status", get(handlers::infra::infra_status))
         .route(

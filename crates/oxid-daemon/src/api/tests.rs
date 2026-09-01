@@ -1637,6 +1637,7 @@ async fn scoped_tokens_are_locked_out_of_node_wide_endpoints() {
         ("POST", "/api/v1/infra/bootstrap"),
         ("GET", "/api/v1/backup"),
         ("GET", "/api/v1/nodes"),
+        ("GET", "/api/v1/environments"),
         ("DELETE", "/api/v1/nodes/1"),
     ] {
         let (status, _) = json_request_with_auth(&app, method, uri, json!({}), Some(&bob)).await;

@@ -235,6 +235,49 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         })
     }
 
+    /// Every environment on a node, newest deploy per branch.
+    ///
+    /// `oxid status` is per project and always was, which is right when a
+    /// person is working on one repository and useless when they are
+    /// emptying a machine: "what is running on `eu-1`" spanned every project
+    /// and had no answer short of asking each one in turn.
+    ///
+    /// Historical rows are collapsed to the live one per branch, the same
+    /// rule `list_environments` applies for a single branch — a node's
+    /// occupancy is what is on it now, not everything that ever was.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on a store failure.
+    pub async fn environments_on(
+        &self,
+        node: Option<NodeId>,
+    ) -> Result<Vec<oxid_core::Environment>, CpError> {
+        use oxid_core::EnvironmentState;
+
+        let mut live: Vec<oxid_core::Environment> = Vec::new();
+        for env in self.store.list_all_environments().await? {
+            if node.is_some_and(|id| env.node_id != id) {
+                continue;
+            }
+            if matches!(
+                env.state,
+                EnvironmentState::Destroyed | EnvironmentState::BuildFailed
+            ) {
+                continue;
+            }
+            match live
+                .iter_mut()
+                .find(|e| e.project_id == env.project_id && e.branch.name == env.branch.name)
+            {
+                // Ascending id order, so a later row is always the newer
+                // deploy of that branch.
+                Some(existing) => *existing = env,
+                None => live.push(env),
+            }
+        }
+        Ok(live)
+    }
+
     /// Moves every live environment off a node.
     ///
     /// The move *is* a redeploy: build the branch on the new node, wait for

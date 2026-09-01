@@ -333,12 +333,18 @@ listening on 0.0.0.0:3000 ...</pre>
         </article>
 
         <article class="doc-entry">
-          <h3><code>oxid node ls</code></h3>
+          <h3><code>oxid node ls [--envs]</code></h3>
           <p>
             The fleet, with each node's state, memory as its Docker reports it, and how many
             live environments it holds. A node listed <code>active</code> but not connected is
             one whose row is fine and whose connection is not — it is called out explicitly
             rather than left to be inferred from an empty memory column.
+          </p>
+          <p>
+            <code>--envs</code> lists what each node is actually running, across every project.
+            <code>oxid status</code> is per repository and always was, so this is the only way
+            to answer "what is on this machine" before emptying it. <code>--json</code> carries
+            the same join, so a script does not have to make it.
           </p>
         </article>
 

@@ -32,6 +32,14 @@ use oxid_core::{
     SecretValue, SelfWiringStatus, StateTransition, TraefikSpec, Ttl,
 };
 
+/// Concurrent container-status queries during startup reconciliation.
+///
+/// Bounded because the alternative is one in-flight Docker request per
+/// environment, and a rig with twelve thousand of them would replace a slow
+/// start with no start at all. Sixteen is enough to hide the round trip on a
+/// remote node without asking any single Docker to answer a flood.
+const RECONCILE_PROBE_WIDTH: usize = 16;
+
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     pub async fn sweep(&self, now: OffsetDateTime) -> Result<GcSummary, CpError> {
         let mut summary = GcSummary::default();
@@ -101,6 +109,80 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] only if listing environments/projects fails;
     /// per-environment reconciliation failures are returned in the `Vec`.
+    /// Asks every node about every environment on it, all at once.
+    ///
+    /// The pre-flight half of [`Self::reconcile_startup_state`]: it makes
+    /// the network calls and records the answers, and decides nothing. That
+    /// split is the point — the decisions are unchanged and still made one
+    /// at a time in a fixed order, they simply no longer each wait for a
+    /// round trip.
+    ///
+    /// Bounded rather than unbounded: a fleet with twelve thousand
+    /// environments would otherwise open twelve thousand concurrent Docker
+    /// requests, which is a different way to fail to start. `buffer_unordered`
+    /// keeps a fixed number in flight.
+    ///
+    /// The project cache is filled here and reused by the caller, so a
+    /// project is still fetched exactly once.
+    async fn probe_container_states(
+        &self,
+        environments: &[Environment],
+        projects: &mut std::collections::HashMap<ProjectId, Project>,
+    ) -> Result<std::collections::HashMap<EnvironmentId, Result<ContainerStatus, OciError>>, CpError>
+    {
+        use futures_util::StreamExt;
+
+        let mut wanted = Vec::new();
+        for env in environments {
+            // Exactly the states the loop below probes: a `Building` row is
+            // rewritten without asking Docker, and `Destroyed`/`BuildFailed`
+            // never had a healthy container to ask about.
+            if matches!(
+                env.state,
+                EnvironmentState::Building
+                    | EnvironmentState::Destroyed
+                    | EnvironmentState::BuildFailed
+            ) {
+                continue;
+            }
+            let project = match projects.get(&env.project_id) {
+                Some(project) => project.clone(),
+                None => match ProjectStore::get(&self.store, env.project_id).await? {
+                    Some(project) => {
+                        projects.insert(env.project_id, project.clone());
+                        project
+                    }
+                    None => continue,
+                },
+            };
+            let Ok(handle) = self.node(env.node_id) else {
+                // Reported by the caller, which owns the error list.
+                continue;
+            };
+            wanted.push((env.id, handle, resolved_container_name(&project, env)));
+        }
+
+        let answers =
+            futures_util::stream::iter(wanted.into_iter().map(|(id, handle, name)| async move {
+                let status =
+                    tokio::time::timeout(self.status_deadline, handle.oci.container_status(&name))
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(OciError::Failure(format!(
+                                "node `{}` did not answer within {}s",
+                                handle.node.name,
+                                self.status_deadline.as_secs()
+                            )))
+                        });
+                (id, status)
+            }))
+            .buffer_unordered(RECONCILE_PROBE_WIDTH)
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(answers.into_iter().collect())
+    }
+
     pub async fn reconcile_startup_state(&self) -> Result<Vec<(EnvironmentId, String)>, CpError> {
         let mut errors = Vec::new();
         let mut projects: std::collections::HashMap<ProjectId, Project> =
@@ -109,7 +191,25 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let mut unreachable: std::collections::HashSet<oxid_core::NodeId> =
             std::collections::HashSet::new();
 
-        for mut env in self.store.list_all_environments().await? {
+        let all = self.store.list_all_environments().await?;
+
+        // Ask Docker about every environment *before* deciding about any of
+        // them.
+        //
+        // This is the one loop in Oxid that makes a network call per
+        // environment, and it runs before the daemon serves its first
+        // request — so on a fleet it was startup time, paid serially: a
+        // hundred branches on a node 200ms away is twenty seconds of a
+        // control plane that exists and will not answer. The questions are
+        // independent of one another and of the decisions below, so they are
+        // asked at once and the decisions are made from the answers.
+        //
+        // None of the decision logic moved. The loop below is what it was,
+        // reading a recorded answer instead of awaiting one, which is what
+        // keeps every invariant it carries intact.
+        let statuses = self.probe_container_states(&all, &mut projects).await?;
+
+        for mut env in all {
             // A `Building` row cannot still be building: nothing survived
             // this process's restart, so the deploy that wrote it is gone.
             // Left alone it stayed `Building` forever — and admission
@@ -190,30 +290,24 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 continue;
             }
             let oci = &handle.oci;
-            let status =
-                match tokio::time::timeout(self.status_deadline, oci.container_status(&name))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(OciError::Failure(format!(
-                            "node `{}` did not answer within {}s",
-                            handle.node.name,
-                            self.status_deadline.as_secs()
-                        )))
-                    }) {
-                    Ok(status) => status,
-                    Err(e) => {
-                        // A *connection* failure condemns the node for this
-                        // pass; a 404 does not, and the difference is exactly
-                        // the invariant below — `Missing` marks a row
-                        // `Destroyed`, so it must only ever come from a node
-                        // that actually answered.
-                        if !matches!(e, OciError::NotFound(_)) {
-                            unreachable.insert(env.node_id);
-                        }
-                        errors.push((env.id, e.to_string()));
-                        continue;
+            let status = match statuses.get(&env.id) {
+                Some(Ok(status)) => *status,
+                Some(Err(e)) => {
+                    // A *connection* failure condemns the node for this
+                    // pass; a 404 does not, and the difference is exactly
+                    // the invariant below — `Missing` marks a row
+                    // `Destroyed`, so it must only ever come from a node
+                    // that actually answered.
+                    if !matches!(e, OciError::NotFound(_)) {
+                        unreachable.insert(env.node_id);
                     }
-                };
+                    errors.push((env.id, e.to_string()));
+                    continue;
+                }
+                // Not asked about, which the pre-flight only skips for an
+                // environment this loop would skip anyway.
+                None => continue,
+            };
 
             // Same opportunistic backfill as `wake_env`: an environment
             // deployed before dynamic port assignment existed never got its

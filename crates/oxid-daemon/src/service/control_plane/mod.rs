@@ -159,11 +159,12 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// a repository, so a burst of pushes to one project needs one of them,
     /// not one each — see [`crate::service::refresh_coalescer`].
     git_fetches: Arc<crate::service::refresh_coalescer::RefreshCoalescer<ProjectId, PathBuf>>,
-    /// How many queued deploys a single drain runs at once. Builds are
-    /// mostly waiting on Docker, so overlapping them is nearly free; the cap
-    /// exists so a large backlog cannot ask the host to build everything
-    /// simultaneously.
-    deploy_concurrency: usize,
+    /// How many queued deploys a single drain runs at once.
+    /// `None` means "work it out from the fleet" — see
+    /// [`Self::drain_width`]. `Some` is an operator who set
+    /// `OXID_DEPLOY_CONCURRENCY` and meant it, so it is used verbatim
+    /// however many nodes there are.
+    deploy_concurrency: Option<usize>,
     /// Admin connection string for the shared Postgres instance
     /// (`OXID_POSTGRES_URL`). `None` means projects declaring a `postgres`
     /// dependency will fail to deploy with a clear error instead of
@@ -223,13 +224,26 @@ const DEFAULT_TRAEFIK_HTTP_PORT: u16 = 80;
 /// Queued deploys run per drain, from `OXID_DEPLOY_CONCURRENCY`. Four by
 /// default: enough to hide the wait on Docker, low enough that a backlog
 /// cannot ask one host to build everything at once.
-fn default_deploy_concurrency() -> usize {
+fn default_deploy_concurrency() -> Option<usize> {
     std::env::var("OXID_DEPLOY_CONCURRENCY")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(4)
 }
+
+/// Queued deploys run per node, per drain wave, when the operator has not
+/// said otherwise. Four is what a single host was measured to want: enough
+/// to hide the wait on Docker, low enough that a backlog cannot ask one
+/// machine to build everything at once.
+const DEPLOYS_PER_NODE: usize = 4;
+
+/// Ceiling on a drain wave however large the fleet gets.
+///
+/// Not because more nodes could not absorb more, but because every entry in
+/// a wave is a claim, a git checkout on *this* machine and a build context
+/// tarred here — the control plane is the shared resource, and a fleet of
+/// fifty would otherwise ask it to hold fifty contexts at once.
+const MAX_DRAIN_WIDTH: usize = 32;
 const DEFAULT_REDIS_POOL_SIZE: u32 = 16;
 
 impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
@@ -432,6 +446,39 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ) -> Self {
         self.node_connector = Some(connect);
         self
+    }
+
+    /// How wide a drain wave should be right now.
+    ///
+    /// Builds are mostly spent waiting on Docker, so overlapping them is
+    /// nearly free — but "how many" was a constant, and a constant is wrong
+    /// in both directions once there is a fleet. Four deploys across five
+    /// nodes leaves four fifths of the hardware idle; four across a single
+    /// full node is three wasted admission round trips and three requeues.
+    ///
+    /// So it scales with the nodes that can actually take work: `draining`
+    /// and `down` ones are excluded, because a wave sized for hardware that
+    /// refuses placements is a wave that mostly comes back unplaced.
+    ///
+    /// `OXID_DEPLOY_CONCURRENCY` overrides it entirely. An operator who set
+    /// a number meant that number, and inferring a different one from the
+    /// node count would quietly ignore them.
+    pub(crate) fn drain_width(&self) -> usize {
+        if let Some(explicit) = self.deploy_concurrency {
+            return explicit;
+        }
+        let placeable = self
+            .fleet
+            .handles()
+            .iter()
+            .filter(|handle| handle.node.state.accepts_placements())
+            .count()
+            // A fleet whose every node is draining still drains its queue,
+            // one wave at a time: those deploys will not be placed, and
+            // finding that out is what puts them back with a delay instead
+            // of leaving the queue frozen.
+            .max(1);
+        (placeable * DEPLOYS_PER_NODE).min(MAX_DRAIN_WIDTH)
     }
 
     /// The fleet, for the API and the scheduler's health probe.

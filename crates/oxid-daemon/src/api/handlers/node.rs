@@ -187,3 +187,29 @@ pub async fn remove_node<
     state.cp.remove_node(NodeId(id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// Query for the fleet-wide environment listing.
+#[derive(Debug, Deserialize)]
+pub struct EnvironmentsQuery {
+    /// Restrict to one node, by id. Omitted lists the whole fleet.
+    #[serde(default)]
+    pub node: Option<u64>,
+}
+
+/// Every live environment, across every project, optionally on one node.
+///
+/// Node-wide by construction — it spans projects — so a project-scoped
+/// credential is refused, exactly as it is for the rest of `/api/v1/nodes`.
+pub async fn list_fleet_environments<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+    axum::extract::Query(query): axum::extract::Query<EnvironmentsQuery>,
+) -> ApiResult<Json<Vec<oxid_core::Environment>>> {
+    authorize(&authed, Capability::ManageNode, None)?;
+    Ok(Json(
+        state.cp.environments_on(query.node.map(NodeId)).await?,
+    ))
+}

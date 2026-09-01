@@ -187,7 +187,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
 
     /// The drain's wave size, as the claim query wants it.
     fn deploy_concurrency_u32(&self) -> u32 {
-        u32::try_from(self.deploy_concurrency).unwrap_or(u32::MAX)
+        u32::try_from(self.drain_width()).unwrap_or(u32::MAX)
     }
 
     pub async fn retry_queued_deploys(&self) -> Result<Vec<(u64, CpError)>, CpError> {
@@ -219,7 +219,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // the moment one of its entries reports it does not fit — a big
         // deploy is never starved by a stream of small ones behind it.
         loop {
-            let wave: Vec<_> = queue.by_ref().take(self.deploy_concurrency).collect();
+            let wave: Vec<_> = queue.by_ref().take(self.drain_width()).collect();
             if wave.is_empty() {
                 break;
             }

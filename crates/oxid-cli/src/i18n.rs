@@ -132,6 +132,11 @@ fn catalog(locale: Locale) -> &'static BTreeMap<&'static str, &'static str> {
     }
 }
 
+// A catalog is a data table, and its length is the number of things the CLI
+// can say — splitting it at an arbitrary line count would scatter related
+// messages across functions to satisfy a lint about control flow that has
+// none.
+#[allow(clippy::too_many_lines)]
 fn english() -> BTreeMap<&'static str, &'static str> {
     catalog! {
         // -- deploy ---------------------------------------------------------
@@ -230,6 +235,7 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "table.node" => "NODE",
         "node.unhealthy" => "Node {name} is {state} — {envs} environment(s) are on it, and they are left exactly as they are",
         "node.allHealthy" => "All {count} nodes are answering",
+        "node.empty" => "(nothing running here)",
         // -- fleet ---------------------------------------------------------------------------
         "node.added" => "Node {name} registered ({cpus} CPUs, {memory})",
         "node.draining" => "Node {name} is draining — it keeps serving what it runs and takes nothing new",
@@ -246,6 +252,7 @@ fn english() -> BTreeMap<&'static str, &'static str> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spanish() -> BTreeMap<&'static str, &'static str> {
     catalog! {
         // -- deploy ---------------------------------------------------------
@@ -344,6 +351,7 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "table.node" => "NODO",
         "node.unhealthy" => "El nodo {name} está {state} — tiene {envs} entorno(s), que se quedan exactamente como están",
         "node.allHealthy" => "Los {count} nodos responden",
+        "node.empty" => "(no corre nada aquí)",
         // -- flota ---------------------------------------------------------------------------
         "node.added" => "Nodo {name} registrado ({cpus} CPUs, {memory})",
         "node.draining" => "El nodo {name} está drenando — sigue sirviendo lo que ya corre y no acepta nada nuevo",
