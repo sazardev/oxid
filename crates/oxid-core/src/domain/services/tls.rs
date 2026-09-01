@@ -54,6 +54,25 @@ pub fn traefik_cmd(spec: &TraefikSpec) -> Vec<String> {
         "--serversTransport.forwardingTimeouts.responseHeaderTimeout=5s".to_owned(),
     ];
 
+    // Added *alongside* the Docker provider, never instead of it. The two
+    // answer different questions: labels describe containers on this
+    // machine, and the HTTP document describes every environment in the
+    // fleet — including the ones on other nodes and the ones whose
+    // container is stopped, neither of which the Docker socket can ever
+    // report. An install that turns this on keeps routing everything it
+    // already routed.
+    if let Some(http) = spec.http_provider.as_ref() {
+        cmd.push(format!("--providers.http.endpoint={}", http.endpoint));
+        cmd.push(format!(
+            "--providers.http.headers.Authorization={}",
+            http.authorization
+        ));
+        cmd.push(format!(
+            "--providers.http.pollInterval={}",
+            http.poll_interval
+        ));
+    }
+
     let Some(acme) = spec.acme.as_ref() else {
         return cmd;
     };

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Oxid — Multi-node</title>
+  <meta name="description" content="Running Oxid on more than one machine: registering nodes over mTLS, how placement and draining work, routing across the fleet, and the two costs of doing it." />
+  <link rel="icon" type="image/svg+xml" href="../assets/logo/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../styles.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a href="../" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="28" height="28" />
+        <span>oxid</span><span class="brand-suffix">/ docs</span>
+      </a>
+      <button class="nav-toggle" id="navToggle" aria-expanded="false" aria-controls="primaryNav" aria-label="Toggle navigation">
+        <span></span><span></span><span></span>
+      </button>
+      <nav class="primary-nav" id="primaryNav">
+        <a href="../#why">Why</a>
+        <a href="../#features">Features</a>
+        <a href="../#how">How it works</a>
+        <a href="../#status">Status</a>
+        <a class="nav-cta" href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub ↗</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="wrap docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <nav>
+        <p class="side-group">Overview</p>
+        <a href="index.html">Docs home</a>
+        <a href="install.html">Install &amp; setup</a>
+        <p class="side-group">Guide</p>
+        <a href="developers.html">For developers</a>
+        <a href="guide.html">How Oxid is used</a>
+        <a href="stacks.html">Stacks &amp; builds</a>
+        <p class="side-group">Modules</p>
+        <a href="cli.html">CLI reference</a>
+        <a href="daemon.html">Daemon</a>
+        <a href="api.html">HTTP API</a>
+        <a href="dashboard.html">Web dashboard</a>
+        <p class="side-group">Operate</p>
+        <a href="fleet.html" class="current">Multi-node</a>
+        <a href="security.html">Security &amp; hardening</a>
+      </nav>
+    </aside>
+
+    <main class="docs-content" id="content">
+
+      <section class="doc-section" id="fleet-what">
+        <p class="eyebrow">// multi-node</p>
+        <h2>One control plane, N Docker endpoints</h2>
+        <p>
+          When one server runs out of room, Oxid adds another — and adds nothing else.
+          The daemon keeps the database, the git cache, the secrets and the audit trail;
+          a node is a Docker API plus an address. There is no agent to install, no cluster
+          to join, and no new dependency: the same <code>bollard</code> client that talks
+          to the local socket talks to a remote one.
+        </p>
+        <pre class="cmd-block">                       oxid CLI · webhooks · dashboard
+                                    │
+   ┌────────────────── control plane node ──────────────────┐
+   │  Traefik ──(http provider)──&gt; oxidd /api/v1/traefik/config
+   │     │                            │                     │
+   │     └──&gt; per-branch proxy (stable public_port)          │
+   │              audit.sqlite · git-cache · secret.key      │
+   └───────────────────────┬─────────────────────────────────┘
+                           │  TCP to node address:host_port
+        ┌──────────────────┴───────┐   ┌────────────────────┐
+        │ node "eu-1"              │   │ node "eu-2"        │
+        │ dockerd tcp/2376 (mTLS)  │   │ dockerd            │
+        └──────────────────────────┘   └────────────────────┘</pre>
+        <p class="note">
+          Builds run <strong>on the node</strong> — the build context is streamed to whichever
+          endpoint the deploy is aimed at — while the git checkout never leaves the control
+          plane. That is the main reason a remote Docker endpoint beats writing an agent.
+        </p>
+      </section>
+
+      <section class="doc-section" id="fleet-add">
+        <h2>Registering a node</h2>
+        <p>
+          Expose Docker over mTLS on the node (Docker's own
+          <a href="https://docs.docker.com/engine/security/protect-access/" target="_blank" rel="noopener">protect-access</a>
+          guide generates the material), copy <code>ca.pem</code>, <code>cert.pem</code> and
+          <code>key.pem</code> to <em>the control plane's</em> disk, then:
+        </p>
+        <pre class="cmd-block">oxid node add eu-1 tcp://10.0.0.4:2376 \
+  --address 10.0.0.4 \
+  --tls-ca   /etc/oxid/nodes/eu-1/ca.pem \
+  --tls-cert /etc/oxid/nodes/eu-1/cert.pem \
+  --tls-key  /etc/oxid/nodes/eu-1/key.pem
+
+oxid node ls
+<span class="tk-gray">ID    NAME     ENDPOINT                   ADDRESS      STATE    MEMORY    ENVS
+1     local    local                      -            active   31.2 GiB  7
+2     eu-1     tcp://10.0.0.4:2376        10.0.0.4     active   15.6 GiB  0</span></pre>
+        <p>
+          The connection is made and probed <em>before</em> anything is written, so a bad
+          endpoint or a missing certificate fails at registration rather than hours later on
+          somebody else's push.
+        </p>
+        <h3><code>--address</code> is not the endpoint</h3>
+        <p>
+          The endpoint is where the Docker API lives. The address is where the control
+          plane's proxy dials the <strong>ports that node publishes</strong>. They are
+          frequently different interfaces, and omitting the address makes Oxid dial loopback
+          — its own machine — so the branch deploys successfully and is unreachable. The
+          post-deploy readiness probe uses the address, which turns a mistyped one into an
+          honest deploy failure instead of a green report.
+        </p>
+        <p class="note">
+          A remote endpoint with no TLS material is <strong>refused</strong>. A Docker socket
+          over plain TCP is root on that machine for anyone who can route to it, and mTLS is
+          the only thing bounding who that is. <code>OXID_ALLOW_INSECURE_NODES=1</code>
+          overrides it, following the precedent <code>OXID_ALLOW_OPEN_API</code> set — for a
+          network you control end to end, and nowhere else.
+        </p>
+      </section>
+
+      <section class="doc-section" id="fleet-routing">
+        <h2>Routing across the fleet</h2>
+        <p>
+          Traefik's Docker provider only ever sees the socket it is reading, so it is
+          structurally incapable of learning about a container on another machine. Point it
+          at the daemon as well:
+        </p>
+        <pre class="cmd-block"><span class="tk-gray"># docker-compose.yml, traefik service — add, don't swap</span>
+command:
+  - --providers.http.endpoint=http://oxid-daemon:8080/api/v1/traefik/config
+  - --providers.http.headers.Authorization=Bearer ${OXID_API_TOKEN}
+  - --providers.http.pollInterval=5s</pre>
+        <p>
+          Both providers run together. The Docker one keeps routing everything it routes
+          today; the HTTP one supplies the two classes of environment labels cannot describe
+          — those on another node, and those whose container is stopped.
+        </p>
+        <p>
+          That second one is a bonus worth naming. A sleeping branch used to have no router
+          at all, which is why the fragile lowest-priority <code>oxid-wake-catchall</code> on
+          the daemon's own container had to exist. A router built from a database row exists
+          whether the container runs or not, so the request reaches the branch's own router,
+          the proxy has no target, Traefik answers 502, and wake-on-request fires. Keep the
+          catch-all anyway — it is still the wake path in direct-publish mode — but
+          <code>oxid infra status</code> stops flagging its absence once the HTTP provider is
+          live.
+        </p>
+        <p class="note">
+          The endpoint is authenticated and ETagged: the document names every branch on this
+          daemon and how to reach it, and Traefik polls it forever.
+        </p>
+      </section>
+
+      <section class="doc-section" id="fleet-placement">
+        <h2>Placement, draining and failure</h2>
+        <table class="docs-table">
+          <thead><tr><th>Behaviour</th><th>What happens</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Placement</td>
+              <td>Affinity first, then most free memory. A redeploy stays on the node it is already on: images are not distributed — each node builds its own — so a branch that moves rebuilds from scratch.</td>
+            </tr>
+            <tr>
+              <td>Admission</td>
+              <td>Per node. Memory promised on <code>eu-2</code> says nothing about whether a deploy fits on <code>eu-1</code>. A request no node could ever satisfy is refused immediately; one that fits nowhere <em>right now</em> is queued.</td>
+            </tr>
+            <tr>
+              <td><code>oxid node drain eu-1</code></td>
+              <td>Stops new environments landing there. Touches nothing already running.</td>
+            </tr>
+            <tr>
+              <td><code>oxid node drain eu-1 --evacuate</code></td>
+              <td>Also moves every live branch off, one redeploy each through the ordinary zero-downtime path (build, wait for ready, cut over, then remove the old container). Each branch is rebuilt at <strong>the commit it is running</strong>, never at its current head — draining is an infrastructure operation, not a licence to ship whatever was pushed since. A branch that will not build stays where it is and is named.</td>
+            </tr>
+            <tr>
+              <td>A node stops answering</td>
+              <td>Marked <code>down</code> by the health probe; receives no new work. Its environments are left <strong>exactly</strong> as they are — nothing moved, marked destroyed or rebuilt. It rejoins on its own when it answers again, with no restart.</td>
+            </tr>
+            <tr>
+              <td><code>oxid node rm eu-1</code></td>
+              <td>Refused while any environment still points at it, destroyed ones included: the audit trail hangs off environment rows, so freeing the node would delete that history as a side effect.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          A network partition is indistinguishable from a dead machine, seen from the control
+          plane. That is why nothing is ever evicted on one: acting on a partition is how two
+          live copies of a branch end up fighting over a single URL.
+        </p>
+      </section>
+
+      <section class="doc-section" id="fleet-costs">
+        <h2>The two costs, stated plainly</h2>
+        <h3>The control plane is in the data path</h3>
+        <p>
+          Traffic for a branch on a remote node goes Traefik → the daemon's per-branch proxy
+          → the node. Restarting <code>oxidd</code> therefore cuts in-flight connections to
+          <em>remote</em> environments and stalls new ones until the accept loops rebind at
+          startup. On a single node nothing changes: Traefik reaches the container directly.
+        </p>
+        <p>
+          If control-plane bandwidth or its restart window becomes the limit, that is the
+          point at which a per-node agent would earn its complexity. The design leaves room
+          for one — an agent implementing the same container port slots in beside the Docker
+          adapter with no change to the control plane — and deliberately does not ship it
+          before it is needed.
+        </p>
+        <h3>The control plane is a single point of failure</h3>
+        <p>
+          Running environments keep serving: containers carry <code>unless-stopped</code>,
+          and Traefik is its own container. What stops is deploying, waking, the GC, the API
+          and — per the point above — cross-node traffic. Recovery is restore-and-restart.
+        </p>
+        <p class="note">
+          Backups snapshot the SQLite file, which brings back the node <strong>rows</strong>
+          and not the certificate files they name. Those stay your responsibility, alongside
+          <code>secret.key</code>.
+        </p>
+      </section>
+
+      <section class="doc-section" id="fleet-scope">
+        <h2>Explicitly out of scope</h2>
+        <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.45rem;">
+          <li><strong>Image distribution.</strong> Each node builds its own copy. A branch that changes node rebuilds from scratch: slower, but correct, and with no registry to operate.</li>
+          <li><strong>A highly-available control plane.</strong> SQLite here is a product decision with measurements behind it, not an implementation detail. Swapping it for an external database trades that away for a dependency you would have to make highly available anyway.</li>
+          <li><strong>Live migration of a running environment.</strong> Moving a branch is a redeploy and a cutover, which the zero-downtime path already does. Never container checkpointing.</li>
+          <li><strong>Autoscaling or provisioning nodes.</strong> An operator registers them. Oxid does not create machines.</li>
+          <li><strong>Per-node secret keys.</strong> Secrets stay encrypted on the control plane and are injected over the mTLS connection. A node never stores <code>secret.key</code> — though environment variables remain readable with <code>docker inspect</code> on the node, exactly as they are today on one machine.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <a href="#daemon-env" class="brand">
+        <img src="../assets/logo/oxid-mark.svg" alt="" width="22" height="22" />
+        <span>oxid</span>
+      </a>
+      <p class="footer-tagline">Ephemeral environments that breathe.</p>
+      <nav class="footer-links">
+        <a href="index.html">Docs home</a>
+        <a href="../">Home</a>
+        <a href="https://github.com/sazardev/oxid" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>

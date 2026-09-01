@@ -54,6 +54,57 @@ pub async fn stats<
     Ok(Json(state.cp.node_stats().await?))
 }
 
+/// Traefik's HTTP provider polls this.
+///
+/// Authenticated like every other protected route — the document names
+/// every branch on this daemon and where to reach it, so it is not public.
+/// Traefik sends the header via `--providers.http.headers.Authorization`.
+///
+/// ETagged, because polling is what this endpoint is *for*: Traefik asks
+/// every few seconds forever, and a fleet's worth of routers rebuilt and
+/// re-serialised on each poll is real work to answer "nothing changed". A
+/// hash of the rendered document rather than a version counter, so it stays
+/// correct with several daemons and across a restart.
+pub async fn traefik_config<
+    G: GitPort + Clone + Send + Sync + 'static,
+    O: ContainerPort + Clone + Send + Sync + 'static,
+>(
+    State(state): State<ApiState<G, O>>,
+    authed: Option<Extension<AuthedAs>>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    authorize(&authed, Capability::ManageNode, None)?;
+
+    let config = state.cp.traefik_dynamic_config().await?;
+    let body = serde_json::to_string(&config)
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let etag = format!(
+        "\"{:x}\"",
+        <Sha256 as sha2::Digest>::digest(body.as_bytes())
+    );
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == etag)
+    {
+        // 304 carries no body by definition, and Traefik keeps whatever it
+        // already had — which is the correct configuration, since the hash
+        // it sent is the hash of what we would have sent back.
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response());
+    }
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::ETAG, etag),
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 /// Read-only: never creates or changes anything, just reports whether the
 /// Docker network/Traefik container/self-wiring the operator would
 /// otherwise have to set up by hand are actually in place.

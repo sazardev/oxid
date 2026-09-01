@@ -50,14 +50,76 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
         stats.queue_length = self.store.list_deploy_queue().await?.len() as u64;
-        let host = self.oci.host_capacity().await?;
+        let host = self.local_oci().host_capacity().await?;
         stats.host_total_memory_bytes = host.total_memory_bytes;
         stats.host_cpu_count = host.cpu_count;
         stats.traefik_enabled = self.docker_network.is_some();
+
+        // The fleet, from the rows the health probe keeps current rather
+        // than by asking every node right now: this backs a dashboard that
+        // polls, and N Docker round-trips per poll would put the panel's
+        // refresh rate on the critical path of the slowest node in the
+        // fleet.
+        let fallback_mb = self.default_memory_limit_mb.unwrap_or(0);
+        for handle in self.fleet.handles() {
+            let node = &handle.node;
+            let (environments_live, _) = self
+                .store
+                .environment_count_on(node.id)
+                .await
+                .unwrap_or((0, 0));
+            stats
+                .nodes
+                .push(crate::service::control_plane::types::NodeUsage {
+                    id: node.id.0,
+                    name: node.name.clone(),
+                    state: node.state.to_string(),
+                    connected: true,
+                    total_memory_bytes: node.capacity.total_memory_bytes,
+                    cpu_count: node.capacity.cpu_count,
+                    committed_memory_mb: self
+                        .store
+                        .committed_memory_mb(fallback_mb, None, node.id)
+                        .await
+                        .unwrap_or(0),
+                    environments_live,
+                });
+        }
+        // A node in the table this process holds no client for still has to
+        // appear: it is where somebody's environments are, and leaving it
+        // out of the panel is how an operator concludes they are gone.
+        let connected: std::collections::HashSet<u64> = stats.nodes.iter().map(|n| n.id).collect();
+        for node in self.store.list_nodes().await.unwrap_or_default() {
+            if connected.contains(&node.id.0) {
+                continue;
+            }
+            let (environments_live, _) = self
+                .store
+                .environment_count_on(node.id)
+                .await
+                .unwrap_or((0, 0));
+            stats
+                .nodes
+                .push(crate::service::control_plane::types::NodeUsage {
+                    id: node.id.0,
+                    name: node.name.clone(),
+                    state: node.state.to_string(),
+                    connected: false,
+                    total_memory_bytes: node.capacity.total_memory_bytes,
+                    cpu_count: node.capacity.cpu_count,
+                    committed_memory_mb: self
+                        .store
+                        .committed_memory_mb(fallback_mb, None, node.id)
+                        .await
+                        .unwrap_or(0),
+                    environments_live,
+                });
+        }
+        stats.nodes.sort_by_key(|n| n.id);
         // Best-effort: a runtime that will not answer `version` is already
         // reported by everything else failing, and a missing label must not
         // turn `oxid stats` into an error.
-        if let Ok(info) = self.oci.runtime_info().await {
+        if let Ok(info) = self.local_oci().runtime_info().await {
             stats.runtime = format!("{} {}", info.flavor.as_str(), info.version);
             stats.runtime_limitations =
                 oxid_core::limitations(&info, self.traefik_http_port(), stats.traefik_enabled)
@@ -86,19 +148,23 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .ok_or_else(Self::no_network_configured)?;
         tracing::info!(network, "checking infra bootstrap status");
 
-        let network_exists = self.oci.network_exists(network).await?;
+        let network_exists = self.local_oci().network_exists(network).await?;
         let traefik_spec = self.traefik_spec(network.to_owned());
         let traefik_status = self
-            .oci
+            .local_oci()
             .container_status(&traefik_spec.container_name)
             .await?;
-        let self_wiring = self.oci.self_wiring_status(network).await?;
+        let self_wiring = self.local_oci().self_wiring_status(network).await?;
 
         // Whether the running Traefik still matches the one Oxid would
         // create. This check used to be "does a container by that name
         // exist", which reported a proxy missing every TLS flag as healthy
         // — the operator saw a green status and a browser warning.
-        let drift = match self.oci.traefik_runtime(&traefik_spec.container_name).await {
+        let drift = match self
+            .local_oci()
+            .traefik_runtime(&traefik_spec.container_name)
+            .await
+        {
             Ok(Some(actual)) => oxid_core::services::tls::traefik_drift(&traefik_spec, &actual)
                 .into_iter()
                 .map(|d| d.describe())
@@ -120,6 +186,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             traefik_status,
             self.traefik_http_port(),
             self_wiring,
+            traefik_spec
+                .http_provider
+                .as_ref()
+                .map(|http| http.endpoint.clone()),
         )
         .with_tls(
             traefik_spec
@@ -153,7 +223,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .ok_or_else(Self::no_network_configured)?;
         tracing::info!(network = %network, "bootstrapping infra: network + traefik");
 
-        let network_status = self.oci.ensure_network(&network).await?;
+        let network_status = self.local_oci().ensure_network(&network).await?;
         tracing::info!(network = %network, ?network_status, "network ensured");
 
         let spec = self.traefik_spec(network.clone());
@@ -162,11 +232,11 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             // `acme.json` the moment it starts, and a volume created later
             // would leave the first certificates in the container's own
             // writable layer, to be lost on the next recreate.
-            self.oci.ensure_volume(&acme.storage_volume).await?;
+            self.local_oci().ensure_volume(&acme.storage_volume).await?;
             tracing::info!(volume = %acme.storage_volume, "acme store ensured");
         }
 
-        let traefik_status = self.oci.ensure_traefik(spec).await?;
+        let traefik_status = self.local_oci().ensure_traefik(spec).await?;
         tracing::info!(?traefik_status, "traefik ensured");
 
         self.infra_status().await
@@ -178,6 +248,13 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     fn traefik_spec(&self, network: String) -> TraefikSpec {
         let spec = TraefikSpec {
             http_port: self.traefik_http_port(),
+            http_provider: self.fleet_routing.as_ref().map(|(token, interval)| {
+                oxid_core::HttpProvider {
+                    endpoint: format!("{}/api/v1/traefik/config", self.daemon_url),
+                    authorization: format!("Bearer {token}"),
+                    poll_interval: interval.clone(),
+                }
+            }),
             ..TraefikSpec::new(network)
         };
         match self.acme.as_ref() {
@@ -192,6 +269,64 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// exact gap the daemon's catalog exists to close.
     pub(crate) fn no_network_configured() -> CpError {
         CpError::NotFound(crate::i18n::t("infra.noNetwork").to_owned())
+    }
+
+    /// The dynamic configuration Traefik's HTTP provider polls for.
+    ///
+    /// Built from environment *rows*, which is the whole point: the Docker
+    /// label provider only ever sees the socket Traefik is reading, so it is
+    /// structurally incapable of learning about a container on another
+    /// machine. It also cannot see a container that is stopped — which is
+    /// why the fragile lowest-priority `oxid-wake-catchall` had to exist.
+    /// A router built from a row has neither limitation.
+    ///
+    /// Rules come from `oxid_core::services::routing`, the same pure module
+    /// nothing else in this file duplicates, so the label path and this one
+    /// cannot drift apart.
+    ///
+    /// # Errors
+    /// Returns [`CpError`] on a store failure.
+    pub async fn traefik_dynamic_config(
+        &self,
+    ) -> Result<oxid_core::services::routing::DynamicConfig, CpError> {
+        use oxid_core::services::routing::{RoutedEnvironment, dynamic_config};
+
+        let network = self.docker_network.clone().unwrap_or_default();
+        let spec = self.traefik_spec(network);
+
+        let mut routed = Vec::new();
+        let mut projects: std::collections::HashMap<ProjectId, Project> =
+            std::collections::HashMap::new();
+        for env in self.store.list_all_environments().await? {
+            let project = match projects.get(&env.project_id) {
+                Some(project) => project.clone(),
+                None => match ProjectStore::get(&self.store, env.project_id).await? {
+                    Some(project) => {
+                        projects.insert(env.project_id, project.clone());
+                        project
+                    }
+                    // Orphaned row (project deleted underneath it): nothing
+                    // to route to and no base domain to route it on.
+                    None => continue,
+                },
+            };
+            // Only a branch with a bound proxy port has an address on this
+            // machine at all. Without one there is nothing for a service to
+            // point at, and emitting a router with no backend would answer
+            // 502 and fire the wake middleware in a loop.
+            let Some(public_port) = env.public_port else {
+                continue;
+            };
+            routed.push(RoutedEnvironment {
+                name: resolved_container_name(&project, &env),
+                url: env.url.clone(),
+                public_port,
+                state: env.state,
+                base_domain: project.config.base_domain.clone(),
+            });
+        }
+
+        Ok(dynamic_config(&routed, &self.daemon_url, &spec))
     }
 
     pub(crate) fn traefik_labels(

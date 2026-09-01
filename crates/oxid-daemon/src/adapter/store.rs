@@ -18,9 +18,10 @@ use sqlx::{Row, SqlitePool};
 
 use oxid_core::{
     AuditEvent, AuditFilter, AuditStore, Branch, BranchName, BuildConfig, Dependency, DomainError,
-    EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore, OffsetDateTime,
-    PoolKind, Project, ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError,
-    SecretContext, SecretStore, SecretValue, StateTransition, Ttl,
+    EnvVarScope, Environment, EnvironmentId, EnvironmentState, EnvironmentStore, HostCapacity,
+    Node, NodeEndpoint, NodeId, NodeState, NodeTls, OffsetDateTime, PoolKind, Project,
+    ProjectConfig, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretContext, SecretStore,
+    SecretValue, StateTransition, Ttl,
 };
 
 use crate::adapter::crypto::{Cipher, CryptoError};
@@ -324,6 +325,7 @@ impl SqliteStore {
         &self,
         fallback_mb: u64,
         exclude: Option<EnvironmentId>,
+        node: NodeId,
     ) -> Result<u64, RepositoryError> {
         // `building` counts as well as `running`. Deploys used to be
         // strictly sequential, so a deploy that had passed admission but not
@@ -332,17 +334,263 @@ impl SqliteStore {
         // ones would let several each see the same free memory and all
         // proceed. The caller excludes its own row, which is `building` by
         // the time it asks.
+        //
+        // Scoped to one node, which is what makes the sum mean anything once
+        // there is more than one: memory committed on `eu-2` has no bearing
+        // on whether a deploy fits on `eu-1`. `COALESCE(e.node_id, 1)`
+        // rather than a plain comparison, because a row written before
+        // migration `0020` reads NULL and belongs to node 1 — leaving it out
+        // of the sum would under-count and over-admit.
         let total: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(COALESCE(p.memory_limit_mb, ?1)), 0) \
              FROM environments e JOIN projects p ON p.id = e.project_id \
-             WHERE e.state IN ('running', 'building') AND e.id != ?2",
+             WHERE e.state IN ('running', 'building') AND e.id != ?2 \
+               AND COALESCE(e.node_id, 1) = ?3",
         )
         .bind(i64::try_from(fallback_mb).unwrap_or(i64::MAX))
         .bind(exclude.map_or(0, |id| id_as_i64(id.0)))
+        .bind(id_as_i64(node.0))
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
         Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    // -----------------------------------------------------------------
+    // nodes
+    // -----------------------------------------------------------------
+
+    /// Every node in the fleet, lowest id first — so node 1 (`local`) leads,
+    /// which is what any listing should show first.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn list_nodes(&self) -> Result<Vec<Node>, RepositoryError> {
+        let rows = sqlx::query(&format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY id"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter().map(node_from_row).collect()
+    }
+
+    /// One node by id.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn get_node(&self, id: NodeId) -> Result<Option<Node>, RepositoryError> {
+        let row = sqlx::query(&format!("SELECT {NODE_COLUMNS} FROM nodes WHERE id = ?"))
+            .bind(id_as_i64(id.0))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        row.as_ref().map(node_from_row).transpose()
+    }
+
+    /// One node by its operator-chosen name, which is what a person types.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn find_node_by_name(&self, name: &str) -> Result<Option<Node>, RepositoryError> {
+        let row = sqlx::query(&format!("SELECT {NODE_COLUMNS} FROM nodes WHERE name = ?"))
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        row.as_ref().map(node_from_row).transpose()
+    }
+
+    /// Creates or replaces a node, keyed on its unique `name`.
+    ///
+    /// Upsert rather than insert because registering a node is how an
+    /// operator also *corrects* one — a mistyped address or a rotated
+    /// certificate path — and asking them to delete a node to fix its
+    /// address would take its environments with it.
+    ///
+    /// `state` and `last_seen_at` are deliberately not written here: they
+    /// belong to the health probe, and a re-registration must not resurrect
+    /// a node that is actually down or un-drain one an operator is draining.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn upsert_node(&self, node: &Node) -> Result<NodeId, RepositoryError> {
+        let (ca, cert, key) = node.tls.as_ref().map_or((None, None, None), |tls| {
+            (
+                Some(tls.ca_path.as_str()),
+                Some(tls.cert_path.as_str()),
+                Some(tls.key_path.as_str()),
+            )
+        });
+        let row = sqlx::query(
+            "INSERT INTO nodes (name, endpoint, address, tls_ca_path, tls_cert_path, \
+             tls_key_path, state, reserved_memory_mb, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(name) DO UPDATE SET \
+               endpoint = excluded.endpoint, address = excluded.address, \
+               tls_ca_path = excluded.tls_ca_path, \
+               tls_cert_path = excluded.tls_cert_path, \
+               tls_key_path = excluded.tls_key_path, \
+               reserved_memory_mb = excluded.reserved_memory_mb \
+             RETURNING id",
+        )
+        .bind(&node.name)
+        .bind(node.endpoint.as_str())
+        .bind(node.address.as_deref())
+        .bind(ca)
+        .bind(cert)
+        .bind(key)
+        .bind(node.state.to_string())
+        .bind(
+            node.reserved_memory_mb
+                .map(|mb| i64::try_from(mb).unwrap_or(i64::MAX)),
+        )
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let id: i64 = row.try_get("id").map_err(storage)?;
+        Ok(NodeId(
+            u64::try_from(id).map_err(|_| storage("node id overflowed u64"))?,
+        ))
+    }
+
+    /// Sets a node's state — `oxid node drain`, and the health probe marking
+    /// one `down` or back `active`.
+    ///
+    /// This touches the `nodes` row and nothing else. Marking a node `down`
+    /// must never rewrite the environments on it: a partition is
+    /// indistinguishable from a dead machine, and acting on one is how two
+    /// live copies of a branch end up fighting over a URL
+    /// (`MULTINODE.md` §8.3).
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError::NotFound`] if no such node exists.
+    pub async fn set_node_state(
+        &self,
+        id: NodeId,
+        state: NodeState,
+    ) -> Result<(), RepositoryError> {
+        let res = sqlx::query("UPDATE nodes SET state = ? WHERE id = ?")
+            .bind(state.to_string())
+            .bind(id_as_i64(id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "node `{id}` does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Records what a successful health probe saw.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError::NotFound`] if no such node exists.
+    pub async fn record_node_health(
+        &self,
+        id: NodeId,
+        capacity: HostCapacity,
+        state: NodeState,
+    ) -> Result<(), RepositoryError> {
+        let res = sqlx::query(
+            "UPDATE nodes SET total_memory_bytes = ?, cpu_count = ?, \
+             last_seen_at = ?, state = ? WHERE id = ?",
+        )
+        .bind(i64::try_from(capacity.total_memory_bytes).unwrap_or(i64::MAX))
+        .bind(i64::from(capacity.cpu_count))
+        .bind(OffsetDateTime::now_utc().unix_timestamp())
+        .bind(state.to_string())
+        .bind(id_as_i64(id.0))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "node `{id}` does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many environments a node hosts: `(live, total)`, where live is
+    /// everything but `destroyed`.
+    ///
+    /// Both numbers matter to `oxid node rm`, and for different reasons.
+    /// Live environments mean real containers that would be orphaned. The
+    /// total matters because `audit_events` cascades from `environments`, so
+    /// a destroyed row is not a tombstone that can be swept aside — it is
+    /// still holding that branch's whole audit trail.
+    ///
+    /// # Errors
+    /// Returns [`RepositoryError`] on query failure.
+    pub async fn environment_count_on(&self, id: NodeId) -> Result<(u64, u64), RepositoryError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS total, \
+                    COALESCE(SUM(state != 'destroyed'), 0) AS live \
+             FROM environments WHERE COALESCE(node_id, 1) = ?",
+        )
+        .bind(id_as_i64(id.0))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let total: i64 = row.try_get("total").map_err(storage)?;
+        let live: i64 = row.try_get("live").map_err(storage)?;
+        Ok((
+            u64::try_from(live).unwrap_or(0),
+            u64::try_from(total).unwrap_or(0),
+        ))
+    }
+
+    /// Removes a node.
+    ///
+    /// Refuses while *any* environment row still points at it, destroyed
+    /// ones included, and the two refusals are not the same refusal. A live
+    /// environment means a container that would be orphaned — nothing would
+    /// ever reap it, and nothing could route to it. A destroyed one means
+    /// history: `audit_events` cascades from `environments`, so deleting the
+    /// row to free the node would take that branch's entire audit trail with
+    /// it, silently, as a side effect of an unrelated command.
+    ///
+    /// So removal is deliberately the last step of a sequence an operator
+    /// drives: drain the node, let its branches redeploy elsewhere, delete
+    /// the projects whose history is genuinely finished. It is not a way to
+    /// make records go away.
+    ///
+    /// # Errors
+    /// [`RepositoryError::NotFound`] if no such node exists, or
+    /// [`RepositoryError::Conflict`] if it is the local node or anything
+    /// still references it.
+    pub async fn delete_node(&self, id: NodeId) -> Result<(), RepositoryError> {
+        if id == NodeId::LOCAL {
+            return Err(RepositoryError::Conflict(
+                "the local node cannot be removed — it is this daemon".to_owned(),
+            ));
+        }
+        let (live, total) = self.environment_count_on(id).await?;
+        if live > 0 {
+            return Err(RepositoryError::Conflict(format!(
+                "node `{id}` still hosts {live} live environment(s) — drain it first"
+            )));
+        }
+        if total > 0 {
+            return Err(RepositoryError::Conflict(format!(
+                "node `{id}` still holds the records of {total} past \
+                 environment(s), and their audit trail with them — delete \
+                 those projects first if that history is finished with"
+            )));
+        }
+        let res = sqlx::query("DELETE FROM nodes WHERE id = ?")
+            .bind(id_as_i64(id.0))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        if res.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "node `{id}` does not exist"
+            )));
+        }
+        Ok(())
     }
 
     /// Lists every environment across all projects, regardless of state.
@@ -1595,14 +1843,61 @@ impl ProjectStore for SqliteStore {
 }
 
 // ---------------------------------------------------------------------------
+// node mapping
+// ---------------------------------------------------------------------------
+
+const NODE_COLUMNS: &str = "id, name, endpoint, address, tls_ca_path, tls_cert_path, \
+     tls_key_path, state, reserved_memory_mb, total_memory_bytes, cpu_count, last_seen_at";
+
+fn node_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Node, RepositoryError> {
+    let id = id_from_row(row, "id")?;
+    let name: String = row.try_get("name").map_err(storage)?;
+    let endpoint: String = row.try_get("endpoint").map_err(storage)?;
+    let address: Option<String> = row.try_get("address").map_err(storage)?;
+    let ca: Option<String> = row.try_get("tls_ca_path").map_err(storage)?;
+    let cert: Option<String> = row.try_get("tls_cert_path").map_err(storage)?;
+    let key: Option<String> = row.try_get("tls_key_path").map_err(storage)?;
+    let state: String = row.try_get("state").map_err(storage)?;
+    let reserved: Option<i64> = row.try_get("reserved_memory_mb").map_err(storage)?;
+    let total_memory_bytes: i64 = row.try_get("total_memory_bytes").map_err(storage)?;
+    let cpu_count: i64 = row.try_get("cpu_count").map_err(storage)?;
+    let last_seen_at: Option<i64> = row.try_get("last_seen_at").map_err(storage)?;
+
+    let mut node = Node::new(NodeId(id), name, NodeEndpoint::from(endpoint.as_str()))
+        .map_err(|e| validation(&e))?;
+    node.address = address;
+    // All three or none: a half-configured triple is not a usable client,
+    // and treating it as one would fail at connect time with a message about
+    // TLS rather than about the row that is missing a path.
+    node.tls = match (ca, cert, key) {
+        (Some(ca_path), Some(cert_path), Some(key_path)) => Some(NodeTls {
+            ca_path,
+            cert_path,
+            key_path,
+        }),
+        _ => None,
+    };
+    node.state = state.parse::<NodeState>().map_err(|e| validation(&e))?;
+    node.reserved_memory_mb = reserved.and_then(|mb| u64::try_from(mb).ok());
+    node.capacity = HostCapacity {
+        total_memory_bytes: u64::try_from(total_memory_bytes).unwrap_or(0),
+        cpu_count: u32::try_from(cpu_count).unwrap_or(0),
+    };
+    node.last_seen_at = last_seen_at;
+    Ok(node)
+}
+
+// ---------------------------------------------------------------------------
 // environment mapping
 // ---------------------------------------------------------------------------
 
 const ENV_COLUMNS: &str = "id, project_id, branch_name, commit_sha, state, url, \
-     created_at, updated_at, last_accessed_at, host_port, public_port, container_name";
+     created_at, updated_at, last_accessed_at, host_port, public_port, container_name, \
+     node_id";
 
 const ENV_COLUMNS_NO_ID: &str = "project_id, branch_name, commit_sha, state, url, \
-     created_at, updated_at, last_accessed_at, host_port, public_port, container_name";
+     created_at, updated_at, last_accessed_at, host_port, public_port, container_name, \
+     node_id";
 
 fn env_to_binds(env: &Environment) -> EnvBinds<'_> {
     EnvBinds {
@@ -1618,6 +1913,7 @@ fn env_to_binds(env: &Environment) -> EnvBinds<'_> {
         host_port: env.host_port.map(i64::from),
         public_port: env.public_port.map(i64::from),
         container_name: env.container_name.as_deref(),
+        node_id: id_as_i64(env.node_id.0),
     }
 }
 
@@ -1634,6 +1930,7 @@ struct EnvBinds<'a> {
     host_port: Option<i64>,
     public_port: Option<i64>,
     container_name: Option<&'a str>,
+    node_id: i64,
 }
 
 fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, RepositoryError> {
@@ -1649,6 +1946,10 @@ fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, Repository
     let host_port: Option<i64> = row.try_get("host_port").map_err(storage)?;
     let public_port: Option<i64> = row.try_get("public_port").map_err(storage)?;
     let container_name: Option<String> = row.try_get("container_name").map_err(storage)?;
+    // NULL means a row written by a binary older than migration `0020`, and
+    // there was only one node then. Resolving it rather than failing is what
+    // lets an operator roll the daemon back and forward again.
+    let node_id: Option<i64> = row.try_get("node_id").map_err(storage)?;
 
     let branch = Branch::new(
         BranchName::parse(branch_name).map_err(|e| validation(&e))?,
@@ -1674,6 +1975,9 @@ fn env_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Environment, Repository
     env.host_port = host_port.and_then(|p| u16::try_from(p).ok());
     env.public_port = public_port.and_then(|p| u16::try_from(p).ok());
     env.container_name = container_name;
+    env.node_id = node_id
+        .and_then(|id| u64::try_from(id).ok())
+        .map_or(NodeId::LOCAL, NodeId);
     Ok(env)
 }
 
@@ -1682,7 +1986,7 @@ impl EnvironmentStore for SqliteStore {
         let binds = env_to_binds(env);
         let row = sqlx::query(&format!(
             "INSERT INTO environments ({ENV_COLUMNS_NO_ID}) VALUES \
-             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+             (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(binds.project_id)
         .bind(binds.branch_name)
@@ -1695,6 +1999,7 @@ impl EnvironmentStore for SqliteStore {
         .bind(binds.host_port)
         .bind(binds.public_port)
         .bind(binds.container_name)
+        .bind(binds.node_id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -1748,7 +2053,8 @@ impl EnvironmentStore for SqliteStore {
         let res = sqlx::query(
             "UPDATE environments SET project_id = ?, branch_name = ?, commit_sha = ?, \
              state = ?, url = ?, created_at = ?, updated_at = ?, last_accessed_at = ?, \
-             host_port = ?, public_port = ?, container_name = ? WHERE id = ?",
+             host_port = ?, public_port = ?, container_name = ?, node_id = ? \
+             WHERE id = ?",
         )
         .bind(binds.project_id)
         .bind(binds.branch_name)
@@ -1761,6 +2067,7 @@ impl EnvironmentStore for SqliteStore {
         .bind(binds.host_port)
         .bind(binds.public_port)
         .bind(binds.container_name)
+        .bind(binds.node_id)
         .bind(binds.id)
         .execute(&self.pool)
         .await
@@ -2778,7 +3085,13 @@ mod concurrency_tests {
             EnvironmentStore::create(&store, &env).await.unwrap();
         }
         // Two running environments of a project limited to 256 MB each.
-        assert_eq!(store.committed_memory_mb(512, None).await.unwrap(), 512);
+        assert_eq!(
+            store
+                .committed_memory_mb(512, None, NodeId::LOCAL)
+                .await
+                .unwrap(),
+            512
+        );
     }
 
     /// The property the in-process mutex could never give: two drains,
@@ -2896,6 +3209,256 @@ mod concurrency_tests {
         )
         .unwrap();
         ProjectStore::create(store, &project).await.unwrap()
+    }
+
+    async fn seed_environment(
+        store: &SqliteStore,
+        project: ProjectId,
+        branch: &str,
+        state: EnvironmentState,
+        node: NodeId,
+    ) -> EnvironmentId {
+        let branch = Branch::new(
+            BranchName::parse(branch).unwrap(),
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
+        let mut env = Environment::new(
+            EnvironmentId(0),
+            project,
+            branch,
+            state,
+            format!("{}.example.dev", uuid_ish()),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        env.node_id = node;
+        let id = EnvironmentStore::create(store, &env).await.unwrap();
+        // `create` returns the assigned id but writes the row from the
+        // struct, so the node has to be re-read rather than assumed.
+        id
+    }
+
+    /// Distinct URLs without pulling in a uuid crate: `deploy_at` rejects a
+    /// colliding subdomain, and so should these fixtures.
+    fn uuid_ish() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!("b{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The property every upgrade depends on: after migrating, there is a
+    /// node, it is node 1, and it is this daemon.
+    #[tokio::test]
+    async fn the_migration_seeds_exactly_the_local_node() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let nodes = store.list_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, NodeId::LOCAL);
+        assert_eq!(nodes[0].name, "local");
+        assert_eq!(nodes[0].endpoint, NodeEndpoint::Local);
+        assert_eq!(nodes[0].state, NodeState::Active);
+        // No address: the proxy must keep dialling loopback, exactly as it
+        // did before nodes existed.
+        assert_eq!(nodes[0].proxy_host(), "127.0.0.1");
+    }
+
+    /// An environment that says nothing about where it lives lives here.
+    #[tokio::test]
+    async fn an_environment_defaults_to_the_local_node_and_round_trips() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let id = seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+        let loaded = EnvironmentStore::get(&store, id).await.unwrap().unwrap();
+        assert_eq!(loaded.node_id, NodeId::LOCAL);
+
+        let node = store.upsert_node(&remote("eu-1")).await.unwrap();
+        let mut moved = loaded;
+        moved.node_id = node;
+        EnvironmentStore::update(&store, &moved).await.unwrap();
+        assert_eq!(
+            EnvironmentStore::get(&store, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .node_id,
+            node,
+            "a redeploy is allowed to move a branch, and the move must persist"
+        );
+    }
+
+    fn remote(name: &str) -> Node {
+        Node::new(NodeId(0), name, NodeEndpoint::from("tcp://10.0.0.4:2376")).unwrap()
+    }
+
+    /// The reason `committed_memory_mb` gained a node at all: memory
+    /// promised on one node says nothing about whether a deploy fits on
+    /// another, and summing the fleet would refuse deploys every node had
+    /// room for.
+    #[tokio::test]
+    async fn committed_memory_is_counted_per_node() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let eu1 = store.upsert_node(&remote("eu-1")).await.unwrap();
+
+        seed_environment(
+            &store,
+            project,
+            "feature-a",
+            EnvironmentState::Running,
+            NodeId::LOCAL,
+        )
+        .await;
+        seed_environment(&store, project, "feature-b", EnvironmentState::Running, eu1).await;
+
+        assert_eq!(
+            store
+                .committed_memory_mb(512, None, NodeId::LOCAL)
+                .await
+                .unwrap(),
+            512
+        );
+        assert_eq!(
+            store.committed_memory_mb(512, None, eu1).await.unwrap(),
+            512
+        );
+    }
+
+    /// Registering a node twice corrects it — a mistyped address or a
+    /// rotated certificate path — rather than failing or duplicating it.
+    /// And it must not un-drain a node an operator is deliberately draining.
+    #[tokio::test]
+    async fn re_registering_a_node_corrects_it_without_reviving_it() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let id = store.upsert_node(&remote("eu-1")).await.unwrap();
+        store.set_node_state(id, NodeState::Draining).await.unwrap();
+
+        let mut corrected = remote("eu-1");
+        corrected.address = Some("10.0.0.9".to_owned());
+        assert_eq!(
+            store.upsert_node(&corrected).await.unwrap(),
+            id,
+            "the same name must be the same node"
+        );
+
+        let loaded = store.get_node(id).await.unwrap().unwrap();
+        assert_eq!(loaded.address.as_deref(), Some("10.0.0.9"));
+        assert_eq!(
+            loaded.state,
+            NodeState::Draining,
+            "re-registering must not silently un-drain a node"
+        );
+        assert_eq!(store.list_nodes().await.unwrap().len(), 2);
+    }
+
+    /// A half-configured TLS triple is not a usable client, and pretending
+    /// it is fails later with a message about certificates instead of about
+    /// the row that is missing a path.
+    #[tokio::test]
+    async fn partial_tls_material_reads_back_as_none() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let mut node = remote("eu-1");
+        node.tls = Some(NodeTls {
+            ca_path: "/ca.pem".to_owned(),
+            cert_path: "/cert.pem".to_owned(),
+            key_path: "/key.pem".to_owned(),
+        });
+        let id = store.upsert_node(&node).await.unwrap();
+        assert!(store.get_node(id).await.unwrap().unwrap().tls.is_some());
+
+        sqlx::query("UPDATE nodes SET tls_key_path = NULL WHERE id = ?")
+            .bind(id_as_i64(id.0))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(store.get_node(id).await.unwrap().unwrap().tls.is_none());
+    }
+
+    /// Removing a node its environments still point at would leave rows
+    /// addressing a node that no longer exists — and containers nothing
+    /// would ever reap.
+    #[tokio::test]
+    async fn a_node_still_hosting_environments_cannot_be_removed() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let eu1 = store.upsert_node(&remote("eu-1")).await.unwrap();
+        let env =
+            seed_environment(&store, project, "feature-a", EnvironmentState::Running, eu1).await;
+
+        assert!(matches!(
+            store.delete_node(eu1).await,
+            Err(RepositoryError::Conflict(_))
+        ));
+
+        // Destroying the environment is not enough, and deliberately so:
+        // `audit_events` cascades from `environments`, so the row is still
+        // holding that branch's whole audit trail.
+        let mut done = EnvironmentStore::get(&store, env).await.unwrap().unwrap();
+        done.state = EnvironmentState::Destroyed;
+        EnvironmentStore::update(&store, &done).await.unwrap();
+        assert_eq!(store.environment_count_on(eu1).await.unwrap(), (0, 1));
+        assert!(
+            matches!(
+                store.delete_node(eu1).await,
+                Err(RepositoryError::Conflict(_))
+            ),
+            "a node must not be removable while it still holds history"
+        );
+
+        EnvironmentStore::delete(&store, env).await.unwrap();
+        assert_eq!(store.environment_count_on(eu1).await.unwrap(), (0, 0));
+        store.delete_node(eu1).await.unwrap();
+    }
+
+    /// The local node is this daemon. Removing it leaves the fleet with
+    /// nowhere to put the Traefik that fronts every environment.
+    #[tokio::test]
+    async fn the_local_node_cannot_be_removed() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        assert!(matches!(
+            store.delete_node(NodeId::LOCAL).await,
+            Err(RepositoryError::Conflict(_))
+        ));
+    }
+
+    /// A probe records what it saw and touches nothing else. Marking a node
+    /// `down` must never rewrite the environments on it: a partition is
+    /// indistinguishable from a dead machine.
+    #[tokio::test]
+    async fn a_health_probe_never_touches_environment_rows() {
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let project = seed_project(&store).await;
+        let eu1 = store.upsert_node(&remote("eu-1")).await.unwrap();
+        let env =
+            seed_environment(&store, project, "feature-a", EnvironmentState::Running, eu1).await;
+
+        store
+            .record_node_health(
+                eu1,
+                HostCapacity {
+                    total_memory_bytes: 8 * 1_073_741_824,
+                    cpu_count: 4,
+                },
+                NodeState::Down,
+            )
+            .await
+            .unwrap();
+
+        let node = store.get_node(eu1).await.unwrap().unwrap();
+        assert_eq!(node.state, NodeState::Down);
+        assert_eq!(node.capacity.cpu_count, 4);
+        assert!(node.last_seen_at.is_some());
+
+        let loaded = EnvironmentStore::get(&store, env).await.unwrap().unwrap();
+        assert_eq!(loaded.state, EnvironmentState::Running);
+        assert_eq!(loaded.node_id, eu1);
     }
 
     /// The bug this closes: `LockKey::ResourcePool` is an in-process lock

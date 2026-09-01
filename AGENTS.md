@@ -24,13 +24,13 @@ Toolchain pinned in `rust-toolchain.toml` — `stable` + `clippy` + `rustfmt`. N
 
 - `resolver = "3"`, `edition = "2024"`, 3 members: `oxid-core`, `oxid-daemon`, `oxid-cli` (`Cargo.toml:1-4`).
 - Entrypoints: `crates/oxid-core/src/lib.rs` (pure domain), `crates/oxid-daemon/src/main.rs` (binary `oxidd`), `crates/oxid-cli/src/main.rs` (binary `oxid`).
-- Migrations: `crates/oxid-daemon/migrations/*.sql` (plain SQL, 9 files) — run at startup via `sqlx` (`crates/oxid-daemon/src/main.rs`).
+- Migrations: `crates/oxid-daemon/migrations/*.sql` (plain SQL, 20 files) — run at startup via `sqlx` (`crates/oxid-daemon/src/main.rs`).
 - Release profile: `opt-level=3 lto=true codegen-units=1 strip=true panic=abort` (`Cargo.toml:53-58`) — `unsafe` forbidden workspace-wide (`Cargo.toml:40`).
 
 ## Architecture (hexagonal, SPEC.md §2)
 
-- `oxid-core` — pure domain, zero I/O. Entities `Project/Branch/Environment/ResourcePool/SecretContext`, state machine `Building/Running/Paused/Hibernating/Destroyed/BuildFailed`, port traits in `domain/ports.rs` (all `#[trait_variant::make(Send)]`), services in `domain/services/` (`gc.rs`, `subdomain.rs`, `var_resolution.rs: Global→Project→Branch→Runtime`, `stack/` detection, `branch_filter.rs`, `access.rs`).
-- `oxid-daemon` — binary `oxidd`: `adapter/store.rs` (SQLite+`sqlx`, secrets AES-GCM via `adapter/crypto.rs`), `adapter/git.rs` (`git2` cached clones, optional per-project token for private repos), `adapter/oci.rs` (`bollard` on `/var/run/docker.sock`, network/Traefik bootstrap), `adapter/config.rs` (`oxid.toml`) + `compose.rs` (docker-compose.yml detection) + `postgres_pool.rs` (shared-Postgres per-branch DBs); `service/control_plane/` (`ControlPlane` split SRP: deploy/provision/lifecycle/gc/infra/admission/auth/project), `service/proxy.rs` (built-in per-branch TCP reverse proxy — stable `public_port`, zero-downtime redeploys), `service/scheduler.rs` (tokio GC tick + deploy-queue retry), `api/` (`axum` router in `mod.rs`, one file per resource in `handlers/`, `middleware.rs` auth+rate-limit+request-id, `dashboard.rs` embedded SPA).
+- `oxid-core` — pure domain, zero I/O. Entities `Project/Branch/Environment/ResourcePool/SecretContext`, state machine `Building/Running/Paused/Hibernating/Destroyed/BuildFailed`, port traits in `domain/ports.rs` (all `#[trait_variant::make(Send)]`), services in `domain/services/` (`gc.rs`, `subdomain.rs`, `var_resolution.rs: Global→Project→Branch→Runtime`, `stack/` detection, `branch_filter.rs`, `access.rs`, `placement.rs`, `routing.rs`, `tls.rs`).
+- `oxid-daemon` — binary `oxidd`: `adapter/store.rs` (SQLite+`sqlx`, secrets AES-GCM via `adapter/crypto.rs`), `adapter/git.rs` (`git2` cached clones, optional per-project token for private repos), `adapter/oci.rs` (`bollard` on `/var/run/docker.sock`, network/Traefik bootstrap), `adapter/config.rs` (`oxid.toml`) + `compose.rs` (docker-compose.yml detection) + `postgres_pool.rs` (shared-Postgres per-branch DBs); `service/control_plane/` (`ControlPlane` split SRP: deploy/provision/lifecycle/gc/infra/admission/auth/project/node), `service/fleet.rs` (`Fleet<O>`: the nodes this daemon holds a Docker client for), `service/proxy.rs` (built-in per-branch TCP reverse proxy — stable `public_port`, zero-downtime redeploys; dials a `Target { host, port }` so it also bridges to another node), `service/scheduler.rs` (tokio tick: node health probe → GC → deploy-queue retry), `api/` (`axum` router in `mod.rs`, one file per resource in `handlers/`, `middleware.rs` auth+rate-limit+request-id, `dashboard.rs` embedded SPA).
 - `oxid-cli` — thin `clap` HTTP client, no business logic (multi-context config in `cli/config.rs`).
 
 Flow: `webhook/CLI → api/ → ControlPlane::deploy → GitPort → SecretStore+var_resolution → ContainerPort(build/run/exec on_start) → EnvironmentStore/AuditStore`.
@@ -51,6 +51,8 @@ Daemon env (`crates/oxid-daemon/src/main.rs`):
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. (see `main.rs`)
 - `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required) — per-client-IP bucket on protected routes
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
+- `OXID_ALLOW_INSECURE_NODES=1` — lets a remote node register with no TLS material. Default refuses: a Docker socket over TCP is root on that box for anyone who can route to it
+- `OXID_TRAEFIK_POLL_INTERVAL` default `5s` — Traefik's re-poll of `/api/v1/traefik/config`. Not the wake latency (a sleeping branch keeps its router), only the delay before a *new* branch is routable
 
 CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. `oxid login/logout/connect/server/whoami` wrap the context config (`cli/config.rs`); `login` reads the token from stdin and verifies it against `/api/v1/me` before saving, `logout` clears the credential but keeps the address. Run: `cargo run -p oxid-daemon` / `cargo run -p oxid-cli -- <subcommand>` (e.g. `ps`, `up`, `logs -f`). Docker required for daemon (build/run/pause), not for `cargo test` (pure `oxid-core` tests are instant; `oxid-daemon` integration tests use in-memory SQLite unless `#[ignore]` Docker tests).
 
@@ -66,9 +68,24 @@ CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. `oxid 
 
 `IDEA.md` / `SPEC.md` / `DESIGN.md` are vision; `ROADMAP.md` is the granular gap code-vs-docs (50 tasks, `✅/Parcial/No existe`, wiring notes for Traefik `OXID_DOCKER_NETWORK` + `/api/v1/wake` + `/heartbeat`). Check it before building a feature they describe. `MEMORY.md` is working state, `CONTRIBUTING.md#guardrails` is hook/CI rationale. OpenCode agent squad: `.opencode/agents/*.md` (20 agents), catalog: `.opencode/AGENTS.md`.
 
+## Multi-node (`MULTINODE.md`, all four stages delivered)
+
+One control plane, N Docker endpoints — no agent. `ContainerPort` unchanged; `DockerClient::connect_to(&Node)` dispatches to `connect_with_defaults`/`connect_with_ssl`/`connect_with_http` (bollard's `ssl` feature already arrives via `buildkit`). Migration `0020` adds `nodes`, seeds node 1 (`local`) and backfills `environments.node_id` in the same file. `Environment::new` defaults to `NodeId::LOCAL`, which is what keeps every construction site compiling *and* meaning the right thing.
+
+- `Fleet<O>` is `Arc<ArcSwap<HashMap<…>>>` — `Arc` **around** the swap, since `ControlPlane` derives `Clone` and axum clones per handler.
+- `ControlPlane::new` keeps its signature and registers the given `oci` as node 1; `with_node_connector` supplies the constructor (`main.rs` passes `DockerClient::connect_to`) because building a `ContainerPort` is adapter knowledge.
+- `local_oci()` = control-plane infrastructure (Traefik, network, ACME volume). `oci_for(env.node_id)?` = anything acting on an environment; it errors rather than falling back to local.
+- `main.rs` calls `reload_fleet()` **before** `reconcile_startup_state()`.
+- `place_deploy` replaced `check_admission`: with a fleet, "does it fit" and "where" are one decision. Capacity is read live per node (the `nodes` row is the probe's cache and admission cannot use a stale number). `LockKey::Admission(NodeId)`; `committed_memory_mb` carries `AND COALESCE(node_id,1) = ?`.
+- `GET /api/v1/traefik/config` (authenticated, ETagged) serves routers from rows; services always point at `127.0.0.1:{public_port}`, never `node.address:host_port` — `host_port` changes per redeploy and the HTTP provider polls, which would reopen the gap migration `0007` closed.
+
 ## Gotchas
 
 - **Docs are part of the change.** `docs/` is a hand-written GitHub Pages site (`docs/docs/*.html`, sidebar duplicated per page) that documents what `install.sh` prints, what the stack table detects, and what each role may do. Change any of those and the page is stale.
+- **A node this daemon cannot reach never has its environments rewritten.** `reconcile_startup_state` resolves the node before deciding anything and pushes an unreachable one into `errors`; `oci.rs::container_status` answers `Missing` only on a real 404. Both halves are needed — the `Missing` branch marks rows `Destroyed`. Nothing (probe, drain, `node rm`) writes an environment row because of a node's state.
+- **`entryPoints` in `routing.rs` carries `#[serde(rename)]`.** Traefik silently ignores keys it does not know, so `entry_points` produced routers that existed, answered nothing and logged nothing. Pinned by the serialisation test.
+- **`delete_node` refuses even destroyed environments** — `audit_events` cascades from `environments`, so freeing a node would delete that branch's history as a side effect.
+- **`oxid node drain --evacuate` sets `draining` first, then redeploys.** Placement refuses a draining node even to a branch already on it, and that is what makes each redeploy *leave*. It re-reads where a branch landed **by branch, not by environment id** — a redeploy creates a new row.
 - **Two things must not be undone in `access.rs`:** an out-of-scope denial answers 404 (403 would confirm the project exists), and a scoped credential is refused any action with `project: None` — the version that also asked whether the capability *looked* project-local let a scoped maintainer write a global secret.
 - **`[deploy]` lives on the project row (migration `0016`), not in the per-commit config**, because the branch filter has to answer before the checkout — reading it from the pushed commit would do the fetch the filter exists to avoid. Only webhooks are filtered; `oxid up <branch>` never is.
 - **Image tags are lowercased in full** (`helpers.rs::image_name`). Docker refuses any other reference, so `JIRA-123` failed every deploy before that.

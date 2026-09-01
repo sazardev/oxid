@@ -218,7 +218,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = SqliteStore::open(db_path, cipher).await?;
     let git = GitClient::new();
     let oci = DockerClient::connect_from_env()?;
-    let mut cp = ControlPlane::new(store, git, oci, cache_dir);
+    let mut cp = ControlPlane::new(store, git, oci, cache_dir)
+        // How this daemon reaches a registered node. `ControlPlane` is
+        // generic over `ContainerPort` and cannot know how to *build* one,
+        // so the adapter hands it the constructor here.
+        .with_node_connector(std::sync::Arc::new(DockerClient::connect_to));
     if let Ok(network) = std::env::var("OXID_DOCKER_NETWORK") {
         let daemon_url = std::env::var("OXID_DAEMON_URL")
             .unwrap_or_else(|_| "http://oxid-daemon:8080".to_owned());
@@ -260,6 +264,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or(Some(1024))
         .filter(|&mb| mb > 0);
     cp = cp.with_admission_control(reserved_memory_mb);
+
+    // Connect to every registered node before reconciling. An environment
+    // whose node has no client is deliberately left untouched, so doing this
+    // the other way round would report every remote environment as
+    // unreachable and reconcile none of them.
+    if let Err(e) = cp.reload_fleet().await {
+        tracing::error!(error = %e, "could not read the node table");
+    }
 
     // Reconciles the database against Docker's actual state before serving
     // any request — the daemon may have been down for a while (crash,
@@ -308,6 +320,17 @@ where
 {
     let (webhook_secret, api_token, auto_token) = resolve_bootstrap_credentials(&data_dir)?;
     enforce_startup_security_posture(addr, api_token.as_ref());
+
+    // Traefik can only poll this daemon if it has a credential to present,
+    // and the routers it would get name every branch and how to reach it.
+    // A daemon with no API token therefore stays on the label provider
+    // alone — which is also the only configuration where handing out an
+    // unauthenticated route table would be the smaller of the two problems.
+    let cp = match api_token.as_ref() {
+        Some(token) => cp.with_fleet_routing(token.clone(), traefik_poll_interval()),
+        None => cp,
+    };
+
     Ok(ApiState {
         cp,
         webhook_secret,
@@ -318,6 +341,21 @@ where
         auto_token,
         bootstrap_access: oxid_daemon::api::BootstrapAccess::from_env(),
     })
+}
+
+/// How often Traefik re-polls this daemon's router table
+/// (`OXID_TRAEFIK_POLL_INTERVAL`, a Go duration).
+///
+/// Five seconds by default, matching Traefik's own. It is not the wake
+/// latency — a sleeping branch keeps its router, so the request that wakes
+/// it arrives immediately — only the delay before a *newly created* branch
+/// is routable, and shortening it buys a few seconds on a first deploy at
+/// the cost of a poll per second forever.
+fn traefik_poll_interval() -> String {
+    std::env::var("OXID_TRAEFIK_POLL_INTERVAL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "5s".to_owned())
 }
 
 /// Binds `addr` and serves `app` — plain HTTP, or HTTPS if

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapter::store::SqliteStore;
-use oxid_core::{ContainerPort, GitPort, PoolKind, ProjectId};
+use oxid_core::{ContainerPort, GitPort, NodeId, PoolKind, ProjectId};
 
 pub mod admission;
 pub mod auth;
@@ -21,11 +21,13 @@ pub mod gc;
 pub mod helpers;
 pub mod infra;
 pub mod lifecycle;
+pub mod node;
 pub mod project;
 pub mod provision;
 pub mod types;
 
 pub use error::CpError;
+pub use node::{NodeConnector, NodeView};
 pub use types::{DeployOutcome, DeployReport, GcSummary, InfraStatus, NodeStats};
 
 /// What a lifecycle operation is exclusive *against*.
@@ -46,9 +48,21 @@ pub(crate) enum LockKey {
     /// tree. Held only until the build context has been captured, never
     /// across the build itself — that is the part worth overlapping.
     GitCache(ProjectId),
-    /// Host capacity. One query, serialized node-wide so two concurrent
-    /// deploys cannot both see the same free memory and both claim it.
-    Admission,
+    /// One node's capacity. Two concurrent deploys aimed at the same node
+    /// must not both see the same free memory and both claim it.
+    ///
+    /// The lock was never the reservation, and its old comment said
+    /// otherwise. The reservation is that `committed_memory_mb` counts rows
+    /// in `building` as well as `running`, so a deploy that has passed
+    /// admission but not yet started its container is memory already
+    /// promised. All this does is stop two readers seeing the same total.
+    /// There is no reservation table, and there does not need to be.
+    ///
+    /// Keyed by node because that count is now `AND node_id = ?`: memory
+    /// committed on `eu-2` says nothing about whether a deploy fits on
+    /// `eu-1`, so making the two queue behind each other would only cost
+    /// throughput.
+    Admission(NodeId),
     /// One shared resource pool, by kind and instance name. Slots are handed
     /// out by reading which are taken and picking the lowest free one, so
     /// two branches provisioning at once would otherwise both read the same
@@ -63,7 +77,15 @@ pub(crate) enum LockKey {
 pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     store: SqliteStore,
     git: G,
-    oci: O,
+    /// Builds a Docker client for a registered node. `None` in a build
+    /// that never wired one up (the test suite), which makes registering a
+    /// remote node a clear error rather than a node nothing can reach.
+    node_connector: Option<crate::service::control_plane::node::NodeConnector<O>>,
+    /// Every node this daemon can place a container on — see
+    /// [`crate::service::fleet`]. One entry (node 1, this daemon's own
+    /// Docker socket) unless an operator registered more, which is what
+    /// makes an upgrade to a multi-node build behaviour-identical.
+    fleet: crate::service::fleet::Fleet<O>,
     cache_dir: PathBuf,
     /// Docker network shared with Traefik and this daemon. `None` (the
     /// default) falls back to publishing the container's port directly on a
@@ -80,6 +102,11 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// whose 80 is already taken by another proxy could otherwise never run
     /// the bootstrap at all.
     traefik_http_port: u16,
+    /// The bearer token Traefik presents when polling this daemon for the
+    /// fleet's routers, and how often it polls. `None` leaves Traefik on
+    /// the Docker label provider alone — which is what a daemon with no API
+    /// token has to do, since it has no credential to hand out.
+    fleet_routing: Option<(String, String)>,
     /// Automatic certificates for deployed environments, and the host port
     /// their `websecure` entrypoint is published on. `None` keeps every
     /// route on plain HTTP, which is what an install that never configured
@@ -205,12 +232,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         Self {
             store,
             git,
-            oci,
+            node_connector: None,
+            fleet: crate::service::fleet::Fleet::single(oci),
             cache_dir,
             docker_network: None,
             daemon_url: DEFAULT_DAEMON_URL.to_owned(),
             traefik_http_port: DEFAULT_TRAEFIK_HTTP_PORT,
             acme: None,
+            fleet_routing: None,
             forge_drain_lock: Arc::new(tokio::sync::Mutex::new(())),
             boot_nonce: rand::RngCore::next_u64(&mut rand::rngs::OsRng),
             lifecycle_lock: Arc::new(crate::service::keyed_lock::KeyedLocks::default()),
@@ -250,6 +279,24 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     ) -> Self {
         self.docker_network = Some(network.into());
         self.daemon_url = daemon_url.into();
+        self
+    }
+
+    /// Points Traefik's HTTP provider at this daemon, so routers come from
+    /// the database as well as from container labels.
+    ///
+    /// **Both providers stay on.** The label provider keeps routing exactly
+    /// what it routes today; the HTTP one adds the two classes of
+    /// environment labels structurally cannot describe — those on another
+    /// node, and those whose container is stopped. An upgrade that removed
+    /// the first would be a migration silently taking behaviour away.
+    #[must_use]
+    pub fn with_fleet_routing(
+        mut self,
+        api_token: impl Into<String>,
+        poll_interval: impl Into<String>,
+    ) -> Self {
+        self.fleet_routing = Some((api_token.into(), poll_interval.into()));
         self
     }
 
@@ -346,6 +393,85 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         self.redis_url = redis_url;
         self.redis_pool_size = redis_pool_size;
         self
+    }
+
+    /// Teaches this control plane how to reach a registered node.
+    ///
+    /// Separate from [`Self::new`] because constructing a `ContainerPort` is
+    /// the adapter's knowledge, not the application layer's — see
+    /// [`crate::service::control_plane::node::NodeConnector`]. Without it a
+    /// daemon runs perfectly well on its own node and refuses to register
+    /// others, which is exactly right for a build that has no way to talk
+    /// to them.
+    #[must_use]
+    pub fn with_node_connector(
+        mut self,
+        connect: crate::service::control_plane::node::NodeConnector<O>,
+    ) -> Self {
+        self.node_connector = Some(connect);
+        self
+    }
+
+    /// The fleet, for the API and the scheduler's health probe.
+    #[must_use]
+    pub const fn fleet(&self) -> &crate::service::fleet::Fleet<O> {
+        &self.fleet
+    }
+
+    /// The node `id`, or an error naming it.
+    ///
+    /// An error, never a silent fallback to the local node: dispatching a
+    /// `remove` meant for `eu-1` at this daemon's own Docker would delete a
+    /// container that happens to share the name, and dispatching a `stop`
+    /// would find nothing and report success for a container still running
+    /// somewhere else. Both are worse than a failed operation an operator
+    /// can see.
+    pub(crate) fn node(
+        &self,
+        id: NodeId,
+    ) -> Result<std::sync::Arc<crate::service::fleet::NodeHandle<O>>, CpError> {
+        self.fleet.get(id).ok_or_else(|| {
+            CpError::UnknownNode(format!(
+                "node `{id}` is not registered with this daemon — its \
+                 environments are left exactly as they are"
+            ))
+        })
+    }
+
+    /// The Docker client for node `id`.
+    pub(crate) fn oci_for(&self, id: NodeId) -> Result<std::sync::Arc<O>, CpError> {
+        Ok(std::sync::Arc::clone(&self.node(id)?.oci))
+    }
+
+    /// Where the branch proxy should send traffic for an environment.
+    ///
+    /// The node's address, or loopback when it named none — which is both
+    /// correct for the local node and literally what this dialled before
+    /// nodes existed, so a single-node install is unchanged.
+    ///
+    /// An error rather than a loopback fallback for an unknown node: sending
+    /// a remote branch's traffic at this machine's port would not fail, it
+    /// would connect to whatever else happens to be listening there.
+    pub(crate) fn proxy_target(
+        &self,
+        env: &oxid_core::Environment,
+        port: u16,
+    ) -> Result<crate::service::proxy::Target, CpError> {
+        Ok(crate::service::proxy::Target {
+            host: self.node(env.node_id)?.proxy_host().to_owned(),
+            port,
+        })
+    }
+
+    /// This daemon's own Docker client.
+    ///
+    /// For infrastructure that belongs to the *control plane* rather than to
+    /// a node: the Traefik in front of every environment, the shared Docker
+    /// network it and the daemon sit on, the ACME volume. Those live here
+    /// and nowhere else, so they are addressed here and not through
+    /// [`Self::oci_for`].
+    pub(crate) fn local_oci(&self) -> std::sync::Arc<O> {
+        std::sync::Arc::clone(&self.fleet.local().oci)
     }
 }
 

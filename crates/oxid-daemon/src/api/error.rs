@@ -87,6 +87,16 @@ impl From<CpError> for ApiError {
             }
             CpError::Validation(_) => Self::from_validation(err.to_string()),
             CpError::Proxy(_) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            // 503 for both, and never 404 or 422: the record is intact and
+            // the request is fine — the fleet is not. A 404 would tell an
+            // operator the branch is gone when its container is very
+            // probably still serving traffic, and a 422 would read as "fix
+            // your request", which is exactly what the caller must not do.
+            // Waiting is the correct response to a drain, a partition or a
+            // node that is full.
+            CpError::UnknownNode(_) | CpError::NoNodeAvailable(_) => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+            }
         }
     }
 }

@@ -8,6 +8,123 @@ is the breaking position.
 
 ### Added
 
+- **Oxid runs on more than one machine.** `oxid node add eu-1 tcp://…:2376`
+  registers a second server; from there environments are placed across the
+  fleet and nothing else about using Oxid changes. All four stages of
+  `MULTINODE.md` are delivered.
+
+  The architecture is **one control plane over N Docker endpoints**, not an
+  agent per node: the daemon keeps the database, the git cache, the secrets,
+  the audit trail and every lock, and a node is a Docker API plus an address.
+  `ContainerPort` did not change to make that work — its 22 methods already
+  took a container name, a spec or an image tag — so a second machine is a
+  second client behind the same trait rather than a second protocol, and it
+  cost no new dependency: `bollard`'s `ssl` feature was already pulled in by
+  `buildkit`. Builds run **on the node** while the checkout stays here, which
+  is why the git-cache lock needs no distributed coordination.
+
+  **Registering.** `oxid node add` connects and probes before it writes the
+  row, so a bad endpoint or a missing certificate fails while an operator is
+  watching rather than hours later on somebody else's push. A remote endpoint
+  with no TLS material is refused outright: a Docker socket over plain TCP is
+  root on that machine for anyone who can route to it, and
+  `OXID_ALLOW_INSECURE_NODES=1` is the explicit opt-in, following the
+  precedent `OXID_ALLOW_OPEN_API` set. `--address` is separate from the
+  endpoint, because the Docker API and container traffic routinely live on
+  different interfaces; the post-deploy readiness probe dials the address, so
+  a mistyped one fails the deploy instead of reporting green on a branch
+  nothing can reach.
+
+  **Placement** (`oxid_core::services::placement`, pure) is affinity first,
+  then most free memory. A redeploy stays where it is because images are not
+  distributed — each node builds its own, so a branch that moves rebuilds
+  from scratch. Affinity is a preference and not a claim: a draining,
+  unreachable or full node does not keep a branch. Admission is per node, and
+  "no room right now" is deliberately a different answer from "no node could
+  ever hold this".
+
+  **Routing.** Traefik's Docker provider only ever sees the socket it reads,
+  so it is structurally incapable of describing a container on another
+  machine. It now also polls `GET /api/v1/traefik/config`, which serves a
+  router per environment built from the database
+  (`oxid_core::services::routing`, pure; authenticated and ETagged). Both
+  providers run together — labels keep routing everything they route today.
+  A bonus falls out: a *stopped* environment now has a router of its own, so
+  the fragile lowest-priority `oxid-wake-catchall` becomes redundant. It
+  stays supported, and `oxid infra status` simply stops flagging its absence.
+
+  **Draining.** `oxid node drain eu-1` stops new placements and touches
+  nothing running. `--evacuate` moves every live branch off, one redeploy
+  each through the ordinary zero-downtime path, and rebuilds each at **the
+  commit it is running** — draining is an infrastructure operation, not a
+  licence to ship whatever was pushed since. A branch that will not build
+  stays and is named.
+
+  **A node that stops answering is marked `down` and nothing else happens to
+  it.** Its environments are not moved, destroyed or rebuilt, by the probe,
+  by the reconciler or by the GC. A partition is indistinguishable from a
+  dead machine, and acting on one is how two live copies of a branch end up
+  fighting over one URL. Removing a node is refused while any environment
+  still references it, destroyed ones included, because `audit_events`
+  cascades from environment rows.
+
+  **The two costs, in the release notes rather than discovered.** With a
+  fleet the control plane is in the data path for remote branches — a daemon
+  restart cuts their in-flight connections, where before a restart never
+  touched environment traffic at all — and it is a single point of failure
+  for deploying, waking, the GC, the API and cross-node routing. Running
+  environments keep serving throughout. A single-node install is unaffected
+  by both.
+
+  Verified against real Docker rather than only `cargo test`, which is how
+  four defects surfaced that the suite could not see: the drain route never
+  called the evacuation it reported on, registering a bad node answered 500
+  instead of 400, a remote node's `endpoint` serialised as a tagged object
+  (`oxid node ls` printed `?`), and ANSI colour consumed the state column's
+  width. The mTLS path was exercised end to end — register, build, run,
+  evacuate back, and pull the endpoint out from under a live environment.
+
+  New: `OXID_ALLOW_INSECURE_NODES`, `OXID_TRAEFIK_POLL_INTERVAL`,
+  `oxid node add|ls|drain|activate|rm`, `GET/POST /api/v1/nodes`,
+  `PATCH/DELETE /api/v1/nodes/{id}`, `GET /api/v1/traefik/config`, a per-node
+  breakdown in `oxid stats` and the dashboard, `PRODUCTION.md` §9 and
+  `docs/docs/fleet.html`.
+
+- **Every environment now records which node it runs on.** The first stage
+  of `MULTINODE.md`: Oxid still runs on exactly one server, still places
+  every deploy there, and an existing install upgrades with no configuration
+  change and no observable difference — but the rows, the locks and the
+  Docker dispatch have all stopped assuming there is only one machine.
+
+  Migration `0020` adds a `nodes` table, seeds this daemon as node 1
+  (`local`) and backfills every environment to it in the same migration, so
+  no row is ever nodeless. `Environment` gains `node_id`, defaulting to node
+  1 — which is what keeps every existing construction site, the whole test
+  suite included, both compiling and *meaning the same thing*.
+
+  `ControlPlane` holds a `Fleet` (`service/fleet.rs`) instead of a single
+  Docker client, and all 30 dispatch sites now ask for the client of a named
+  node. Infrastructure that belongs to the control plane rather than to a
+  node — Traefik, the shared network, the ACME volume — is addressed
+  explicitly as local. `ContainerPort` is unchanged: multi-node is a change
+  of cardinality, not of contract, which is the whole reason a remote Docker
+  endpoint beats writing an agent.
+
+  Admission is now per node. The lock (`LockKey::Admission(NodeId)`) never
+  was the reservation — the reservation is that `committed_memory_mb` counts
+  rows in `building` as well as `running` — and that count is now scoped
+  with `AND node_id = ?`, because memory promised on one node says nothing
+  about whether a deploy fits on another.
+
+  One behaviour genuinely changed, and it is the invariant the rest of the
+  plan rests on: **a node this daemon cannot reach never has its
+  environments rewritten.** `reconcile_startup_state` used to be free to
+  mark a `Running` row `Destroyed` when Docker reported the container
+  missing; it now resolves the node first, reports an unreachable one into
+  its error list and moves on to the next environment. A partition is
+  indistinguishable from a dead machine, and acting on one is how two live
+  copies of a branch end up fighting over a URL. Two tests carry that name.
+
 - **Automatic TLS for preview environments.** `DESIGN.md` has always shown
   `https://feature-login.local.dev` in its own example output and Oxid could
   not produce it. Setting `OXID_ACME_EMAIL` turns it on; naming a DNS

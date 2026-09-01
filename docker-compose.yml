@@ -60,6 +60,26 @@ services:
       # cutting ~1.5s off every wake that arrives before the route is gone.
       - --serversTransport.forwardingTimeouts.dialTimeout=500ms
       - --serversTransport.forwardingTimeouts.responseHeaderTimeout=5s
+      # --- fleet routing (uncomment when you run more than one node) -------
+      #
+      # The Docker provider above only ever sees *this* machine's socket, so
+      # it is structurally incapable of learning about a container on
+      # another node — and it cannot see a stopped container either, which
+      # is the whole reason `oxid-wake-catchall` exists further down. Both
+      # gaps close by having Traefik poll the daemon for a router table
+      # built from the database instead.
+      #
+      # Add it, don't swap it: the Docker provider keeps routing everything
+      # it routes today, and the two run side by side.
+      #
+      # The token must match OXID_API_TOKEN below — the document names every
+      # branch on this daemon and how to reach it, so the endpoint is
+      # authenticated like the rest of the API. It ends up on Traefik's
+      # command line and therefore in `docker inspect` on this host, which
+      # is the same exposure the daemon's own environment already has.
+      # - --providers.http.endpoint=http://oxid-daemon:8080/api/v1/traefik/config
+      # - --providers.http.headers.Authorization=Bearer ${OXID_API_TOKEN}
+      # - --providers.http.pollInterval=5s
     ports:
       # Host side only. Traefik's `web` entrypoint always listens on 80
       # inside the container; change the left number (and set
@@ -181,6 +201,14 @@ services:
       # outranks it, so this only ever sees hosts with no live container
       # behind them. Unknown hosts get the same 404 they always did, just
       # from the daemon instead of the proxy.
+      #
+      # Redundant, but not obsolete, once the HTTP provider above is on:
+      # a router built from a database row exists whether the container runs
+      # or not, so a sleeping branch is caught by its own router instead of
+      # by this one. Keep it anyway — it is still the only wake path for the
+      # label provider and for direct-publish mode, and `oxid infra status`
+      # stops treating its absence as a problem rather than stopping to
+      # support it.
       - traefik.http.routers.oxid-wake-catchall.rule=HostRegexp(`^.+$`)
       - traefik.http.routers.oxid-wake-catchall.priority=1
       # Both entrypoints, and this is load-bearing under TLS. A sleeping

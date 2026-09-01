@@ -50,12 +50,14 @@
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
         <p class="side-group">Operate</p>
+        <a href="fleet.html">Multi-node</a>
         <a href="security.html" class="current">Security &amp; hardening</a>
         <a href="#sec-surface" class="sub">Publish surface</a>
         <a href="#sec-bootstrap" class="sub">Bootstrap token</a>
         <a href="#sec-tokens" class="sub">Giving people access</a>
         <a href="#sec-webhooks" class="sub">Webhook verification</a>
         <a href="#sec-secrets" class="sub">Secrets &amp; key rotation</a>
+        <a href="#sec-nodes" class="sub">Trusting a node</a>
         <a href="#sec-checklist" class="sub">Checklist</a>
       </nav>
     </aside>
@@ -269,6 +271,34 @@ oxid audit --branch feat/login
 oxid audit --json | jq '.[] | select(.action == "destroy")'</pre>
       </section>
 
+      <section class="doc-section" id="sec-nodes">
+        <h2>Trusting a node</h2>
+        <p>
+          A <a href="fleet.html">fleet node</a> exposes its Docker API over the network, and a
+          Docker socket is root on that machine &mdash; not "root inside a container", root:
+          anything that can reach it can mount the host filesystem and start a privileged
+          container. mTLS bounds <em>who</em> can reach it. It does not bound what they can do
+          once they have.
+        </p>
+        <p>
+          So the rule is short: <strong>an Oxid node must be a machine you would already
+          trust the control plane on.</strong> Registering a remote endpoint with no TLS
+          material is refused outright; <code>OXID_ALLOW_INSECURE_NODES=1</code> is the
+          explicit opt-in, for a network you control end to end.
+        </p>
+        <p>
+          Secrets never land on a node's disk. They stay encrypted on the control plane and
+          are injected over the mTLS connection as container environment variables &mdash;
+          which are readable with <code>docker inspect</code> on that node, exactly as they
+          already are on a single machine. Worth saying rather than leaving to be discovered.
+        </p>
+        <p class="note">
+          The node's certificate paths live in the database; the <em>files</em> do not. A
+          restored backup brings back the rows and not the certificates, so back those up
+          alongside <code>secret.key</code>.
+        </p>
+      </section>
+
       <section class="doc-section" id="sec-checklist">
         <h2>Before you expose it</h2>
         <ul style="color:#c7c7ca; margin:0 0 1rem; padding-left:1.25rem; display:grid; gap:0.45rem;">
@@ -277,6 +307,7 @@ oxid audit --json | jq '.[] | select(.action == "destroy")'</pre>
           <li><code>OXID_BOOTSTRAP_TOKEN_ACCESS</code> matches your publish: <code>any</code> only while the port is private, otherwise <code>loopback</code> or <code>off</code>.</li>
           <li>TLS terminates somewhere &mdash; the daemon or a proxy in front of it.</li>
           <li>Rate limits are set if the port is reachable by anything untrusted.</li>
+          <li>Multi-node only: every node registered with TLS paths, on machines you already trust the control plane on.</li>
           <li><code>OXID_ALLOW_RESTORE</code> stays unset except while you are actually restoring.</li>
           <li>Backups run, and you have restored one at least once.</li>
         </ul>

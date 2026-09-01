@@ -2,6 +2,7 @@
 
 pub mod backup;
 pub mod control_plane;
+pub mod fleet;
 pub mod keyed_lock;
 pub mod proxy;
 pub mod refresh_coalescer;

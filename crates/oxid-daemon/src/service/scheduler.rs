@@ -21,6 +21,21 @@ where
     let mut ticker = tokio::time::interval(interval);
     loop {
         ticker.tick().await;
+
+        // Before the sweep and before the queue drain, because both of them
+        // want an up-to-date picture of which nodes are answering: placement
+        // must not send a deploy at a machine that stopped responding a
+        // minute ago, and the sweep must not report every environment on it
+        // as an error it could have known about.
+        //
+        // It records what it saw and nothing else — never an environment
+        // row. A partition is indistinguishable from a dead machine, and
+        // evicting on one is how two live copies of a branch end up
+        // fighting over a URL.
+        if let Err(err) = cp.probe_nodes().await {
+            tracing::warn!(error = %err, "node health probe failed");
+        }
+
         match cp.sweep(OffsetDateTime::now_utc()).await {
             Ok(summary) => {
                 if summary.paused > 0 || summary.hibernated > 0 || summary.destroyed > 0 {

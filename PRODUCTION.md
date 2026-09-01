@@ -5,8 +5,10 @@ The supported way to run Oxid for real work is **CLI-first**: one daemon
 dashboard ships in the same binary at no extra cost, but nothing below
 requires opening it to the world.
 
-Single-node by design — Oxid does not promise HA. Disaster recovery is
-snapshots, not replication (see [Backups & DR](#backups--dr)).
+**One control plane, any number of nodes.** Oxid runs environments on more
+than one machine (see [Scaling past one machine](#9-scaling-past-one-machine)),
+but the control plane itself is single — it does not promise HA. Disaster
+recovery is snapshots, not replication (see [Backups & DR](#backups--dr)).
 
 ---
 
@@ -240,6 +242,118 @@ and never persisted anywhere else.
 - History: `oxid audit [--branch|--project|--since|--kind]`.
 - Capacity: `oxid stats` (host memory/CPU vs committed environments).
 
+## 9. Scaling past one machine
+
+Oxid is **one control plane over N Docker endpoints**. The daemon keeps the
+database, the git cache, the secrets and the audit trail; a node is a Docker
+API plus an address, and nothing runs on it but the containers Oxid starts.
+There is no agent to install and no cluster to join.
+
+### Register a node
+
+On the node, expose Docker over mTLS (Docker's own
+[protect-access](https://docs.docker.com/engine/security/protect-access/)
+guide generates the material; the short version):
+
+```bash
+# on the node — creates ca.pem, server-cert.pem, server-key.pem,
+# cert.pem and key.pem
+dockerd --tlsverify \
+        --tlscacert=ca.pem \
+        --tlscert=server-cert.pem \
+        --tlskey=server-key.pem \
+        -H tcp://0.0.0.0:2376
+```
+
+Copy `ca.pem`, `cert.pem` and `key.pem` to **the control plane's** disk — the
+node row stores the *paths*, and the daemon reads them — then:
+
+```bash
+oxid node add eu-1 tcp://10.0.0.4:2376 \
+  --address 10.0.0.4 \
+  --tls-ca /etc/oxid/nodes/eu-1/ca.pem \
+  --tls-cert /etc/oxid/nodes/eu-1/cert.pem \
+  --tls-key /etc/oxid/nodes/eu-1/key.pem
+oxid node ls
+```
+
+`--address` is not the same thing as the endpoint, and getting it wrong is
+the most common way this goes subtly wrong. The endpoint is where the Docker
+API lives; the address is where the control plane's proxy dials the *ports
+that node publishes*. They are frequently different interfaces. Omit it and
+Oxid dials loopback — its own machine — so the branch deploys successfully
+and is unreachable. The post-deploy readiness probe uses the address, so a
+mistyped one fails the deploy honestly rather than reporting green.
+
+A remote endpoint with no TLS material is refused. A Docker socket over plain
+TCP is root on that machine for anyone who can route to it, and mTLS is the
+only thing bounding who that is. `OXID_ALLOW_INSECURE_NODES=1` overrides it,
+following the precedent `OXID_ALLOW_OPEN_API` set — use it on a network you
+control end to end, and nowhere else.
+
+### Routing across nodes
+
+Traefik's Docker provider only ever sees the socket it is reading, so it
+cannot learn about a container on another machine. Point it at the daemon as
+well:
+
+```yaml
+# docker-compose.yml, traefik service
+command:
+  # ... everything already there stays ...
+  - --providers.http.endpoint=http://oxid-daemon:8080/api/v1/traefik/config
+  - --providers.http.headers.Authorization=Bearer ${OXID_API_TOKEN}
+  - --providers.http.pollInterval=5s
+```
+
+Add it, do not swap it: both providers run together, and the Docker one keeps
+routing everything it routes today. The HTTP one supplies what labels
+structurally cannot — environments on other nodes, and environments whose
+container is stopped. That second one is a bonus: a sleeping branch now has a
+router built from its database row, so `oxid-wake-catchall` stops being the
+only thing that can wake it. Keep the catch-all anyway; it is still the wake
+path in direct-publish mode.
+
+### Placement, draining and failure
+
+- **Placement** is affinity first, then most free memory. A redeploy stays on
+  the node it is already on, because images are not distributed — each node
+  builds its own — so a branch that moves rebuilds from scratch.
+- **Draining** (`oxid node drain eu-1`) stops new environments landing there
+  and touches nothing already running. `--evacuate` additionally moves every
+  live branch off, one redeploy each through the ordinary zero-downtime path
+  (build, wait for ready, cut over, then remove). It rebuilds each branch at
+  **the commit it is running**, never at its current head.
+- **A node that stops answering** is marked `down` by the health probe and
+  receives no new work. Its environments are left exactly as they are —
+  nothing is moved, marked destroyed or rebuilt. A network partition is
+  indistinguishable from a dead machine from the control plane, and acting on
+  one is how two live copies of a branch end up fighting over a URL. A node
+  that answers again rejoins on its own, with no restart.
+- **Removing a node** is refused while any environment still points at it,
+  destroyed ones included: the audit trail hangs off environment rows, so
+  freeing the node would delete that history as a side effect.
+
+### The two costs, stated plainly
+
+1. **The control plane is in the data path.** Traffic for a branch on a remote
+   node goes Traefik → the daemon's per-branch proxy → the node. Restarting
+   `oxidd` therefore cuts in-flight connections to *remote* environments and
+   stalls new ones until the accept loops rebind at startup. On a single node
+   this is unchanged: Traefik reaches the container directly. If control-plane
+   bandwidth or its restart window becomes your limit, that is the point at
+   which a per-node agent would earn its complexity — the design leaves room
+   for one, and does not ship it before it is needed.
+2. **The control plane is a single point of failure.** Running environments
+   keep serving (containers carry `unless-stopped`, and Traefik is its own
+   container). What stops is deploying, waking, the GC, the API, and — per
+   the point above — cross-node traffic. Recovery is restore-and-restart; see
+   [Backups & DR](#backups--dr).
+
+Backups snapshot the SQLite file. That brings back the node **rows** and not
+the certificate files they name — those stay your responsibility, alongside
+`secret.key`.
+
 ## Production checklist
 
 - [ ] `OXID_DOCKER_NETWORK` set (Traefik mode) — scale-to-zero actually works
@@ -251,3 +365,6 @@ and never persisted anywhere else.
 - [ ] `OXID_BACKUP_INTERVAL_SECS` on (or Litestream sidecar running)
 - [ ] Restore drill performed once before go-live
 - [ ] `oxid doctor` green from an operator machine
+- [ ] Multi-node only: every node registered with `--address` **and** TLS paths
+- [ ] Multi-node only: Traefik's `--providers.http.*` wired (`oxid infra status` confirms)
+- [ ] Multi-node only: node certificate files backed up separately from the database

@@ -424,7 +424,7 @@ daemon real: seis pushes simultáneos, seis entornos, cola vacía.
 También entregado fuera de etapa, por ser el mismo tipo de fallo:
 la reclamación condicional de slots de pool (`5dd5113`).
 
-### Etapa 1 — Identidad de nodo, con un solo nodo todavía · **1 semana** · cero cambio de comportamiento
+### Etapa 1 — Identidad de nodo, con un solo nodo todavía · ✅ **ENTREGADA**
 
 Cada fila aprende dónde vive, mientras la respuesta siempre es «aquí».
 
@@ -451,7 +451,38 @@ Cada fila aprende dónde vive, mientras la respuesta siempre es «aquí».
 > una instalación en marcha se actualiza sin cambiar configuración y sin
 > diferencia observable. Si eso no se cumple, la etapa 1 no está hecha.
 
-### Etapa 2 — Nodos remotos · **3–4 semanas**
+**Cumplido, con una excepción que conviene decir en voz alta.** La suite pasa
+entera (492 tests, más 15 nuevos) y el comportamiento no cambia: cada deploy
+sigue cayendo en el nodo 1 y un install existente se actualiza sin tocar
+configuración. Lo que sí hubo que modificar son **dos líneas de test**, las
+que llaman a `committed_memory_mb`, porque el propio plan le añade el
+parámetro `node_id`. Ninguna aserción cambió.
+
+Tres cosas salieron distintas de lo escrito arriba, y las tres por haberlas
+probado:
+
+- **`Fleet` va envuelto en `Arc`, no sólo su `ArcSwap` interno.**
+  `ControlPlane` deriva `Clone` y axum entrega un clon nuevo a cada handler,
+  así que un `ArcSwap` copiado deja el nodo registrado por un clon invisible
+  para la siguiente petición. Lo cazó el test `clones_share_one_registry`,
+  que se escribió antes de que fallara.
+- **`reconcile_startup_state` resuelve el nodo *antes* de decidir nada.** La
+  traducción mecánica de `self.oci.` a `self.oci_for(env.node_id)?` metía un
+  `?` en mitad del bucle: un solo nodo inalcanzable abortaba la
+  reconciliación de todos los demás. Ahora el fallo va a `errors` y el bucle
+  sigue. Dos tests lo fijan, incluido
+  `an_unreachable_node_never_destroys_its_environments`.
+- **`delete_node` rechaza también los entornos ya destruidos.** No es
+  celo: `audit_events` cuelga de `environments` con `ON DELETE CASCADE`, así
+  que borrar la fila tumba de paso el rastro de auditoría de esa rama. Quitar
+  un nodo no puede ser una forma indirecta de borrar historial.
+
+Entregado además, fuera de lo listado: `CpError::UnknownNode` (503, no 404 —
+el entorno existe y muy probablemente sigue sirviendo), `record_node_health`
+y `environment_count_on` en el store, y `NodeState`/`NodeEndpoint`/`NodeTls`
+en el dominio.
+
+### Etapa 2 — Nodos remotos · ✅ **ENTREGADA**
 
 - `adapter/oci.rs`: `DockerClient::connect_to(&Node)` despachando a
   `connect_with_defaults` / `connect_with_ssl` / `connect_with_http`. Unas 40
@@ -478,7 +509,36 @@ Cada fila aprende dónde vive, mientras la respuesta siempre es «aquí».
 Al final de la etapa 2 un segundo nodo puede correr entornos, alcanzables por
 puerto en modo direct-publish. El enrutado sigue siendo manual.
 
-### Etapa 3 — Enrutado de flota · **2–3 semanas**
+**Lo que salió distinto de lo escrito:**
+
+- **`check_admission` desapareció como tal.** Se convirtió en `place_deploy`,
+  que devuelve *dónde* además de *si cabe*. Con flota las dos preguntas son
+  una: separarlas deja una ventana en la que la respuesta puede cambiar entre
+  ambas. `Admission::Fits` lleva ahora el `NodeId`.
+- **La capacidad se lee en vivo por nodo, no de la fila del sondeo.** La fila
+  es una caché con un intervalo detrás, y la admisión es el único consumidor
+  que no tolera un número viejo: un deploy admitido contra una cifra de hace
+  un minuto es un deploy admitido contra memoria que otro ya tomó.
+- **`unreachable!("admission control is off, so this never queues")` era una
+  bomba.** Con flota un deploy puede no tener sitio por razones que nada
+  tienen que ver con la memoria — todos los nodos drenando, o ninguno
+  respondiendo — y ese panic habría tumbado el daemon por un drenaje que
+  alguien inició a propósito. Ahora es `CpError::NoNodeAvailable`, 503.
+- **`add_node` conecta y sondea *antes* de escribir la fila.** El registro es
+  el único momento en que un operador está mirando; un nodo que se registra
+  en silencio y falla en el primer deploy le entrega el error horas después,
+  colgado del push de otra persona.
+- **`delete_node` rechaza también los entornos destruidos**, porque
+  `audit_events` cuelga de `environments` con `ON DELETE CASCADE`.
+- **`NodeEndpoint` se serializa como cadena plana, no como enum etiquetado.**
+  La columna almacenada es un solo `TEXT` y el CLI, el panel y cualquier
+  script leen ese mismo campo, así que `local` y `tcp://10.0.0.4:2376` tienen
+  que tener la *misma forma*. El `Serialize` derivado daba cadena a la
+  variante unitaria y objeto a la de tupla, de modo que el endpoint de un
+  nodo remoto llegaba como `{"remote":"tcp://…"}` y `oxid node ls` lo pintaba
+  como `?`. Apareció leyendo el JSON de un nodo remoto real.
+
+### Etapa 3 — Enrutado de flota · ✅ **ENTREGADA**
 
 - `oxid-core/domain/services/routing.rs::dynamic_config`, puro y testeado.
 - `GET /api/v1/traefik/config`, autenticado por bearer.
@@ -492,14 +552,76 @@ puerto en modo direct-publish. El enrutado sigue siendo manual.
   comprobaciones actuales, y deja de tratar como fatal la ausencia de
   `oxid-wake-catchall` cuando el proveedor HTTP está vivo.
 
-### Etapa 4 — Operación · **1–2 semanas**
+**Lo que salió distinto de lo escrito:**
 
-`oxid node drain` moviendo ramas por redespliegue y corte; memoria reservada
-por nodo; eventos de auditoría atribuyendo la colocación; documentación en
-`PRODUCTION.md` sobre generar certificados TLS de Docker y sobre el
-compromiso de punto único de fallo y camino de datos.
+- **`base_domain` va por entorno, no uno para todo el documento.** Es un
+  ajuste de *proyecto*: un daemon que sirve `app.example.dev` y
+  `api.otro.dev` tiene dos, y nombrar un solo comodín pediría un certificado
+  que cubre la mitad de la flota y falla en silencio con el resto.
+- **`entryPoints` lleva `#[serde(rename)]` y eso es load-bearing.** Traefik
+  ignora en silencio una clave que no reconoce, así que la versión con
+  `entry_points` producía routers que existían, no respondían y no se
+  quejaban en ningún log. Lo cazó el test que serializa el documento y
+  compara contra la forma que Traefik espera — escrito antes de fallar.
+- **El proxy dial un `Target { host, port }`, no un puerto atómico.** Los dos
+  valores tienen que cambiar juntos: un host cambiado un instante antes que
+  su puerto manda el tráfico de una rama al puerto correcto de la máquina
+  equivocada, que no es un fallo de conexión sino la aplicación de otro
+  respondiendo.
+- **`wait_until_ready` sondea `node.address`**, y eso convierte una dirección
+  mal escrita en un deploy que falla con honestidad en lugar de uno verde
+  sobre una rama inalcanzable — que era exactamente la mitigación que §8.6
+  pedía.
 
-**Total restante: aproximadamente 7–10 semanas.**
+### Etapa 4 — Operación · ✅ **ENTREGADA**
+
+`oxid node drain --evacuate` mueve las ramas por redespliegue y corte, cada
+una **en el commit que estaba corriendo** — drenar es una operación de
+infraestructura, no permiso para publicar lo que alguien haya empujado
+desde entonces. Una rama que no compila se queda donde está y se nombra: un
+nodo medio vacío es el resultado honesto, y un drenaje que reportara éxito
+dejando contenedores atrás no lo es.
+
+**Un hueco que apareció auditando qué está de verdad *llamado*:** la API ya
+mandaba el desglose por nodo en `/api/v1/stats` y el panel lo pintaba, pero
+`oxid stats` sólo imprimía el agregado — y la página de docs del CLI ya
+afirmaba lo contrario. La tabla de flota sólo aparece a partir del segundo
+nodo: con uno, la salida es exactamente la de siempre, porque una fila por
+nodo repetiría la línea de capacidad justo encima sin decir nada nuevo. La
+línea de capacidad sigue significando **la máquina del control plane**, no un
+total de la flota: convertirla en suma dejaría equivocado a cada script que
+la lee sin cambiarles una línea.
+
+Entregado además: memoria reservada por nodo (`--reserved-memory-mb`, que
+gana a `OXID_RESERVED_MEMORY_MB` para esa máquina); el evento de auditoría
+del deploy nombra el nodo **sólo cuando no es el local**, para que el
+historial de una instalación de un nodo siga siendo byte a byte el que era;
+`PRODUCTION.md` §9 con la generación de certificados y los dos costes; y
+`docs/docs/fleet.html`, nueva página del sitio público, con la barra lateral
+actualizada en las diez páginas que la duplican.
+
+**Dos defectos que sólo aparecieron ejecutándolo:**
+
+- `evacuate_node` comprobaba dónde había acabado la rama releyendo el
+  `EnvironmentId` de partida. Un redespliegue crea una fila nueva y destruye
+  la vieja, así que eso devolvía siempre el nodo que la rama acababa de
+  abandonar, y toda evacuación correcta se reportaba como fallida. Se
+  resuelve por *rama*, no por id.
+- **El handler `PATCH /api/v1/nodes/{id}` nunca llamaba a `evacuate_node`.**
+  `evacuate_node` tenía su test y funcionaba; la ruta simplemente no lo
+  invocaba. Nada fallaba: el nodo pasaba a `draining`, el CLI imprimía un
+  alegre «0 ramas movidas», y todos los contenedores se quedaban donde
+  estaban. Un test unitario del método no podía verlo. Ahora hay un test de
+  la *ruta* que sólo comprueba que la respuesta trae `moved` y `stuck` — la
+  prueba más barata posible de que el cableado existe.
+
+**Verificado contra Docker real**, no sólo con `cargo test`: dos nodos
+registrados, un repositorio git de verdad, una imagen construida, un
+contenedor sirviendo, la tabla de routers generada con su `Host()` y sus dos
+middlewares, y `oxid node drain local --evacuate` moviendo la rama del nodo 1
+al 2 **conservando el mismo `public_port` y sin dejar de responder**.
+
+**Total restante: ninguno.** Las cuatro etapas están entregadas.
 
 ---
 
@@ -520,11 +642,30 @@ sin Dockerfile, servir por Traefik, dormir por inactividad, despertar por
 petición, webhook firmado con filtro de ramas, matriz de roles, secretos que
 llegan al contenedor, suspender y reanudar— tiene que seguir pasando entero.
 
-Para las etapas 2 y 3 hace falta además un escenario de dos nodos reales. La
-forma barata: dos daemons Docker en la misma máquina, el segundo escuchando
-en TCP con certificados generados para la prueba. No es un sustituto de dos
-máquinas, pero cubre todo salvo la latencia de red y la partición — y para
-esos dos, `tc netem` da lo que falta.
+Para las etapas 2 y 3 hace falta además un escenario de dos nodos reales.
+
+**Hecho, y esto es lo que cubre.** Se generó una CA con certificados de
+servidor y de cliente, y se puso un terminador TLS con verificación de
+certificado de cliente delante del socket Docker
+(`scratchpad/tls-docker.py`, ~50 líneas de stdlib de Python). Lo que se
+prueba así es la mitad **cliente**: que `DockerClient::connect_to` negocia
+mTLS de verdad con las rutas de certificado de una fila `nodes` y luego
+habla la API de Docker sobre esa conexión. Verificado extremo a extremo:
+
+- registro del nodo por `tcp://localhost:2376` con las tres rutas TLS;
+- una CA equivocada **se rechaza** en lugar de confiarse en silencio;
+- con el nodo local drenado, un deploy real construye la imagen y arranca el
+  contenedor **a través del endpoint TLS**, y responde por HTTP;
+- `oxid node drain eu-1 --evacuate` devuelve la rama al nodo local
+  conservando el mismo `public_port` y sin dejar de responder;
+- matar el endpoint marca el nodo `down`, **deja su entorno intacto**
+  (`running`, en el nodo 2) y el siguiente deploy va al nodo vivo.
+
+Lo que **no** cubre, y conviene decirlo: un `dockerd` remoto de verdad con
+`--tlsverify` (aquí el servidor TLS es un intermediario, no el propio
+daemon), la latencia de red y la partición parcial. Para esos dos últimos,
+`tc netem` da lo que falta; para el primero, hace falta root y un segundo
+`data-root`.
 
 ---
 

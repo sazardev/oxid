@@ -203,6 +203,8 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "infra.selfWiredNot" => "This daemon's own container is NOT fully wired for wake-on-request",
         "infra.notContainerized" => "Daemon isn't running inside Docker — self-wiring check skipped",
         "infra.selfWiringUnknown" => "Could not determine this daemon's own container wiring",
+        "infra.httpProvider" => "Traefik polls this daemon for the fleet's routers at {endpoint} — environments on other nodes, and sleeping ones, are routed from the database",
+        "infra.httpProviderOff" => "Traefik routes by container labels only — fine on one node, but a second node's environments would have no route. Set OXID_API_TOKEN and point Traefik at /api/v1/traefik/config",
         // -- table headers -------------------------------------------------------------------
         "table.branch" => "BRANCH",
         "table.state" => "STATE",
@@ -220,6 +222,24 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "table.baseDomain" => "BASE DOMAIN",
         "table.stack" => "STACK",
         "table.scope" => "SCOPE",
+        "table.endpoint" => "ENDPOINT",
+        "table.address" => "ADDRESS",
+        "table.memory" => "MEMORY",
+        "table.envs" => "ENVS",
+        "table.committed" => "COMMITTED",
+        // -- fleet ---------------------------------------------------------------------------
+        "node.added" => "Node {name} registered ({cpus} CPUs, {memory})",
+        "node.draining" => "Node {name} is draining — it keeps serving what it runs and takes nothing new",
+        "node.active" => "Node {name} is active again",
+        "node.removed" => "Node {name} removed",
+        "node.disconnected" => "not connected from this daemon",
+        "node.confirmRemove" => "Remove node {name}? [y/N] ",
+        "node.aborted" => "Aborted.",
+        "node.tlsIncomplete" => "--tls-ca, --tls-cert and --tls-key go together: pass all three, or none",
+        "node.localHint" => "`local` is this daemon's own Docker; a remote node wants tcp://host:2376",
+        "node.evacuating" => "Moving every live branch off {name} — one rebuild each, with no gap in service",
+        "node.evacuated" => "{count} branch(es) moved off",
+        "node.stuck" => "environment {id} is still on the node: {reason}",
     }
 }
 
@@ -294,6 +314,8 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "infra.selfWiredNot" => "El contenedor de este daemon NO está listo para despertar bajo demanda",
         "infra.notContainerized" => "El daemon no corre dentro de Docker — se omite la comprobación de cableado",
         "infra.selfWiringUnknown" => "No se pudo determinar el cableado del contenedor de este daemon",
+        "infra.httpProvider" => "Traefik consulta a este daemon las rutas de la flota en {endpoint} — los entornos de otros nodos, y los dormidos, se enrutan desde la base de datos",
+        "infra.httpProviderOff" => "Traefik enruta sólo por etiquetas de contenedor — vale con un nodo, pero los entornos de un segundo nodo no tendrían ruta. Define OXID_API_TOKEN y apunta Traefik a /api/v1/traefik/config",
         // -- table headers -------------------------------------------------------------------
         "table.branch" => "RAMA",
         "table.state" => "ESTADO",
@@ -311,6 +333,24 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "table.baseDomain" => "DOMINIO BASE",
         "table.stack" => "STACK",
         "table.scope" => "ÁMBITO",
+        "table.endpoint" => "ENDPOINT",
+        "table.address" => "DIRECCIÓN",
+        "table.memory" => "MEMORIA",
+        "table.envs" => "ENTORNOS",
+        "table.committed" => "COMPROMETIDA",
+        // -- flota ---------------------------------------------------------------------------
+        "node.added" => "Nodo {name} registrado ({cpus} CPUs, {memory})",
+        "node.draining" => "El nodo {name} está drenando — sigue sirviendo lo que ya corre y no acepta nada nuevo",
+        "node.active" => "El nodo {name} vuelve a estar activo",
+        "node.removed" => "Nodo {name} eliminado",
+        "node.disconnected" => "sin conexión desde este daemon",
+        "node.confirmRemove" => "¿Eliminar el nodo {name}? [s/N] ",
+        "node.aborted" => "Cancelado.",
+        "node.tlsIncomplete" => "--tls-ca, --tls-cert y --tls-key van juntos: pasa las tres, o ninguna",
+        "node.localHint" => "`local` es el Docker de este propio daemon; un nodo remoto quiere tcp://host:2376",
+        "node.evacuating" => "Moviendo todas las ramas vivas fuera de {name} — una reconstrucción por rama, sin corte de servicio",
+        "node.evacuated" => "{count} rama(s) movidas",
+        "node.stuck" => "el entorno {id} sigue en el nodo: {reason}",
     }
 }
 

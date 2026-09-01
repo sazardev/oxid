@@ -4,6 +4,7 @@ pub mod deploy;
 pub mod environment;
 pub mod infra;
 pub mod lifecycle;
+pub mod node;
 pub mod project;
 pub mod secrets;
 pub mod setup;

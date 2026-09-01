@@ -163,11 +163,15 @@ fn english() -> BTreeMap<&'static str, &'static str> {
         "invalid.emptyScope" => "an empty project list would create a token that can do nothing; omit the field for full access",
         "invalid.duplicateRepo" => "more than one project is registered for `{repo}`; remove the duplicate registration so pushes route to exactly one project",
         "invalid.missingField" => "webhook payload is missing `{field}`",
+        // -- fleet ----------------------------------------------------------------------
+        "node.partialTls" => "a node needs all three of --tls-ca, --tls-cert and --tls-key, or none of them — two out of three is not a usable client",
+        "notFound.node" => "node `{id}` not found",
         // -- deploy ---------------------------------------------------------------------
         "deploy.subdomainTaken" => "branch `{branch}` resolves to `{url}`, which branch `{other}` is already using — DNS labels can't tell `/`, `_` and `.` apart from `-`. Rename one of the two branches, or destroy the other environment first.",
         "deploy.containerGone" => "container `{name}` no longer exists; redeploy this branch to recreate it",
         "deploy.notReady" => "new instance never became ready: {detail}",
         "deploy.noCapacity" => "insufficient host capacity: {detail}",
+        "deploy.noNode" => "no node in the fleet can take this deploy right now — every node is draining, unreachable or full. Check `oxid node ls`.",
         "deploy.dependencyUnconfigured" => "project `{project}` declares a `{kind}` dependency but {var} is not configured on this daemon",
         // -- webhooks -------------------------------------------------------------------------
         "webhook.noSecret" => "webhook secret is not configured; set OXID_WEBHOOK_SECRET",
@@ -202,11 +206,15 @@ fn spanish() -> BTreeMap<&'static str, &'static str> {
         "invalid.emptyScope" => "una lista de proyectos vacía crearía un token que no puede hacer nada; omite el campo para acceso total",
         "invalid.duplicateRepo" => "hay más de un proyecto registrado para `{repo}`; elimina el registro duplicado para que los pushes vayan a un solo proyecto",
         "invalid.missingField" => "al cuerpo del webhook le falta `{field}`",
+        // -- flota ----------------------------------------------------------------------
+        "node.partialTls" => "un nodo necesita las tres rutas --tls-ca, --tls-cert y --tls-key, o ninguna — dos de tres no forman un cliente utilizable",
+        "notFound.node" => "nodo `{id}` no encontrado",
         // -- deploy ---------------------------------------------------------------------
         "deploy.subdomainTaken" => "la rama `{branch}` resuelve a `{url}`, que ya usa la rama `{other}` — las etiquetas DNS no distinguen `/`, `_` ni `.` de `-`. Renombra una de las dos ramas, o destruye primero el otro entorno.",
         "deploy.containerGone" => "el contenedor `{name}` ya no existe; vuelve a desplegar esta rama para recrearlo",
         "deploy.notReady" => "la nueva instancia nunca llegó a estar lista: {detail}",
         "deploy.noCapacity" => "capacidad insuficiente en el host: {detail}",
+        "deploy.noNode" => "ningún nodo de la flota puede aceptar este despliegue ahora mismo — todos están drenando, inalcanzables o llenos. Revisa `oxid node ls`.",
         "deploy.dependencyUnconfigured" => "el proyecto `{project}` declara una dependencia `{kind}` pero {var} no está configurado en este daemon",
         // -- webhooks -------------------------------------------------------------------------
         "webhook.noSecret" => "el secreto del webhook no está configurado; define OXID_WEBHOOK_SECRET",

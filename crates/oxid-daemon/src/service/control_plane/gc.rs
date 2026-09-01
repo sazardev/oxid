@@ -153,7 +153,29 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 },
             };
             let name = resolved_container_name(&project, &env);
-            let status = match self.oci.container_status(&name).await {
+            // Resolved once, before anything is decided, and reported
+            // rather than propagated: one node this daemon holds no client
+            // for must not stop the other nodes' environments being
+            // reconciled, and it must certainly not have its own rewritten.
+            //
+            // This is the invariant that makes the whole reconciler safe on
+            // a fleet, and it has a twin one layer down: `container_status`
+            // answers `Missing` only on a real 404, mapping a connection
+            // failure to `OciError::Failure` instead. Both arms of the pair
+            // are needed — the `Missing` branch below marks an environment
+            // `Destroyed`, so a node that is merely unreachable answering
+            // "no such container" would delete every record of everything
+            // running on it, in the exact moment a partition is least
+            // distinguishable from a dead machine.
+            let handle = match self.node(env.node_id) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    errors.push((env.id, e.to_string()));
+                    continue;
+                }
+            };
+            let oci = &handle.oci;
+            let status = match oci.container_status(&name).await {
                 Ok(status) => status,
                 Err(e) => {
                     errors.push((env.id, e.to_string()));
@@ -169,7 +191,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             if env.host_port.is_none()
                 && self.docker_network.is_none()
                 && status != ContainerStatus::Missing
-                && let Ok(Some(port)) = self.oci.published_port(&name, project.config.port).await
+                && let Ok(Some(port)) = oci.published_port(&name, project.config.port).await
             {
                 env.host_port = Some(port);
                 let _ = EnvironmentStore::update(&self.store, &env).await;
@@ -199,7 +221,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     && let Some(port) = env.host_port
                 {
                     self.proxy
-                        .set_target(env.project_id, &env.branch.name, port)
+                        .set_target(
+                            env.project_id,
+                            &env.branch.name,
+                            crate::service::proxy::Target {
+                                host: handle.proxy_host().to_owned(),
+                                port,
+                            },
+                        )
                         .await;
                 }
             }
@@ -214,10 +243,10 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 // router table, so re-suspending a rebooted environment
                 // that way would silently make it unreachable again.
                 (EnvironmentState::Paused, ContainerStatus::Running) => {
-                    self.oci.stop(&name).await.map_err(CpError::from)
+                    oci.stop(&name).await.map_err(CpError::from)
                 }
                 (EnvironmentState::Running, ContainerStatus::Stopped) => {
-                    match self.oci.start(&name).await {
+                    match oci.start(&name).await {
                         Ok(()) => Ok(()),
                         Err(_) => self.mark_destroyed(&mut env).await,
                     }
@@ -279,7 +308,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `gc::evaluate` above, this is belt-and-suspenders.
         match action {
             GcAction::Pause | GcAction::Hibernate | GcAction::Destroy => {
-                if let Err(e) = self.oci.stop(&name).await {
+                if let Err(e) = self.oci_for(env.node_id)?.stop(&name).await {
                     let msg = e.to_string();
                     if matches!(e, OciError::NotFound(_))
                         || msg.contains("already stopped")
@@ -304,12 +333,15 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             }
         }
         if action == GcAction::Destroy {
-            match self.oci.remove(&name).await {
+            match self.oci_for(env.node_id)?.remove(&name).await {
                 Ok(()) | Err(OciError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+            // The image was built on the node that ran the container, and
+            // that is the only copy this fleet has: images are not
+            // distributed, each node builds its own.
             match self
-                .oci
+                .oci_for(env.node_id)?
                 .remove_image(&image_name(project, &env.branch.name))
                 .await
             {

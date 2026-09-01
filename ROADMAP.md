@@ -164,12 +164,24 @@ documentos de visión nunca lo prometieron (`SPEC.md` habla del **nodo**, en
 singular), así que no es una brecha entre código y documentos sino una
 expansión de alcance.
 
-El plan completo — inventario de lo que asume un solo nodo, decisión de
-arquitectura con sus alternativas descartadas, esquema, enrutado, modos de
-fallo y etapas con estimaciones — vive en
-[`MULTINODE.md`](MULTINODE.md). Su etapa 0 (cola de deploys reclamable de
-forma atómica) ya está entregada, porque arreglaba un fallo que muerde con
-un solo servidor.
+**Ya está entregado, las cuatro etapas.** `oxid node add eu-1
+tcp://10.0.0.4:2376` registra un segundo servidor y a partir de ahí los
+entornos se reparten. La arquitectura es **un control plane sobre N endpoints
+Docker**, sin agente: el daemon conserva la base de datos, la caché de git,
+los secretos, la auditoría y todos los bloqueos.
+
+[`MULTINODE.md`](MULTINODE.md) sigue siendo la referencia, ahora como
+registro en vez de plan: el inventario de lo que asumía un solo nodo, la
+decisión de arquitectura con sus alternativas descartadas y por qué, el
+esquema, el enrutado, los modos de fallo — y, por etapa, qué salió distinto
+de lo escrito y por qué. `PRODUCTION.md` §9 y `docs/docs/fleet.html` son la
+documentación operativa.
+
+Sigue **fuera de alcance**, y cada cosa por una razón: distribución de
+imágenes (cada nodo construye la suya; una rama que cambia de nodo
+reconstruye — lento pero correcto, y sin registry que operar), alta
+disponibilidad del control plane, migración en vivo de un contenedor,
+autoescalado y claves de secretos por nodo.
 
 ## Priorización
 

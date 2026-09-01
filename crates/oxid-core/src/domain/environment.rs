@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 use crate::domain::DomainError;
 use crate::domain::branch::Branch;
 use crate::domain::error::invalid;
+use crate::domain::node::NodeId;
 use crate::domain::project::ProjectId;
 use crate::domain::state::{EnvironmentState, EnvironmentStateError, StateTransition};
 
@@ -65,6 +66,18 @@ pub struct Environment {
     /// deterministic `oxid-{project}-{branch}` naming, which is what their
     /// real container is actually named).
     pub container_name: Option<String>,
+    /// Which node in the fleet actually runs this environment's container.
+    ///
+    /// Not optional, and never has been in practice: every install has node
+    /// 1 (`local`), seeded by migration `0020`, and rows written before that
+    /// migration are backfilled to it. A `NULL` read back afterwards means
+    /// "written by a binary older than the migration" and resolves to node 1
+    /// too — the same answer, and one that survives rolling back.
+    ///
+    /// It is the environment's, not the branch's: a redeploy is allowed to
+    /// *move* a branch to another node, and `LockKey::Branch` is what makes
+    /// that move atomic.
+    pub node_id: NodeId,
 }
 
 impl Environment {
@@ -97,6 +110,11 @@ impl Environment {
             host_port: None,
             public_port: None,
             container_name: None,
+            // Every caller that does not care — including the whole
+            // existing test suite — means "this node", and that is what
+            // node 1 is. Defaulting here rather than making the parameter
+            // explicit is what keeps an upgrade behaviour-identical.
+            node_id: NodeId::LOCAL,
         })
     }
 

@@ -72,6 +72,8 @@ struct FakeOci {
     /// listed here defaults to `Running`.
     container_statuses: Arc<Mutex<std::collections::HashMap<String, ContainerStatus>>>,
     host_capacity: Arc<Mutex<HostCapacity>>,
+    /// When set, `host_capacity` fails — a node that has stopped answering.
+    host_capacity_error: Arc<Mutex<bool>>,
     /// Docker networks `ensure_network`/`network_exists` believe exist.
     network_exists: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Whether `ensure_traefik` believes its container is already up.
@@ -238,6 +240,9 @@ impl ContainerPort for FakeOci {
             .unwrap_or(ContainerStatus::Running))
     }
     async fn host_capacity(&self) -> Result<HostCapacity, OciError> {
+        if *self.host_capacity_error.lock().unwrap() {
+            return Err(OciError::Failure("connection refused".to_owned()));
+        }
         Ok(*self.host_capacity.lock().unwrap())
     }
     async fn network_exists(&self, name: &str) -> Result<bool, OciError> {
@@ -1852,6 +1857,524 @@ async fn sweep_destroys_expired_environment() {
     assert!(calls.iter().any(|c| c.starts_with("remove:")), "{calls:?}");
 }
 
+// ---------------------------------------------------------------------------
+// fleet
+// ---------------------------------------------------------------------------
+
+/// A control plane that can register nodes, all sharing one `FakeOci`.
+///
+/// Enough for the tests about *which node a decision names*, which is most
+/// of them — what the Docker on the other end does is not the subject.
+fn cp_with_nodes(
+    cp: ControlPlane<FakeGit, FakeOci>,
+    oci: FakeOci,
+) -> ControlPlane<FakeGit, FakeOci> {
+    cp.with_node_connector(Arc::new(move |_node| Ok(oci.clone())))
+}
+
+/// A control plane where each registered node gets its **own** `FakeOci`,
+/// so one node can stop answering while the others carry on. Without this
+/// separation, "node eu-1 went down" silently also takes down the local
+/// node, and a test asserting the fleet keeps working proves nothing.
+fn cp_with_distinct_nodes(
+    cp: ControlPlane<FakeGit, FakeOci>,
+    remote: FakeOci,
+) -> ControlPlane<FakeGit, FakeOci> {
+    cp.with_node_connector(Arc::new(move |_node| Ok(remote.clone())))
+}
+
+/// A connector that always fails — a node whose endpoint is wrong, or a
+/// machine that is simply not there.
+fn cp_with_unreachable_nodes(cp: ControlPlane<FakeGit, FakeOci>) -> ControlPlane<FakeGit, FakeOci> {
+    cp.with_node_connector(Arc::new(|_node| {
+        Err(OciError::Failure("connection refused".to_owned()))
+    }))
+}
+
+/// Draining is what an operator does before emptying a machine, so it has
+/// to actually stop new work arriving — while leaving everything already
+/// there running.
+#[tokio::test]
+async fn a_drained_node_receives_no_new_deploys() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+    assert!(eu1.connected);
+
+    // With both active, the tie breaks on the lowest id: the local node.
+    let first = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.node_id, oxid_core::NodeId::LOCAL);
+
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+
+    let second = cp
+        .deploy(project.id, BranchName::parse("feature-b").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.node_id, eu1.node.id,
+        "a draining node must not be handed a new environment"
+    );
+
+    // And the branch already there is untouched.
+    let loaded = EnvironmentStore::get(&cp.store, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.state, EnvironmentState::Running);
+    assert_eq!(loaded.node_id, oxid_core::NodeId::LOCAL);
+}
+
+/// Images are not distributed: a branch that moves rebuilds from scratch.
+/// A redeploy must therefore stay where its layer cache already is, even
+/// when another node is emptier.
+#[tokio::test]
+async fn a_redeploy_stays_on_the_node_it_is_already_on() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+    let first = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.node_id, eu1.node.id);
+
+    // Node 1 is active again and is now the lower id — affinity has to win
+    // anyway, or every redeploy would drag the branch back and rebuild it.
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Active)
+        .await
+        .unwrap();
+    let second = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.node_id, eu1.node.id,
+        "a redeploy must not move a branch away from its warm image cache"
+    );
+}
+
+/// The whole reason `add_node` connects before it writes: a node in the
+/// table that nothing can reach is a node placement keeps skipping and an
+/// operator keeps having to explain.
+#[tokio::test]
+async fn registering_a_node_that_will_not_connect_changes_nothing() {
+    let cp = cp_with_unreachable_nodes(cp(FakeOci::default()).await);
+    let err = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap_err();
+    // A validation failure, not a Docker one — the difference is a 400 and
+    // not a 500, and it is not cosmetic. Everything that can go wrong at
+    // registration is the operator's input: a wrong address, a missing
+    // certificate, no TLS material at all. A 500 tells them the daemon broke
+    // and there is nothing to do but wait.
+    assert!(matches!(err, CpError::Validation(_)), "{err:?}");
+    assert_eq!(
+        cp.list_nodes().await.unwrap().len(),
+        1,
+        "a failed registration must not leave a row behind"
+    );
+}
+
+/// The probe records what it saw about the *node* and nothing about the
+/// environments on it. A partition is indistinguishable from a dead
+/// machine, and rewriting rows on one is how two live copies of a branch
+/// end up fighting over a URL.
+#[tokio::test]
+async fn a_failed_probe_marks_the_node_and_leaves_its_environments_alone() {
+    let repo = repo_dir_with_config();
+    let local = FakeOci::default();
+    // A separate fake for the remote node: the point of the test is that
+    // one node going down leaves the rest of the fleet working, which a
+    // shared client cannot demonstrate.
+    let oci = FakeOci::default();
+    let cp = cp_with_distinct_nodes(cp(local.clone()).await, oci.clone());
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(env.node_id, eu1.node.id);
+
+    // The node stops answering.
+    *oci.host_capacity_error.lock().unwrap() = true;
+    cp.probe_nodes().await.unwrap();
+
+    let node = cp.store.get_node(eu1.node.id).await.unwrap().unwrap();
+    assert_eq!(node.state, oxid_core::NodeState::Down);
+
+    let loaded = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.state,
+        EnvironmentState::Running,
+        "a node going down says nothing about the environments on it"
+    );
+    assert_eq!(loaded.node_id, eu1.node.id);
+
+    // And a node that is down takes no new work, even though its row still
+    // claims plenty of memory.
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Active)
+        .await
+        .unwrap();
+    let next = cp
+        .deploy(project.id, BranchName::parse("feature-b").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(next.node_id, oxid_core::NodeId::LOCAL);
+
+    // It comes back on its own once it answers again — no restart, no
+    // re-registration.
+    *oci.host_capacity_error.lock().unwrap() = false;
+    cp.probe_nodes().await.unwrap();
+    assert_eq!(
+        cp.store.get_node(eu1.node.id).await.unwrap().unwrap().state,
+        oxid_core::NodeState::Active
+    );
+}
+
+/// Draining and then evacuating is how a machine is emptied: every live
+/// branch is rebuilt elsewhere through the ordinary zero-downtime path, and
+/// each one is rebuilt at **the commit it was running**, not at its current
+/// head — draining a node is an infrastructure operation, not a licence to
+/// ship whatever somebody pushed since.
+#[tokio::test]
+async fn evacuating_a_node_moves_its_branches_at_the_commit_they_were_running() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+
+    // Two branches on the local node.
+    let a = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    let b = cp
+        .deploy(project.id, BranchName::parse("feature-b").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(a.node_id, oxid_core::NodeId::LOCAL);
+    assert_eq!(b.node_id, oxid_core::NodeId::LOCAL);
+    let deployed_sha = a.branch.commit_sha.clone();
+
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+    let results = cp
+        .evacuate_node(oxid_core::NodeId::LOCAL, None)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results.iter().all(|(_, failure)| failure.is_none()),
+        "{results:?}"
+    );
+
+    for branch in ["feature-a", "feature-b"] {
+        let env = cp
+            .find_environment_by_branch(project.id, &BranchName::parse(branch).unwrap())
+            .await
+            .unwrap()
+            .expect("the branch must still have a live environment");
+        assert_eq!(
+            env.node_id, eu1.node.id,
+            "{branch} should have moved off the draining node"
+        );
+        assert_eq!(
+            env.state,
+            EnvironmentState::Running,
+            "the move is a redeploy, so the branch ends up serving again"
+        );
+        assert_eq!(
+            env.branch.commit_sha, deployed_sha,
+            "an evacuation must not quietly ship a newer commit"
+        );
+    }
+}
+
+/// A branch that will not build stays where it is, and is named. A node
+/// half-emptied is the honest outcome; a drain that reported success while
+/// leaving containers behind is not.
+#[tokio::test]
+async fn a_branch_that_cannot_be_rebuilt_stays_and_is_reported() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    cp.add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    cp.set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+    *oci.fail_build_times.lock().unwrap() = 1;
+
+    let results = cp
+        .evacuate_node(oxid_core::NodeId::LOCAL, None)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, env.id);
+    assert!(
+        results[0].1.is_some(),
+        "a branch that could not move must say so, not be counted as moved"
+    );
+}
+
+/// A successful probe must not undo a drain. An operator emptying a machine
+/// does not want deploys sent back at it thirty seconds later.
+#[tokio::test]
+async fn a_probe_never_un_drains_a_node() {
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+    cp.set_node_state(eu1.node.id, oxid_core::NodeState::Draining)
+        .await
+        .unwrap();
+
+    cp.probe_nodes().await.unwrap();
+    assert_eq!(
+        cp.store.get_node(eu1.node.id).await.unwrap().unwrap().state,
+        oxid_core::NodeState::Draining
+    );
+}
+
+/// `down` is what a failed probe records, not something to assert by hand —
+/// the next tick would overwrite it anyway, so accepting it would be a
+/// setting that silently does nothing.
+#[tokio::test]
+async fn a_node_cannot_be_marked_down_by_hand() {
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let err = cp
+        .set_node_state(oxid_core::NodeId::LOCAL, oxid_core::NodeState::Down)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CpError::Validation(_)), "{err:?}");
+}
+
+/// The fleet is rebuilt from the table at startup, and a node that will not
+/// connect is skipped rather than fatal — one bad endpoint must not stop a
+/// daemon whose other nodes are serving traffic.
+#[tokio::test]
+async fn a_node_that_will_not_connect_at_startup_is_skipped_not_fatal() {
+    let oci = FakeOci::default();
+    let cp = cp_with_nodes(cp(oci.clone()).await, oci.clone());
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+
+    // A fresh daemon over the same store, this time unable to reach it.
+    let restarted = cp_with_unreachable_nodes(cp.clone());
+    restarted.fleet().deregister(eu1.node.id);
+    restarted.reload_fleet().await.unwrap();
+
+    assert!(restarted.fleet().get(eu1.node.id).is_none());
+    assert!(
+        restarted.fleet().get(oxid_core::NodeId::LOCAL).is_some(),
+        "the local node must survive another node being unreachable"
+    );
+    let listed = restarted.list_nodes().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(
+        !listed
+            .iter()
+            .find(|n| n.node.id == eu1.node.id)
+            .unwrap()
+            .connected,
+        "a node with no client must report itself as disconnected, not as gone"
+    );
+}
+
+/// Records a second node in the `nodes` table without giving the fleet a
+/// client for it — the state a daemon is in between reading the table and
+/// connecting, and the state it stays in for a node it cannot reach.
+async fn register_unreachable_node(cp: &ControlPlane<FakeGit, FakeOci>) -> oxid_core::NodeId {
+    let node = oxid_core::Node::new(
+        oxid_core::NodeId(0),
+        "eu-1",
+        oxid_core::NodeEndpoint::from("tcp://10.0.0.4:2376"),
+    )
+    .unwrap();
+    cp.store.upsert_node(&node).await.unwrap()
+}
+
+/// The invariant that makes reconciliation safe on a fleet: a node this
+/// daemon cannot reach must have its environments left *exactly* as they
+/// are.
+///
+/// A network partition and a dead machine are indistinguishable from here.
+/// The reconciler's other branch marks a `Running` row `Destroyed` when
+/// Docker says the container is missing — so if an unreachable node were
+/// allowed to resolve to "missing", every environment on the far side of a
+/// partition would have its record deleted while its container carried on
+/// serving traffic. Recovering the node would then redeploy every branch on
+/// top of the copies still running, two of each fighting over one URL.
+///
+/// Reported loudly, and nothing else touched.
+#[tokio::test]
+async fn an_unreachable_node_never_destroys_its_environments() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+
+    // A node that exists in the table but that this *process* holds no
+    // client for — what an operator sees mid-restart, after a
+    // mis-registration, or during a real partition.
+    let eu2 = register_unreachable_node(&cp).await;
+    let mut moved = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    moved.node_id = eu2;
+    EnvironmentStore::update(&cp.store, &moved).await.unwrap();
+
+    let before = oci.calls.lock().unwrap().len();
+    let errors = cp.reconcile_startup_state().await.unwrap();
+
+    assert_eq!(
+        errors.len(),
+        1,
+        "an unreachable node must be reported, not passed over: {errors:?}"
+    );
+    assert_eq!(errors[0].0, env.id);
+    assert_eq!(
+        oci.calls.lock().unwrap().len(),
+        before,
+        "nothing may be dispatched at the local Docker on behalf of another node"
+    );
+
+    let loaded = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.state,
+        EnvironmentState::Running,
+        "the row must survive its node being unreachable, untouched"
+    );
+    assert_eq!(loaded.node_id, eu2);
+}
+
+/// One unreachable node must not stop the rest of the fleet reconciling.
+#[tokio::test]
+async fn one_unreachable_node_does_not_block_the_others() {
+    let repo = repo_dir_with_config();
+    let oci = FakeOci::default();
+    let cp = cp(oci.clone()).await;
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let stranded = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    let local = cp
+        .deploy(project.id, BranchName::parse("feature-b").unwrap())
+        .await
+        .unwrap();
+
+    let eu2 = register_unreachable_node(&cp).await;
+    let mut moved = EnvironmentStore::get(&cp.store, stranded.id)
+        .await
+        .unwrap()
+        .unwrap();
+    moved.node_id = eu2;
+    EnvironmentStore::update(&cp.store, &moved).await.unwrap();
+
+    // The reachable one has drifted and does need correcting.
+    oci.container_statuses.lock().unwrap().insert(
+        format!("oxid-app-feature-b-{}", local.id.0),
+        ContainerStatus::Missing,
+    );
+
+    let errors = cp.reconcile_startup_state().await.unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0, stranded.id);
+
+    let loaded = EnvironmentStore::get(&cp.store, local.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.state,
+        EnvironmentState::Destroyed,
+        "an unreachable node must not stop the reachable ones being reconciled"
+    );
+}
+
+/// Nothing about placement is decided yet, and that is the whole point of
+/// this stage: every deploy still lands on node 1.
+#[tokio::test]
+async fn a_deploy_still_lands_on_the_local_node() {
+    let repo = repo_dir_with_config();
+    let cp = cp(FakeOci::default()).await;
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let env = cp
+        .deploy(project.id, BranchName::parse("feature-a").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(env.node_id, oxid_core::NodeId::LOCAL);
+
+    let loaded = EnvironmentStore::get(&cp.store, env.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.node_id,
+        oxid_core::NodeId::LOCAL,
+        "the node has to survive a round trip through the store"
+    );
+}
+
 #[tokio::test]
 async fn reconcile_marks_a_missing_container_destroyed() {
     let repo = repo_dir_with_config();
@@ -1950,7 +2473,10 @@ async fn reconcile_closes_out_a_deploy_a_restart_interrupted() {
     );
     // Which is the point: it no longer counts against the node's budget.
     assert_eq!(
-        cp.store.committed_memory_mb(128, None).await.unwrap(),
+        cp.store
+            .committed_memory_mb(128, None, oxid_core::NodeId::LOCAL)
+            .await
+            .unwrap(),
         0,
         "the interrupted deploy is still reserving memory"
     );

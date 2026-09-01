@@ -49,11 +49,13 @@
         <a href="#cli-session" class="sub">Connecting</a>
         <a href="#cli-lifecycle" class="sub">Lifecycle</a>
         <a href="#cli-observe" class="sub">Observation</a>
+        <a href="#cli-fleet" class="sub">Fleet</a>
         <a href="#cli-ops" class="sub">Operations</a>
         <a href="daemon.html">Daemon</a>
         <a href="api.html">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
         <p class="side-group">Operate</p>
+        <a href="fleet.html">Multi-node</a>
         <a href="security.html">Security &amp; hardening</a>
       </nav>
     </aside>
@@ -285,6 +287,74 @@ listening on 0.0.0.0:3000 ...</pre>
           <p>
             What the node has and what it is using: CPUs and memory as Docker reports them, plus a
             count per environment state. The same numbers the dashboard's top strip shows.
+            With more than one node registered, a per-node breakdown comes with it.
+          </p>
+        </article>
+      </section>
+
+      <section class="doc-section" id="cli-fleet">
+        <h2>Fleet</h2>
+        <p>
+          Oxid runs environments on more than one machine — see
+          <a href="fleet.html">Multi-node</a> for how it fits together and what it costs.
+          These commands are node-wide, so a project-scoped token is refused.
+        </p>
+
+        <article class="doc-entry">
+          <h3><code>oxid node add &lt;name&gt; &lt;endpoint&gt;</code></h3>
+          <p>
+            Registers a node, or corrects one already registered under that name. The
+            connection is made and probed before anything is written, so a bad endpoint or a
+            missing certificate fails here rather than hours later on somebody else's push.
+          </p>
+          <pre class="cmd-block">oxid node add eu-1 tcp://10.0.0.4:2376 \
+  --address 10.0.0.4 \
+  --tls-ca   /etc/oxid/nodes/eu-1/ca.pem \
+  --tls-cert /etc/oxid/nodes/eu-1/cert.pem \
+  --tls-key  /etc/oxid/nodes/eu-1/key.pem</pre>
+          <table class="docs-table">
+            <thead><tr><th>Option</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>--address &lt;host&gt;</code></td><td>Where the control plane dials the <em>ports this node publishes</em> — not the same thing as the endpoint, which is where the Docker API lives. Omit it and Oxid dials its own loopback, so the branch deploys and is unreachable.</td></tr>
+              <tr><td><code>--tls-ca</code> / <code>--tls-cert</code> / <code>--tls-key</code></td><td>Paths <strong>on the daemon's disk</strong>. All three or none. A remote endpoint without them is refused unless <code>OXID_ALLOW_INSECURE_NODES=1</code>.</td></tr>
+              <tr><td><code>--reserved-memory-mb &lt;mb&gt;</code></td><td>Memory this machine owes its own OS and daemons, overriding <code>OXID_RESERVED_MEMORY_MB</code> for this node alone.</td></tr>
+            </tbody>
+          </table>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid node ls</code></h3>
+          <p>
+            The fleet, with each node's state, memory as its Docker reports it, and how many
+            live environments it holds. A node listed <code>active</code> but not connected is
+            one whose row is fine and whose connection is not — it is called out explicitly
+            rather than left to be inferred from an empty memory column.
+          </p>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid node drain &lt;node&gt; [--evacuate]</code> · <code>oxid node activate &lt;node&gt;</code></h3>
+          <p>
+            <code>drain</code> stops new environments landing on a node and touches nothing
+            already running. <code>--evacuate</code> additionally moves every live branch off,
+            one redeploy each through the ordinary zero-downtime path — build on the new node,
+            wait for it to accept connections, cut the proxy over, then remove the old
+            container. Each branch is rebuilt at <strong>the commit it is running</strong>,
+            never at its current head. A branch that will not build stays where it is and is
+            named, so a half-emptied node is visible rather than silent.
+          </p>
+          <p class="note">
+            An evacuation is a full rebuild per branch, since images are not distributed. On a
+            busy node that is minutes, which is why it is opt-in.
+          </p>
+        </article>
+
+        <article class="doc-entry">
+          <h3><code>oxid node rm &lt;node&gt; [--force]</code></h3>
+          <p>
+            Retires a node. Refused while any environment still points at it, destroyed ones
+            included — the audit trail hangs off environment rows, so freeing the node would
+            delete that history as a side effect of an unrelated command.
           </p>
         </article>
       </section>

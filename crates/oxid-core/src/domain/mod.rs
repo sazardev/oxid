@@ -5,6 +5,7 @@ mod branch;
 mod environment;
 mod error;
 pub mod infra;
+mod node;
 pub mod ports;
 mod project;
 mod project_config;
@@ -19,9 +20,10 @@ pub use branch::{Branch, BranchName};
 pub use environment::{Environment, EnvironmentId};
 pub use error::DomainError;
 pub use infra::{
-    AcmeChallenge, AcmeConfig, Limitation, NetworkStatus, RuntimeFlavor, RuntimeInfo,
+    AcmeChallenge, AcmeConfig, HttpProvider, Limitation, NetworkStatus, RuntimeFlavor, RuntimeInfo,
     SelfWiringStatus, TraefikSpec, TraefikStatus, limitations,
 };
+pub use node::{Node, NodeEndpoint, NodeId, NodeState, NodeTls};
 pub use ports::{
     AuditFilter, AuditStore, BuildReport, BuildSpec, CommitRef, ContainerPort, ContainerSpec,
     ContainerStatus, EnvironmentStore, ForgePort, ForgeRequest, GitError, GitPort, HostCapacity,

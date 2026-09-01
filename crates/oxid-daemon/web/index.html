@@ -995,6 +995,37 @@
           </dl>
         </div>
 
+        <div class="card" x-show="fleetNodes().length">
+          <h2 x-text="t('diag.fleetTitle')"></h2>
+          <p class="muted" x-text="t('diag.fleetHint')"></p>
+          <table class="table">
+            <thead>
+              <tr>
+                <th x-text="t('diag.col.node')"></th>
+                <th x-text="t('diag.col.nodeState')"></th>
+                <th x-text="t('diag.col.nodeMemory')"></th>
+                <th x-text="t('diag.col.nodeUsed')"></th>
+                <th x-text="t('diag.col.nodeEnvs')"></th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="node in fleetNodes()" :key="node.id">
+                <tr>
+                  <td :data-label="t('diag.col.node')" class="mono" x-text="node.name"></td>
+                  <td :data-label="t('diag.col.nodeState')">
+                    <span class="badge" :class="nodeBadgeClass(node)" x-text="node.state"></span>
+                    <span class="muted" x-show="!node.connected && node.state !== 'down'"
+                          x-text="t('diag.nodeDisconnected')"></span>
+                  </td>
+                  <td :data-label="t('diag.col.nodeMemory')" class="mono" x-text="nodeMemoryLabel(node)"></td>
+                  <td :data-label="t('diag.col.nodeUsed')" class="mono" x-text="node.committed_memory_mb + ' MB'"></td>
+                  <td :data-label="t('diag.col.nodeEnvs')" class="mono" x-text="node.environments_live"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
         <div class="card">
           <h2 x-text="t('admin.infraTitle')"></h2>
           <p class="muted" x-show="infra.loading && !infra.error && !infra.status" x-text="t('admin.infraLoading')"></p>

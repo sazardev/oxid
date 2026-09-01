@@ -1454,6 +1454,148 @@ async fn token_scopes_are_normalized_on_creation() {
     );
 }
 
+/// The drain route must actually *do* the evacuation, not just set the
+/// state.
+///
+/// This is here because it once did not: `evacuate_node` had a unit test and
+/// worked perfectly, and the handler simply never called it. Nothing failed
+/// — the node went `draining`, the CLI printed a cheerful "0 branches moved
+/// off", and every container stayed exactly where it was. Only running it
+/// against a real daemon showed it. The two response fields are the cheapest
+/// possible proof that the wiring exists.
+#[tokio::test]
+async fn draining_with_evacuate_reports_what_it_moved() {
+    let app = test_app_with_token("master-secret").await;
+
+    let (status, body) = json_request_with_auth(
+        &app,
+        "PATCH",
+        "/api/v1/nodes/1",
+        json!({ "state": "draining", "evacuate": true }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["state"], "draining");
+    assert!(
+        value.get("moved").is_some_and(Value::is_array),
+        "a drain that evacuates must report which branches left: {value}"
+    );
+    assert!(
+        value.get("stuck").is_some_and(Value::is_array),
+        "and which could not: {value}"
+    );
+
+    // A plain drain touches nothing and says so with empty lists rather than
+    // absent ones, so a client can read the same shape either way.
+    let (status, body) = json_request_with_auth(
+        &app,
+        "PATCH",
+        "/api/v1/nodes/1",
+        json!({ "state": "active" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["state"], "active");
+    assert_eq!(value["moved"], json!([]));
+}
+
+/// `down` is what a failed health probe records. Accepting it by hand would
+/// be a setting the next probe silently overwrites.
+#[tokio::test]
+async fn a_node_cannot_be_marked_down_through_the_api() {
+    let app = test_app_with_token("master-secret").await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "PATCH",
+        "/api/v1/nodes/1",
+        json!({ "state": "down" }),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The local node is this daemon: removing it would leave the fleet with
+/// nowhere to put the Traefik that fronts every environment.
+#[tokio::test]
+async fn the_local_node_cannot_be_removed_through_the_api() {
+    let app = test_app_with_token("master-secret").await;
+    let (status, _) = json_request_with_auth(
+        &app,
+        "DELETE",
+        "/api/v1/nodes/1",
+        json!({}),
+        Some("master-secret"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// Traefik polls this endpoint forever, so the two things that matter are
+/// that it is not public and that a poll finding nothing changed is cheap.
+///
+/// Not public because the document names every branch on this daemon and
+/// exactly how to reach it — a route table is a map of the whole install.
+#[tokio::test]
+async fn the_traefik_router_table_is_authenticated_and_etagged() {
+    let app = test_app_with_token("master-secret").await;
+
+    let (status, _) =
+        json_request_with_auth(&app, "GET", "/api/v1/traefik/config", json!({}), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the fleet's route table must never be readable without a token"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/traefik/config")
+                .header("authorization", "Bearer master-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get("etag")
+        .expect("a polled endpoint must offer an ETag")
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // The same table again, with the hash Traefik was given: no body, no
+    // re-serialisation, and Traefik keeps exactly what it already had.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/traefik/config")
+                .header("authorization", "Bearer master-secret")
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    assert!(bytes.is_empty(), "a 304 carries no body");
+}
+
 #[tokio::test]
 async fn scoped_tokens_are_locked_out_of_node_wide_endpoints() {
     let app = test_app_with_token("master-secret").await;
@@ -1482,14 +1624,38 @@ async fn scoped_tokens_are_locked_out_of_node_wide_endpoints() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // Node-wide reads/writes: stats, infra and backups.
+    // Node-wide reads/writes: stats, infra, backups and the fleet.
+    //
+    // The fleet routes need no code of their own to be denied here — a
+    // scoped credential is refused *any* action with no project id, whatever
+    // the capability. That is the rule that stopped a scoped maintainer
+    // writing a global secret, and asserting it explicitly is what keeps a
+    // future route from quietly relying on the wrong half of it.
     for (method, uri) in [
         ("GET", "/api/v1/stats"),
         ("GET", "/api/v1/infra/status"),
         ("POST", "/api/v1/infra/bootstrap"),
         ("GET", "/api/v1/backup"),
+        ("GET", "/api/v1/nodes"),
+        ("DELETE", "/api/v1/nodes/1"),
     ] {
         let (status, _) = json_request_with_auth(&app, method, uri, json!({}), Some(&bob)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+
+    // The two that take a body get a well-formed one, so what is being
+    // asserted is the authorization and not the extractor: axum runs
+    // extractors before the handler, so a malformed body answers 422 before
+    // anything looks at the token.
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/api/v1/nodes",
+            json!({ "name": "eu-1", "endpoint": "tcp://10.0.0.4:2376" }),
+        ),
+        ("PATCH", "/api/v1/nodes/1", json!({ "state": "draining" })),
+    ] {
+        let (status, _) = json_request_with_auth(&app, method, uri, body, Some(&bob)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
     }
 }

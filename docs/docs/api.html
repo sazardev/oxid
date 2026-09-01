@@ -50,6 +50,7 @@
         <a href="api.html" class="current">HTTP API</a>
         <a href="dashboard.html">Web dashboard</a>
         <p class="side-group">Operate</p>
+        <a href="fleet.html">Multi-node</a>
         <a href="security.html">Security &amp; hardening</a>
       </nav>
     </aside>
@@ -98,6 +99,10 @@
             <tr><td><code>POST /api/v1/rotate-key</code></td><td>Zero-downtime master key rotation.</td></tr>
             <tr><td><code>GET /api/v1/backup</code>, <code>POST /api/v1/backup/restore</code></td><td>Snapshot download; staged restore (needs <code>OXID_ALLOW_RESTORE=1</code>).</td></tr>
             <tr><td><code>GET /api/v1/infra/status</code>, <code>POST /api/v1/infra/bootstrap</code></td><td>Traefik/network wiring, inspect and idempotent setup.</td></tr>
+            <tr><td><code>GET /api/v1/nodes</code> · <code>POST /api/v1/nodes</code></td><td>The <a href="fleet.html">fleet</a>: list, and register (or correct) a node. The connection is probed before the row is written.</td></tr>
+            <tr><td><code>PATCH /api/v1/nodes/{id}</code></td><td><code>{"state": "draining"}</code> stops new placements; add <code>"evacuate": true</code> to also move every live branch off by redeploying it elsewhere. <code>down</code> is refused — that is what a failed health probe records.</td></tr>
+            <tr><td><code>DELETE /api/v1/nodes/{id}</code></td><td>Retire a node. <code>409</code> while anything still references it, destroyed environments included.</td></tr>
+            <tr><td><code>GET /api/v1/traefik/config</code></td><td>Traefik's HTTP provider polls this for a router per environment, built from the database — including environments on other nodes and ones whose container is stopped, neither of which the Docker label provider can see. Authenticated and ETagged.</td></tr>
             <tr><td><code>GET /api/v1/setup/status</code></td><td>Public onboarding probe — version, <code>auth_required</code>, <code>auto_token</code>, <code>webhook_secret_configured</code>. No auth needed.</td></tr>
             <tr><td><code>GET /api/v1/setup/webhook-secret</code></td><td>Reveal webhook secret (master token required) — same trust level as backup download.</td></tr>
             <tr><td><code>GET /api/v1/setup/token</code></td><td>Hands over the <em>auto-generated</em> master token so a fresh install can self-serve. Governed by <code>OXID_BOOTSTRAP_TOKEN_ACCESS</code>: <code>loopback</code> (default) serves only callers on the daemon's own host, judged on the connection's real peer address and never on <code>X-Forwarded-For</code>; <code>any</code> serves anyone who can reach the port, for a containerized daemon whose port is published privately (what the shipped compose does); <code>off</code> disables it. Also <code>404</code> when the token was set explicitly: it never reveals one you chose.</td></tr>

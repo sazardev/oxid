@@ -24,8 +24,8 @@ use oxid_core::services::tls::{
 };
 use oxid_core::{
     AcmeChallenge, BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus,
-    HostCapacity, LogStream, NetworkStatus, OciError, RuntimeFlavor, RuntimeInfo, SelfWiringStatus,
-    TraefikSpec, TraefikStatus,
+    HostCapacity, LogStream, NetworkStatus, Node, NodeEndpoint, OciError, RuntimeFlavor,
+    RuntimeInfo, SelfWiringStatus, TraefikSpec, TraefikStatus,
 };
 
 /// Backed by a Docker connection (default socket).
@@ -66,6 +66,96 @@ impl DockerClient {
             _ => Self::connect(),
         }
     }
+
+    /// Connects to whatever Docker a fleet node names.
+    ///
+    /// This is the entire cost of running on more than one machine, and that
+    /// is the argument for it: `ContainerPort`'s 22 methods already take a
+    /// container name, a spec or an image tag, so a second server is a
+    /// second client behind the same trait rather than a second protocol.
+    /// The build in particular needs nothing: `tar_context` already streams
+    /// the context to whichever endpoint it is talking to, so the build runs
+    /// **on the node** while the git cache stays on the control plane — which
+    /// is why `LockKey::GitCache` needs no distributed coordination.
+    ///
+    /// A remote endpoint without TLS material is refused. A Docker socket
+    /// over plain TCP is root on that machine for anyone who can route to
+    /// it, and mTLS is the only thing bounding *who* that is. The escape
+    /// hatch is `OXID_ALLOW_INSECURE_NODES=1`, following the precedent
+    /// `OXID_ALLOW_OPEN_API` already set: the daemon cannot tell a lab from
+    /// a datacentre, so the operator says so and the default withholds.
+    ///
+    /// # Errors
+    /// [`OciError::Failure`] if the endpoint cannot be reached, if a remote
+    /// node names no TLS material without the override, or if a named
+    /// certificate path does not exist.
+    pub fn connect_to(node: &Node) -> Result<Self, OciError> {
+        let NodeEndpoint::Remote(addr) = &node.endpoint else {
+            // The node this daemon runs on: exactly the client it has always
+            // built, honouring `OXID_CONTAINER_HOST` and `DOCKER_HOST`.
+            return Self::connect_from_env();
+        };
+
+        match &node.tls {
+            Some(tls) => {
+                for (label, path) in [
+                    ("ca", &tls.ca_path),
+                    ("cert", &tls.cert_path),
+                    ("key", &tls.key_path),
+                ] {
+                    if !Path::new(path).exists() {
+                        return Err(OciError::Failure(format!(
+                            "node `{}`: TLS {label} file `{path}` does not exist — \
+                             the paths are read from this daemon's disk, and a \
+                             restored backup brings back the rows but not the files",
+                            node.name
+                        )));
+                    }
+                }
+                Docker::connect_with_ssl(
+                    addr,
+                    Path::new(&tls.key_path),
+                    Path::new(&tls.cert_path),
+                    Path::new(&tls.ca_path),
+                    NODE_TIMEOUT_SECS,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .map(|docker| Self { docker })
+                .map_err(map_err)
+            }
+            None if allow_insecure_nodes() => {
+                tracing::warn!(
+                    node = %node.name,
+                    endpoint = %addr,
+                    "connecting to a remote Docker over plain TCP because \
+                     OXID_ALLOW_INSECURE_NODES is set — this is root on that \
+                     machine for anyone who can reach the port"
+                );
+                Docker::connect_with_http(addr, NODE_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+                    .map(|docker| Self { docker })
+                    .map_err(map_err)
+            }
+            None => Err(OciError::Failure(format!(
+                "node `{}` at `{addr}` names no TLS material. A Docker socket over \
+                 plain TCP is root on that machine for anyone who can route to it. \
+                 Register it with --tls-ca/--tls-cert/--tls-key, or set \
+                 OXID_ALLOW_INSECURE_NODES=1 if this is a network you control end \
+                 to end",
+                node.name
+            ))),
+        }
+    }
+}
+
+/// Read/write timeout for a fleet node, in seconds. Generous because the
+/// operations behind it are a build and an image pull, not a status query —
+/// the same 120 seconds `connect_from_env` already uses for a local socket.
+const NODE_TIMEOUT_SECS: u64 = 120;
+
+/// Whether the operator has accepted an unauthenticated Docker endpoint.
+fn allow_insecure_nodes() -> bool {
+    std::env::var("OXID_ALLOW_INSECURE_NODES")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn map_err(err: bollard::errors::Error) -> OciError {
@@ -868,6 +958,74 @@ mod tests {
         let _images = client.docker.list_images::<String>(None).await.unwrap();
     }
 
+    /// `connect_to` against a real Docker, through the node path rather
+    /// than the local shortcut.
+    ///
+    /// A `local` endpoint is what every existing install has, so this is the
+    /// case that must keep working byte for byte — and the one an operator
+    /// hits when they register the control plane's own machine under a name
+    /// to make the fleet listing read sensibly.
+    #[tokio::test]
+    #[ignore = "requires a running Docker daemon"]
+    async fn connect_to_a_local_node_reaches_the_same_docker() {
+        let node = Node::new(oxid_core::NodeId::LOCAL, "local", NodeEndpoint::Local).unwrap();
+        let client = DockerClient::connect_to(&node).unwrap();
+        let capacity = client.host_capacity().await.unwrap();
+        assert!(
+            capacity.total_memory_bytes > 0,
+            "a real Docker reports real memory"
+        );
+    }
+
+    /// A remote endpoint with no TLS material is refused before any socket
+    /// is opened.
+    ///
+    /// The refusal is the security boundary, not a convenience: a Docker
+    /// socket over plain TCP is root on that machine for anyone who can
+    /// route to it, and mTLS is the only thing bounding who that is. This
+    /// needs no Docker at all, which is why it is not ignored.
+    #[test]
+    fn a_remote_node_without_tls_is_refused() {
+        let node = Node::new(
+            oxid_core::NodeId(2),
+            "eu-1",
+            NodeEndpoint::from("tcp://10.0.0.4:2376"),
+        )
+        .unwrap();
+        let err = DockerClient::connect_to(&node).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("OXID_ALLOW_INSECURE_NODES"),
+            "the refusal must name its own escape hatch: {message}"
+        );
+    }
+
+    /// A certificate path that does not exist fails at registration with a
+    /// message about the file, not later with one about TLS.
+    ///
+    /// Worth its own test because the paths are read from *this daemon's*
+    /// disk and a restored backup brings back the node rows without the
+    /// files they name — the one way a working fleet breaks on restore.
+    #[test]
+    fn a_missing_certificate_file_is_named() {
+        let mut node = Node::new(
+            oxid_core::NodeId(2),
+            "eu-1",
+            NodeEndpoint::from("tcp://10.0.0.4:2376"),
+        )
+        .unwrap();
+        node.tls = Some(oxid_core::NodeTls {
+            ca_path: "/nonexistent/ca.pem".to_owned(),
+            cert_path: "/nonexistent/cert.pem".to_owned(),
+            key_path: "/nonexistent/key.pem".to_owned(),
+        });
+        let message = DockerClient::connect_to(&node).unwrap_err().to_string();
+        assert!(
+            message.contains("/nonexistent/ca.pem"),
+            "the missing file must be named: {message}"
+        );
+    }
+
     #[test]
     #[ignore = "requires a running Docker daemon"]
     fn docker_socket_present() {
@@ -1432,6 +1590,7 @@ mod tests {
             docker_socket_path: "/var/run/docker.sock".to_owned(),
             https_port: None,
             acme: None,
+            http_provider: None,
         };
 
         let first_traefik = client.ensure_traefik(spec.clone()).await.unwrap();

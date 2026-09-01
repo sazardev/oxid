@@ -107,7 +107,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // this same environment id left one behind. `previous`'s container
         // (if any) has a *different* name and is deliberately left running
         // — it keeps serving traffic until the cutover below.
-        match self.oci.remove(&name).await {
+        match self.oci_for(env.node_id)?.remove(&name).await {
             Ok(()) | Err(OciError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
@@ -141,17 +141,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .cpu_limit_millicores
                 .or(self.default_cpu_limit_millicores),
         };
-        env.host_port = match self.oci.run(&spec).await {
+        env.host_port = match self.oci_for(env.node_id)?.run(&spec).await {
             Ok(port) => port,
             Err(e) => {
-                let _ = self.oci.remove(&name).await;
+                let _ = self.oci_for(env.node_id)?.remove(&name).await;
                 return Err(e.into());
             }
         };
 
         for command in &project.config.build.on_start {
-            if let Err(e) = self.oci.exec(&name, command).await {
-                let _ = self.oci.remove(&name).await;
+            if let Err(e) = self.oci_for(env.node_id)?.exec(&name, command).await {
+                let _ = self.oci_for(env.node_id)?.remove(&name).await;
                 return Err(e.into());
             }
         }
@@ -160,13 +160,21 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // accept connections before cutting traffic over to it — `on_start`
         // succeeding only proves those specific commands ran, not that the
         // app itself is up and listening.
+        // Probed at the node's own address, not at loopback. On a fleet
+        // those differ, and the difference is the whole check: `node.address`
+        // is supplied by an operator and verifiable nowhere else, so a
+        // mistyped one has to fail here rather than report a green deploy on
+        // a branch nothing can reach.
         if self.docker_network.is_none()
             && self.readiness_check
             && let Some(port) = env.host_port
-            && !crate::service::proxy::wait_until_ready(port, std::time::Duration::from_secs(20))
-                .await
+            && !crate::service::proxy::wait_until_ready(
+                &self.proxy_target(env, port)?,
+                std::time::Duration::from_secs(20),
+            )
+            .await
         {
-            let _ = self.oci.remove(&name).await;
+            let _ = self.oci_for(env.node_id)?.remove(&name).await;
             return Err(CpError::DeployNotReady(format!(
                 "container `{name}` did not accept connections on port {port} within 20s"
             )));
@@ -184,7 +192,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .ensure(env.project_id, branch, previous.and_then(|p| p.public_port))
                 .await?;
             env.public_port = Some(public_port);
-            self.proxy.set_target(env.project_id, branch, port).await;
+            self.proxy
+                .set_target(env.project_id, branch, self.proxy_target(env, port)?)
+                .await;
         }
 
         // Only now remove the previous instance, if this was a redeploy —
@@ -192,8 +202,24 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // cutover above.
         if let Some(prev) = previous {
             let prev_name = resolved_container_name(project, prev);
-            let _ = self.oci.remove(&prev_name).await;
+            // The previous instance may well be on a different node than
+            // the new one — a redeploy is allowed to move a branch — so it
+            // is torn down where it actually runs, not where its
+            // replacement landed.
+            let _ = self.oci_for(prev.node_id)?.remove(&prev_name).await;
         }
+
+        // Which node ran it, in the audit trail — but only when that is
+        // news. A single-node install's history stays byte-for-byte what it
+        // was, and on a fleet the one question the trail could not answer
+        // ("where did this actually go?") now has an answer attached to the
+        // event that decided it.
+        let detail = match self.node(env.node_id) {
+            Ok(handle) if handle.node.id != oxid_core::NodeId::LOCAL => {
+                format!("{name} on node `{}`", handle.node.name)
+            }
+            _ => name,
+        };
 
         let now = OffsetDateTime::now_utc();
         env.transition(StateTransition::BuildSucceeded, now)
@@ -205,7 +231,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     u64::try_from(now.unix_timestamp()).unwrap_or_default(),
                     env.id,
                     StateTransition::BuildSucceeded,
-                    Some(name),
+                    Some(detail),
                     now,
                     operator.map(str::to_owned),
                 )

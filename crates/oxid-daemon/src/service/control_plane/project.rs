@@ -44,7 +44,7 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
     /// image would waste bandwidth on every registration.
     fn prewarm_base_images(&self, project: &Project)
     where
-        O: Clone + Send + Sync + 'static,
+        O: Send + Sync + 'static,
     {
         let Some(stack) = &project.detected_stack else {
             return;
@@ -53,7 +53,12 @@ impl<G: GitPort, O: oxid_core::ContainerPort> ControlPlane<G, O> {
         if images.is_empty() {
             return;
         }
-        let oci = self.oci.clone();
+        // The control plane's own Docker, not every node's. Pre-fetching
+        // fleet-wide would fan one registration out into a pull per node,
+        // and the pull is best-effort anyway — a build on a node that has
+        // not got the layer simply pulls it, exactly as it did before any
+        // of this existed.
+        let oci = self.local_oci();
         let name = project.name.clone();
         tokio::spawn(async move {
             for image in images {

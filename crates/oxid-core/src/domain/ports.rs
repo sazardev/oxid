@@ -335,7 +335,7 @@ pub enum ContainerStatus {
 /// admission-control source of truth for whether a new deploy actually
 /// fits, since Docker already knows the real host capacity whether this
 /// daemon runs on bare metal or inside its own container on the same host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct HostCapacity {
     /// Total host memory, in bytes.
     pub total_memory_bytes: u64,

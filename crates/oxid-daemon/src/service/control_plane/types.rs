@@ -78,6 +78,43 @@ pub struct NodeStats {
     /// `[routing].port` published directly on whatever host is running the
     /// daemon. The dashboard uses this to decide which one to link to.
     pub traefik_enabled: bool,
+    /// One row per node in the fleet.
+    ///
+    /// `host_total_memory_bytes` and `host_cpu_count` above stay as they
+    /// were and keep meaning the control plane's own machine: every client,
+    /// dashboard and script reading them predates the fleet, and quietly
+    /// turning them into a sum would have made every existing reader wrong
+    /// without changing its code. The fleet is additional information, not
+    /// a redefinition of what was there.
+    ///
+    /// A single-node install gets exactly one entry, which is what it
+    /// always effectively reported.
+    #[serde(default)]
+    pub nodes: Vec<NodeUsage>,
+}
+
+/// One node's share of the fleet, for `oxid stats` and the dashboard.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NodeUsage {
+    /// Node id.
+    pub id: u64,
+    /// Operator-chosen name.
+    pub name: String,
+    /// `active`, `draining` or `down`.
+    pub state: String,
+    /// Whether this daemon currently holds a client for it. `false` with
+    /// `state: active` means the row is fine and the connection is not —
+    /// a node registered while this process could not reach it.
+    pub connected: bool,
+    /// Total memory the node's Docker reports, in bytes. Zero until a probe
+    /// has reached it.
+    pub total_memory_bytes: u64,
+    /// CPUs the node's Docker reports.
+    pub cpu_count: u32,
+    /// Memory (MB) promised to `running` and `building` environments here.
+    pub committed_memory_mb: u64,
+    /// Environments on it that are not `destroyed`.
+    pub environments_live: u64,
 }
 
 /// Bundled result of [`crate::service::control_plane::ControlPlane::infra_status`]/
@@ -114,6 +151,14 @@ pub struct InfraStatus {
     /// wake-on-request" indicator read `undefined` and therefore showed red
     /// on daemons that were perfectly wired.
     pub self_wiring_ok: bool,
+    /// The URL Traefik polls this daemon at for the fleet's routers, or
+    /// `None` when only the Docker label provider is configured.
+    ///
+    /// Worth reporting on its own rather than folding into `next_steps`,
+    /// because it changes what the *other* checks mean: with it, a missing
+    /// `oxid-wake-catchall` is a redundancy rather than a hole.
+    #[serde(default)]
+    pub http_provider: Option<String>,
     /// Human-readable, actionable instructions for whatever's missing.
     /// Empty when everything is fully wired.
     pub next_steps: Vec<String>,
@@ -136,6 +181,7 @@ impl InfraStatus {
         traefik_status: ContainerStatus,
         traefik_http_port: u16,
         self_wiring: SelfWiringStatus,
+        http_provider: Option<String>,
     ) -> Self {
         let mut next_steps = Vec::new();
         if !network_exists {
@@ -152,7 +198,24 @@ impl InfraStatus {
                 );
             }
         }
-        if !self_wiring.is_fully_wired() {
+        // The catch-all stops being mandatory once Traefik polls this
+        // daemon for its routers.
+        //
+        // It exists because a stopped container publishes no labels and
+        // therefore has no router, so nothing catches the request that
+        // should wake it — a lowest-priority router on the *daemon's own*
+        // container had to stand in. Under the HTTP provider a router comes
+        // from the environment's row and exists whether its container runs
+        // or not, so the request reaches the branch's own router, the proxy
+        // has no target, Traefik answers 502, and the `errors` middleware
+        // fires. The catch-all becomes redundant.
+        //
+        // Still reported, and deliberately still *supported*: it remains
+        // the only wake path for the label provider and for direct-publish
+        // mode, and a migration must never quietly remove behaviour that
+        // works. What changes is that it is no longer a red mark on an
+        // install that has something better.
+        if !self_wiring.is_fully_wired() && http_provider.is_none() {
             next_steps.push(format!(
                 "This daemon's own container isn't fully wired for wake-on-request. Docker \
                  can't relabel a running container without recreating it, so this can't be \
@@ -180,6 +243,7 @@ impl InfraStatus {
             traefik_http_port,
             self_wiring_ok: self_wiring.is_fully_wired(),
             self_wiring,
+            http_provider,
             next_steps,
             // Filled by `with_tls`; plain HTTP with no drift is the shape
             // every install without certificates keeps.
@@ -226,14 +290,16 @@ pub struct DeployReport {
     pub dependencies: Vec<String>,
 }
 
-/// Whether a new deploy should proceed now or wait for capacity — see
-/// [`crate::service::control_plane::ControlPlane::check_admission`].
+/// Whether a new deploy should proceed now, and where — see
+/// [`crate::service::control_plane::ControlPlane::place_deploy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Admission {
-    /// Enough host memory is free (after `reserved_memory_mb` and every
-    /// other live environment's own reservation) for this request too.
-    Fits,
-    /// Not enough room right now, but the request could fit once other
-    /// environments free memory — queue it rather than fail or overcommit.
+    /// A node has room for it. Carries which one: with a fleet, "it fits"
+    /// and "where" are one decision, and splitting them would leave a
+    /// window in which the answer could change.
+    Fits(oxid_core::NodeId),
+    /// Nowhere has room right now, but the request could fit once some
+    /// environment frees memory — queue it rather than fail or overcommit.
+    /// With one node this is the same "the host is full" it always was.
     Queue,
 }

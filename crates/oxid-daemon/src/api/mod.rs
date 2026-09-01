@@ -21,7 +21,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self as axum_middleware, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -263,8 +263,20 @@ pub fn router<
             "/api/v1/setup/webhook-secret",
             get(handlers::setup::webhook_secret),
         )
+        .route(
+            "/api/v1/nodes",
+            get(handlers::node::list_nodes).post(handlers::node::add_node),
+        )
+        .route(
+            "/api/v1/nodes/{id}",
+            patch(handlers::node::update_node).delete(handlers::node::remove_node),
+        )
         .route("/api/v1/stats", get(handlers::infra::stats))
         .route("/api/v1/infra/status", get(handlers::infra::infra_status))
+        .route(
+            "/api/v1/traefik/config",
+            get(handlers::infra::traefik_config),
+        )
         // Idempotent and safe to re-run: creates the Docker network/Traefik
         // container only if missing, otherwise a no-op that just reports
         // current status (see `ControlPlane::infra_bootstrap`).

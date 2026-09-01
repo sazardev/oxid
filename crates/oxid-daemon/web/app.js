@@ -614,6 +614,44 @@ function dashboard() {
         : this.t("project.confidence.likely");
     },
 
+    /**
+     * The fleet, or nothing.
+     *
+     * A single-node install gets no fleet section at all rather than a
+     * one-row table restating the capacity card directly above it. The
+     * section appears the moment a second node is registered, which is also
+     * the moment it starts saying something the rest of the panel does not.
+     */
+    fleetNodes() {
+      const nodes = this.stats.nodes ?? [];
+      return nodes.length > 1 ? nodes : [];
+    },
+
+    /** Bytes as a person reads them; zero means "never probed", not 0 B. */
+    nodeMemoryLabel(node) {
+      if (!node?.total_memory_bytes) {
+        return "—";
+      }
+      const gb = node.total_memory_bytes / 1_073_741_824;
+      return `${gb.toFixed(1)}G / ${node.cpu_count ?? "?"} cpu`;
+    },
+
+    /**
+     * A node's badge follows the same palette as an environment's state,
+     * with one deliberate exception: `active` but not connected is neither
+     * healthy nor down. The row is fine and the connection is not, and
+     * showing it green would hide exactly the case an operator needs to see.
+     */
+    nodeBadgeClass(node) {
+      if (node.state === "down") {
+        return "badge-build_failed";
+      }
+      if (!node.connected) {
+        return "badge-building";
+      }
+      return node.state === "draining" ? "badge-paused" : "badge-running";
+    },
+
     hostMemoryLabel() {
       if (!this.stats.host_total_memory_bytes) {
         return "—";

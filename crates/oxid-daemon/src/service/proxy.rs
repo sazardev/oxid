@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwapOption;
 use oxid_core::{BranchName, ProjectId};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -30,11 +30,33 @@ use tokio::time::sleep;
 
 type BranchKey = (ProjectId, String);
 
+/// Where a branch's traffic currently goes.
+///
+/// A host as well as a port, because a branch's container need not be on
+/// this machine: with a fleet, the control plane's proxy is what bridges a
+/// stable local port to a container published on `node.address`. For the
+/// local node the host is loopback, which is exactly what this dialled
+/// before nodes existed — so a single-node install sees no change at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// Host to dial: `127.0.0.1` for the local node, the node's address
+    /// otherwise.
+    pub host: String,
+    /// The container's published host port on that machine.
+    pub port: u16,
+}
+
 struct BranchProxy {
     public_port: u16,
-    /// `0` means "no upstream yet" — connections are dropped instead of
+    /// `None` means "no upstream yet" — connections are dropped instead of
     /// hanging, so a client sees a fast, clean failure instead of a timeout.
-    target_port: Arc<AtomicU16>,
+    ///
+    /// `ArcSwapOption` rather than an atomic port: the target is now two
+    /// values, and they must change together. A host swapped a moment
+    /// before its port would, for that moment, send a branch's traffic at
+    /// the wrong machine's right port — which is not a connection failure
+    /// but somebody else's application answering.
+    target: Arc<ArcSwapOption<Target>>,
 }
 
 /// In-memory registry of every branch's stable proxy. Not itself
@@ -87,13 +109,13 @@ impl ProxyRegistry {
                 .map_err(ProxyError)?,
         };
         let public_port = listener.local_addr().map_err(ProxyError)?.port();
-        let target_port = Arc::new(AtomicU16::new(0));
-        spawn_accept_loop(listener, Arc::clone(&target_port));
+        let target = Arc::new(ArcSwapOption::empty());
+        spawn_accept_loop(listener, Arc::clone(&target));
         proxies.insert(
             key,
             BranchProxy {
                 public_port,
-                target_port,
+                target,
             },
         );
         Ok(public_port)
@@ -104,11 +126,23 @@ impl ProxyRegistry {
     /// already accepted keep talking to whatever they were already
     /// connected to; every connection accepted from this point on goes to
     /// the new target.
-    pub async fn set_target(&self, project_id: ProjectId, branch: &BranchName, host_port: u16) {
+    pub async fn set_target(&self, project_id: ProjectId, branch: &BranchName, target: Target) {
         let key = (project_id, branch.to_string());
         if let Some(proxy) = self.proxies.lock().await.get(&key) {
-            proxy.target_port.store(host_port, Ordering::Release);
+            proxy.target.store(Some(Arc::new(target)));
         }
+    }
+
+    /// Where a branch's traffic currently goes, if anywhere. Test-facing,
+    /// and the only way to observe a cutover without opening a socket.
+    pub async fn target(&self, project_id: ProjectId, branch: &BranchName) -> Option<Target> {
+        let key = (project_id, branch.to_string());
+        self.proxies
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|proxy| proxy.target.load_full())
+            .map(|target| (*target).clone())
     }
 
     /// Clears a branch's current target (paused/hibernating/destroyed) so
@@ -116,7 +150,7 @@ impl ProxyRegistry {
     pub async fn mark_unavailable(&self, project_id: ProjectId, branch: &BranchName) {
         let key = (project_id, branch.to_string());
         if let Some(proxy) = self.proxies.lock().await.get(&key) {
-            proxy.target_port.store(0, Ordering::Release);
+            proxy.target.store(None);
         }
     }
 
@@ -130,19 +164,23 @@ impl ProxyRegistry {
     }
 }
 
-fn spawn_accept_loop(listener: TcpListener, target_port: Arc<AtomicU16>) {
+fn spawn_accept_loop(listener: TcpListener, target: Arc<ArcSwapOption<Target>>) {
     tokio::spawn(async move {
         loop {
             let Ok((mut inbound, _)) = listener.accept().await else {
                 continue;
             };
-            let target_port = Arc::clone(&target_port);
+            let target = Arc::clone(&target);
             tokio::spawn(async move {
-                let port = target_port.load(Ordering::Acquire);
-                if port == 0 {
+                // Read once, then use that one snapshot for the whole
+                // connection: a cutover mid-handshake would otherwise dial
+                // the new container with the old one's half-open state.
+                let Some(current) = target.load_full() else {
                     return;
-                }
-                let Ok(mut outbound) = TcpStream::connect(("127.0.0.1", port)).await else {
+                };
+                let Ok(mut outbound) =
+                    TcpStream::connect((current.host.as_str(), current.port)).await
+                else {
                     return;
                 };
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
@@ -156,10 +194,18 @@ fn spawn_accept_loop(listener: TcpListener, target_port: Arc<AtomicU16>) {
 /// ready" gate a zero-downtime cutover depends on — swapping the proxy at a
 /// container before it's actually listening would just move the outage
 /// instead of removing it.
-pub async fn wait_until_ready(host_port: u16, timeout: Duration) -> bool {
+/// Probing `target.host` rather than loopback is also what turns a
+/// mistyped `node.address` into an honest deploy failure instead of a green
+/// report on a branch nobody can reach: the address the operator supplied is
+/// not verifiable any other way, and this is the one moment Oxid uses it
+/// before anybody else does.
+pub async fn wait_until_ready(target: &Target, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if TcpStream::connect(("127.0.0.1", host_port)).await.is_ok() {
+        if TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .is_ok()
+        {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {

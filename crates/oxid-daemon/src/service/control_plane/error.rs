@@ -40,6 +40,24 @@ pub enum CpError {
     /// one fit, so it's rejected immediately instead of queued forever.
     #[error("insufficient host capacity: {0}")]
     InsufficientCapacity(String),
+    /// Every node in the fleet is draining, unreachable or full, so a
+    /// deploy that cannot be queued has nowhere to go.
+    ///
+    /// Distinct from [`Self::InsufficientCapacity`], which means the request
+    /// is larger than any node could ever satisfy — a configuration error
+    /// waiting will not fix. This one is transient by construction: a drain
+    /// ends, a partition heals, a branch idles out.
+    #[error("no node available: {0}")]
+    NoNodeAvailable(String),
+    /// An environment names a node this daemon holds no client for.
+    ///
+    /// Deliberately an error and never a fallback to the local node. A node
+    /// this process cannot reach — mid-restart, mis-registered, or genuinely
+    /// partitioned — must leave its environments exactly as they are: a
+    /// partition is indistinguishable from a dead machine, and acting on one
+    /// is how two live copies of a branch end up fighting over a URL.
+    #[error("unknown node: {0}")]
+    UnknownNode(String),
     /// A request was structurally valid JSON but semantically wrong
     /// (e.g. an empty project-scope list on a new API token).
     #[error("{0}")]

@@ -300,6 +300,85 @@ enum Command {
         #[command(subcommand)]
         action: InfraAction,
     },
+    /// Manage the machines environments run on.
+    ///
+    /// Oxid is one control plane over N Docker endpoints: the git cache,
+    /// the secrets and the audit trail stay on this daemon, and a node is a
+    /// Docker API plus an address. Nothing here ever touches an environment
+    /// row — draining a node or finding it unreachable says where work
+    /// should go, never what has already happened.
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NodeAction {
+    /// Register a node, or correct one already registered under this name.
+    ///
+    /// The connection is made and probed before anything is written, so a
+    /// bad endpoint or a missing certificate fails here rather than hours
+    /// later on somebody else's push.
+    Add {
+        /// Fleet-unique name (`eu-1`). Re-using one corrects that node.
+        name: String,
+        /// Docker endpoint: `tcp://10.0.0.4:2376`, or `local` for this
+        /// daemon's own socket.
+        endpoint: String,
+        /// Host the control plane's proxy dials for ports this node
+        /// publishes. Defaults to loopback, which is right for `local` and
+        /// wrong for everything else — a remote node almost always wants
+        /// this set.
+        #[arg(long)]
+        address: Option<String>,
+        /// Path *on the daemon's disk* to the CA that signed the node's
+        /// Docker certificate.
+        #[arg(long)]
+        tls_ca: Option<String>,
+        /// Path to the client certificate the control plane presents.
+        #[arg(long)]
+        tls_cert: Option<String>,
+        /// Path to the private key for `--tls-cert`.
+        #[arg(long)]
+        tls_key: Option<String>,
+        /// Memory (MB) this machine owes its OS and daemons, overriding the
+        /// daemon-wide `OXID_RESERVED_MEMORY_MB` for this node alone.
+        #[arg(long)]
+        reserved_memory_mb: Option<u64>,
+    },
+    /// List the fleet.
+    Ls,
+    /// Stop sending new environments to a node, without touching what it
+    /// already runs.
+    Drain {
+        /// Node name or id.
+        node: String,
+        /// Also move every live branch off it, by redeploying each one
+        /// elsewhere at the commit it is currently running.
+        ///
+        /// The move is the ordinary zero-downtime path — build on the new
+        /// node, wait for it to accept connections, cut the proxy over,
+        /// then remove the old container — so nothing observing a branch
+        /// sees a gap. It is a full rebuild per branch, since images are not
+        /// distributed, which is why it is opt-in.
+        #[arg(long)]
+        evacuate: bool,
+    },
+    /// Let a drained node take new environments again.
+    Activate {
+        /// Node name or id.
+        node: String,
+    },
+    /// Retire a node. Refused while it still holds environments or their
+    /// history.
+    Rm {
+        /// Node name or id.
+        node: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -899,6 +978,38 @@ async fn main() {
         Command::Infra { action } => match action {
             InfraAction::Status => cmd_infra_status(&client, &base).await,
             InfraAction::Setup => cmd_infra_setup(&client, &base).await,
+        },
+        Command::Node { action } => match action {
+            NodeAction::Add {
+                name,
+                endpoint,
+                address,
+                tls_ca,
+                tls_cert,
+                tls_key,
+                reserved_memory_mb,
+            } => {
+                cmd_node_add(
+                    &client,
+                    &base,
+                    &name,
+                    &endpoint,
+                    address.as_deref(),
+                    tls_ca.as_deref(),
+                    tls_cert.as_deref(),
+                    tls_key.as_deref(),
+                    reserved_memory_mb,
+                )
+                .await
+            }
+            NodeAction::Ls => cmd_node_ls(&client, &base).await,
+            NodeAction::Drain { node, evacuate } => {
+                cmd_node_state(&client, &base, &node, "draining", evacuate).await
+            }
+            NodeAction::Activate { node } => {
+                cmd_node_state(&client, &base, &node, "active", false).await
+            }
+            NodeAction::Rm { node, force } => cmd_node_rm(&client, &base, &node, force).await,
         },
     };
 
@@ -2587,11 +2698,46 @@ fn print_node_stats(node_stats: &Value) {
             ],
         ));
     }
+
+    // The fleet, only once there is one. A single-node install gets exactly
+    // the output it always had: one extra line per node would repeat the
+    // capacity line directly above it and say nothing new.
+    let nodes = node_stats["nodes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if nodes.len() > 1 {
+        println!(
+            "{:<16} {:<11} {:<10} {:<12} {}",
+            t("table.name"),
+            t("table.state"),
+            t("table.memory"),
+            t("table.committed"),
+            t("table.envs")
+        );
+        for node in nodes {
+            let state = node["state"].as_str().unwrap_or("?");
+            let connected = node["connected"].as_bool().unwrap_or(false);
+            println!(
+                "{:<16} {} {:<10} {:<12} {}",
+                node["name"].as_str().unwrap_or("?"),
+                colored_node_state(state, connected, STATE_WIDTH),
+                human_memory(node["total_memory_bytes"].as_u64().unwrap_or(0)),
+                format!("{} MB", node["committed_memory_mb"].as_u64().unwrap_or(0)),
+                node["environments_live"].as_u64().unwrap_or(0),
+            );
+        }
+    }
 }
 
 /// Read-only: `GET /api/v1/stats` — host capacity and running-environment
 /// count, standalone for scripts/monitoring (`--json` emits the raw
 /// object). `doctor` runs this same check as one of its diagnostics.
+///
+/// The capacity line above the table keeps meaning **the control plane's own
+/// machine**, not a fleet total. Every script and dashboard reading it
+/// predates the fleet, and quietly turning it into a sum would make each of
+/// them wrong without changing a line of their code.
 async fn cmd_stats(client: &Client, base: &str) -> Result<(), CliError> {
     let value = get_json(client, format!("{base}/api/v1/stats")).await?;
     if !emit_json(&value) {
@@ -2633,6 +2779,287 @@ async fn cmd_infra_status(client: &Client, base: &str) -> Result<(), CliError> {
     if !emit_json(&value) {
         print_infra_report(&value);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// fleet
+// ---------------------------------------------------------------------------
+
+/// Resolves what a person typed — a name or an id — to a node id.
+///
+/// Names first, because that is what an operator remembers and what every
+/// other command prints. A bare number is only treated as an id when no node
+/// is actually called that: a node named `2` is unusual but not forbidden,
+/// and silently addressing a different machine would be the worst possible
+/// way to find out.
+async fn resolve_node(client: &Client, base: &str, node: &str) -> Result<(u64, String), CliError> {
+    let list = get_json(client, format!("{base}/api/v1/nodes")).await?;
+    let nodes = list.as_array().cloned().unwrap_or_default();
+    if let Some(found) = nodes.iter().find(|n| n["name"].as_str() == Some(node)) {
+        return Ok((found["id"].as_u64().unwrap_or(0), node.to_owned()));
+    }
+    if let Ok(id) = node.parse::<u64>()
+        && let Some(found) = nodes.iter().find(|n| n["id"].as_u64() == Some(id))
+    {
+        return Ok((id, found["name"].as_str().unwrap_or(node).to_owned()));
+    }
+    Err(format!("no node named `{node}`").into())
+}
+
+/// `POST /api/v1/nodes`.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_node_add(
+    client: &Client,
+    base: &str,
+    name: &str,
+    endpoint: &str,
+    address: Option<&str>,
+    tls_ca: Option<&str>,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+    reserved_memory_mb: Option<u64>,
+) -> Result<(), CliError> {
+    // Caught here as well as on the daemon: a round trip to be told the
+    // flags go together is a round trip nobody needed.
+    let tls_given = [tls_ca, tls_cert, tls_key]
+        .iter()
+        .filter(|v| v.is_some())
+        .count();
+    if tls_given != 0 && tls_given != 3 {
+        return Err(t("node.tlsIncomplete").to_owned().into());
+    }
+
+    let mut body = json!({ "name": name, "endpoint": endpoint });
+    if let Some(address) = address {
+        body["address"] = json!(address);
+    }
+    if let (Some(ca), Some(cert), Some(key)) = (tls_ca, tls_cert, tls_key) {
+        body["tls_ca"] = json!(ca);
+        body["tls_cert"] = json!(cert);
+        body["tls_key"] = json!(key);
+    }
+    if let Some(mb) = reserved_memory_mb {
+        body["reserved_memory_mb"] = json!(mb);
+    }
+
+    let url = format!("{base}/api/v1/nodes");
+    let response = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&text, status, "registering the node failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    ok(tf(
+        "node.added",
+        &[
+            ("name", value["name"].as_str().unwrap_or(name)),
+            (
+                "cpus",
+                &value["capacity"]["cpu_count"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
+            (
+                "memory",
+                &human_memory(
+                    value["capacity"]["total_memory_bytes"]
+                        .as_u64()
+                        .unwrap_or(0),
+                ),
+            ),
+        ],
+    ));
+    if value["address"].is_null() && value["endpoint"].as_str() != Some("local") {
+        // A remote node with no address publishes ports the control plane
+        // will try to reach on loopback — its own. The deploy succeeds and
+        // the branch is unreachable, which is the failure mode hardest to
+        // read backwards from.
+        bg(t("node.localHint"));
+    }
+    Ok(())
+}
+
+/// Column width for a node's state, applied to the plain text before it is
+/// coloured — see [`colored_node_state`].
+const STATE_WIDTH: usize = 10;
+
+/// `GET /api/v1/nodes`.
+async fn cmd_node_ls(client: &Client, base: &str) -> Result<(), CliError> {
+    let value = get_json(client, format!("{base}/api/v1/nodes")).await?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    let nodes = value.as_array().cloned().unwrap_or_default();
+    println!(
+        "{:<5} {:<16} {:<26} {:<16} {:<STATE_WIDTH$} {:<10} {}",
+        t("table.id"),
+        t("table.name"),
+        t("table.endpoint"),
+        t("table.address"),
+        t("table.state"),
+        t("table.memory"),
+        t("table.envs")
+    );
+    for node in &nodes {
+        let state = node["state"].as_str().unwrap_or("?");
+        let connected = node["connected"].as_bool().unwrap_or(false);
+        println!(
+            "{:<5} {:<16} {:<26} {:<16} {} {:<10} {}",
+            node["id"].as_u64().unwrap_or(0),
+            node["name"].as_str().unwrap_or("?"),
+            node["endpoint"].as_str().unwrap_or("?"),
+            node["address"].as_str().unwrap_or("-"),
+            colored_node_state(state, connected, STATE_WIDTH),
+            human_memory(node["capacity"]["total_memory_bytes"].as_u64().unwrap_or(0)),
+            node["environments_live"].as_u64().unwrap_or(0),
+        );
+        // A row that is `active` but not connected is the confusing case:
+        // the node is fine as far as the table knows and this daemon still
+        // cannot talk to it. Saying so beats leaving it to be inferred from
+        // a memory column reading 0 B.
+        if !connected && state != "down" {
+            bg(format!("    {}", t("node.disconnected")));
+        }
+    }
+    Ok(())
+}
+
+/// Same palette as an environment state: draining is the "asleep" look,
+/// down gets attention. `active` but *not connected* gets the attention
+/// colour too — the row is fine and the connection is not, which is exactly
+/// the case green would hide.
+///
+/// Padded before it is coloured, not after. An escape sequence counts toward
+/// a format width but occupies no columns, so `{:<11}` on an already-coloured
+/// string leaves two visible characters and a table that does not line up.
+fn colored_node_state(state: &str, connected: bool, width: usize) -> String {
+    let padded = format!("{state:<width$}");
+    match state {
+        "active" if connected => format!("{GREEN}{padded}{RESET}"),
+        "draining" => format!("{GRAY}{padded}{RESET}"),
+        "down" => format!("{RED}{padded}{RESET}"),
+        _ => format!("{ORANGE}{padded}{RESET}"),
+    }
+}
+
+/// Bytes as a person reads them. Zero renders as `-`, because zero total
+/// memory always means "never probed", never a machine with no RAM.
+fn human_memory(bytes: u64) -> String {
+    if bytes == 0 {
+        return "-".to_owned();
+    }
+    // Integer tenths rather than floating point: this is a table column, no
+    // host has 2^53 bytes of RAM, and a lossy cast is one more thing for the
+    // clippy gate to be right about.
+    let tenths = bytes * 10 / 1_073_741_824;
+    if tenths >= 10 {
+        format!("{}.{} GiB", tenths / 10, tenths % 10)
+    } else {
+        format!("{} MiB", bytes / 1_048_576)
+    }
+}
+
+/// `PATCH /api/v1/nodes/{id}`.
+async fn cmd_node_state(
+    client: &Client,
+    base: &str,
+    node: &str,
+    state: &str,
+    evacuate: bool,
+) -> Result<(), CliError> {
+    let (id, name) = resolve_node(client, base, node).await?;
+    if evacuate {
+        // Said before the request, not after: an evacuation is one rebuild
+        // per branch and can run for minutes, and a silent terminal is the
+        // wrong thing to hand someone who has just started one.
+        action(tf("node.evacuating", &[("name", &name)]));
+    }
+    let url = format!("{base}/api/v1/nodes/{id}");
+    let response = client
+        .patch(&url)
+        .json(&json!({ "state": state, "evacuate": evacuate }))
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("cannot read daemon response: {e}"))?;
+    if !status.is_success() {
+        return Err(response_error(&text, status, "changing the node failed"));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("invalid daemon response: {e}"))?;
+    if emit_json(&value) {
+        return Ok(());
+    }
+    let key = if state == "draining" {
+        "node.draining"
+    } else {
+        "node.active"
+    };
+    ok(tf(key, &[("name", &name)]));
+
+    if evacuate {
+        let moved = value["moved"].as_array().map_or(0, Vec::len);
+        ok(tf("node.evacuated", &[("count", &moved.to_string())]));
+        // Named individually rather than counted: a branch that would not
+        // build is still on the node an operator believes they have
+        // emptied, and a number does not tell them which one to look at.
+        for stuck in value["stuck"].as_array().unwrap_or(&Vec::new()) {
+            bg(tf(
+                "node.stuck",
+                &[
+                    (
+                        "id",
+                        &stuck["environment_id"].as_u64().unwrap_or(0).to_string(),
+                    ),
+                    ("reason", stuck["reason"].as_str().unwrap_or("?")),
+                ],
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `DELETE /api/v1/nodes/{id}`.
+async fn cmd_node_rm(client: &Client, base: &str, node: &str, force: bool) -> Result<(), CliError> {
+    let (id, name) = resolve_node(client, base, node).await?;
+    if !force && !confirm(&tf("node.confirmRemove", &[("name", &name)])) {
+        bg(t("node.aborted"));
+        return Ok(());
+    }
+    let url = format!("{base}/api/v1/nodes/{id}");
+    let response = client
+        .delete(&url)
+        .send()
+        .await
+        .map_err(|e| connect_error(&url, &e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(response_error(&text, status, "removing the node failed"));
+    }
+    if emit_json(&json!({ "removed": name })) {
+        return Ok(());
+    }
+    ok(tf("node.removed", &[("name", &name)]));
     Ok(())
 }
 
@@ -2709,6 +3136,15 @@ fn print_infra_report(value: &Value) {
             }
         }
         _ => bg(t("infra.selfWiringUnknown")),
+    }
+
+    // Reported after the wiring, because it changes what the line above
+    // means: with the HTTP provider live, a missing catch-all is a
+    // redundancy rather than a hole — a sleeping branch is caught by its own
+    // router, built from its database row.
+    match value["http_provider"].as_str() {
+        Some(endpoint) => ok(tf("infra.httpProvider", &[("endpoint", endpoint)])),
+        None => bg(t("infra.httpProviderOff")),
     }
 
     if let Some(steps) = value["next_steps"].as_array() {

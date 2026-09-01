@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Oxid is a self-hosted control plane for ephemeral, branch-based preview environments ("the Vercel of local servers"). It detects a git push, builds an image, spins up a container, routes it, and scales it to zero (pause) after inactivity, waking it on the next request. Written entirely in Rust, `unsafe` forbidden workspace-wide.
 
-The product vision, architecture spec, and visual design language live in `IDEA.md`, `SPEC.md`, and `DESIGN.md` respectively — read those for background/rationale, not just this file. `ROADMAP.md` tracks a granular gap analysis between what those documents promise and what's actually implemented; check it before assuming a feature described in SPEC/IDEA/DESIGN exists in code. `MULTINODE.md` is the execution plan for running on more than one server; read it before touching anything in the single-node inventory it lists — the keyed locks, the deploy queue, admission, the proxy's hardcoded `127.0.0.1`, or `Environment`'s lack of a node column. `AGENTS.md` is a denser, more exhaustive agent-oriented reference (exact line numbers, hook/CI internals, gotchas) — consult it when this file isn't specific enough.
+The product vision, architecture spec, and visual design language live in `IDEA.md`, `SPEC.md`, and `DESIGN.md` respectively — read those for background/rationale, not just this file. `ROADMAP.md` tracks a granular gap analysis between what those documents promise and what's actually implemented; check it before assuming a feature described in SPEC/IDEA/DESIGN exists in code. `MULTINODE.md` was the execution plan for running on more than one server and is now the record of it: **all four stages are delivered**, so read it for the reasoning (why one control plane over N Docker endpoints, why not an agent, why not HA) rather than as a to-do list. `AGENTS.md` is a denser, more exhaustive agent-oriented reference (exact line numbers, hook/CI internals, gotchas) — consult it when this file isn't specific enough.
 
 ## Commands
 
@@ -40,6 +40,8 @@ Daemon configuration is via environment variables (see `crates/oxid-daemon/src/m
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
 - `OXID_DB_MAX_CONNECTIONS` (default 8) — SQLite pool size. WAL lets readers and the writer proceed in parallel, so the read-heavy hot paths (the `forwardAuth` heartbeat on every request, dashboard polling, `oxid status`) overlap instead of queueing. Writes still serialize — that is SQLite — so `busy_timeout`/`acquire_timeout` are set explicitly
 - `OXID_TRAEFIK_HTTP_PORT` (default 80) — host port `oxid infra setup` publishes the built-in Traefik on. Traefik always listens on 80 *inside* its container; only the host side is configurable, so a machine whose 80 is already taken can still bootstrap
+- `OXID_ALLOW_INSECURE_NODES` — `1` lets a remote node be registered with no TLS material. A Docker socket over plain TCP is root on that machine for anyone who can route to it, so the default refuses; this follows the precedent `OXID_ALLOW_OPEN_API` set
+- `OXID_TRAEFIK_POLL_INTERVAL` (default `5s`) — how often Traefik re-polls `/api/v1/traefik/config`. Not the wake latency (a sleeping branch keeps its router), only the delay before a newly created branch is routable
 - `OXID_DOCKER_NETWORK` / `OXID_DEFAULT_MEMORY_LIMIT_MB` etc. — see `main.rs`
 
 CLI targets the daemon via `OXID_API` (default `http://127.0.0.1:8080`) and `OXID_API_TOKEN`. Docker is required for the daemon (build/run/pause) but not for `cargo test` — `oxid-core` tests are pure and instant; `oxid-daemon` integration tests use in-memory SQLite unless marked `#[ignore]` (Docker-dependent).
@@ -56,8 +58,10 @@ Hexagonal / ports-and-adapters, split across three crates:
   - `adapter/git.rs` — `git2`-based cached clones and detached-head checkouts (optional per-project token for private repos).
   - `adapter/oci.rs` — Docker orchestration via `bollard` (build/run/pause/unpause/stop/remove/logs/exec) plus network/Traefik bootstrap.
   - `adapter/config.rs` — parses per-project `oxid.toml`; `compose.rs` detects `docker-compose.yml`; `postgres_pool.rs` implements shared-Postgres per-branch databases.
-  - `service/control_plane/` — the `ControlPlane` application service, split SRP (one module per concern): `deploy.rs`, `provision.rs`, `lifecycle.rs`, `gc.rs`, `infra.rs`, `admission.rs`, `auth.rs`, `project.rs`.
-  - `service/proxy.rs` — built-in per-branch TCP reverse proxy (stable `public_port`, zero-downtime redeploys); `service/scheduler.rs` — periodic tokio task driving scale-to-zero GC + deploy-queue retry.
+  - `service/control_plane/` — the `ControlPlane` application service, split SRP (one module per concern): `deploy.rs`, `provision.rs`, `lifecycle.rs`, `gc.rs`, `infra.rs`, `admission.rs`, `auth.rs`, `project.rs`, `node.rs`.
+  - `service/proxy.rs` — built-in per-branch TCP reverse proxy (stable `public_port`, zero-downtime redeploys); it dials a `Target { host, port }`, where the host is the node's address, so the same proxy bridges a stable local port to a container on another machine.
+  - `service/fleet.rs` — `Fleet<O>`, the registry of nodes this daemon holds a Docker client for. `ControlPlane` holds one instead of a single `oci`.
+  - `service/scheduler.rs` — periodic tokio task driving the node health probe, then scale-to-zero GC + deploy-queue retry.
   - `api/` — `axum` HTTP surface: router in `mod.rs`, one handler file per resource under `handlers/`, `middleware.rs` (auth + rate-limit + request-id), `dashboard.rs` (embedded SPA).
 - **`oxid-cli`** — thin `clap`-based HTTP client (binary `oxid`) that talks to the daemon's REST API; holds no business logic itself (multi-context config in `cli/config.rs`).
 
@@ -84,6 +88,43 @@ Four invariants in that pipeline are load-bearing and easy to undo by accident:
   `require_master` survives for exactly two operations an admin must not
   have: key rotation and reading the webhook secret.
 
+- **A node this daemon cannot reach never has its environments rewritten.**
+  This is the invariant the whole fleet rests on, and it has two halves.
+  `reconcile_startup_state` resolves the node *before* it decides anything,
+  reports an unreachable one into its error list and moves to the next
+  environment; and `oci.rs::container_status` answers `Missing` only on a
+  real 404, mapping a connection failure to `OciError::Failure`. Both are
+  needed, because the `Missing` branch marks an environment `Destroyed` — so
+  a merely unreachable node answering "no such container" would delete every
+  record of everything running on it. A partition is indistinguishable from
+  a dead machine, and acting on one is how two live copies of a branch end
+  up fighting over one URL. Nothing anywhere — not the health probe, not
+  `drain`, not `oxid node rm` — writes an environment row because of a
+  node's state. Two tests carry that name.
+
+- **Placement is affinity first, then most free memory, decided once.**
+  `oxid_core::services::placement` is pure and holds the rules. A redeploy
+  stays on the node it is already on because images are **not** distributed —
+  each node builds its own copy, so a branch that moves rebuilds from
+  scratch. Affinity is a preference and not a claim: a draining, unreachable
+  or full node does not get to keep a branch. `Placement::Queue` ("not right
+  now") and `Placement::TooLarge` ("not ever") are deliberately different
+  answers — conflating them either queues a deploy for eternity or refuses
+  one a finishing branch would have made room for. Nothing rebalances.
+
+- **The Docker label provider cannot describe half the fleet, so Traefik
+  also polls the daemon.** `GET /api/v1/traefik/config` serves routers built
+  from *rows* (`oxid_core::services::routing`, pure), which is the only way
+  to route an environment on another node — the label provider sees one
+  socket — and, as a bonus, gives a *stopped* environment a router, which is
+  what `oxid-wake-catchall` was papering over. Both providers run together:
+  an upgrade must never silently remove behaviour that works, so the labels
+  keep routing everything they route today and the catch-all stays
+  supported. The service always points at `127.0.0.1:{public_port}` — the
+  control plane's own per-branch proxy — never at `node.address:host_port`,
+  because `host_port` changes on every redeploy and the HTTP provider polls,
+  which would reintroduce exactly the routing gap migration `0007` closed.
+
 - **The shipped compose publishes on every interface, and that is deliberate.**
   The port is not the boundary — the token is. What makes it safe is the pair:
   `OXID_BOOTSTRAP_TOKEN_ACCESS: off` (nothing hands out a credential pre-auth)
@@ -103,7 +144,7 @@ Four invariants in that pipeline are load-bearing and easy to undo by accident:
   pattern list fails *open* — a filter that fails closed stops deploying a
   project silently.
 
-- **Admission is decided once, after the checkout.** `check_admission` runs inside `deploy_at` with the branch's own effective config, because that is the first point the real memory request is known. `AdmissionMode` says what to do when it doesn't fit — enqueue, report (the queue drain already holds the entry), or bypass (rollback). Deciding earlier means weighing a number the deploy won't use.
+- **Admission is decided once, after the checkout, and per node.** `place_deploy` runs inside `deploy_at` with the branch's own effective config, because that is the first point the real memory request is known. `AdmissionMode` says what to do when it doesn't fit — enqueue, report (the queue drain already holds the entry), or bypass (rollback). Deciding earlier means weighing a number the deploy won't use. The lock (`LockKey::Admission(NodeId)`) was never the reservation: the reservation is that `committed_memory_mb` counts rows in `building` as well as `running`, and that count carries `AND node_id = ?` because memory promised on one node says nothing about whether a deploy fits on another. Capacity is read **live** per node rather than from the row the health probe caches — admission is the one caller that cannot tolerate a stale number.
 
 Per-deploy config comes from the commit: `branch_config` re-reads `oxid.toml` from the checkout for `[build]`, `[routing].port` and `[dependencies]`. `base_domain` and the idle/lifetime policy stay with the project, because those are operator decisions owned by `oxid configure`. Containers are injected `OXID_BRANCH`, `OXID_ENV_URL` and `OXID_COMMIT`.
 
@@ -113,9 +154,67 @@ When adding a capability, prefer: domain rules and new port methods in `oxid-cor
 
 The project (`oxid.toml`) config schema and its `[project]`/`[build]`/`[routing]`/`[dependencies]` sections are specified in `IDEA.md`; `crates/oxid-core/src/domain/project_config.rs` is the domain-side model for it.
 
+## Running on more than one machine
+
+One control plane, N Docker endpoints (`MULTINODE.md` has the full
+reasoning). The daemon keeps the database, the git cache, the secrets, the
+audit trail and every lock; a node is a Docker API plus an address, with no
+agent to install.
+
+`ContainerPort` did not change to make this work, and that is the argument
+for it: all 22 methods already took a container name, a spec or an image
+tag, so a second machine is a second client behind the same trait rather
+than a second protocol. `DockerClient::connect_to(&Node)` dispatches to
+`connect_with_defaults`/`connect_with_ssl`/`connect_with_http`; `bollard`'s
+`ssl` feature was already pulled in by `buildkit`, so it cost no new
+dependency. Builds run **on the node** — `tar_context` streams the context
+to whichever endpoint it is talking to — while the checkout stays on the
+control plane, which is why `LockKey::GitCache` needs no distributed
+coordination.
+
+The bits worth knowing before touching them:
+
+- **`Fleet<O>`** (`service/fleet.rs`) is `Arc<ArcSwap<HashMap<NodeId, …>>>`.
+  The `Arc` is around the `ArcSwap`, not just inside it: `ControlPlane`
+  derives `Clone` and axum hands every handler a fresh clone, so a copied
+  registry would make a node registered through one clone invisible to the
+  next request.
+- **`NodeConnector`** is a closure on `ControlPlane`, not a method:
+  constructing a `ContainerPort` is the adapter's knowledge, and putting it
+  in the application layer would drag Docker into it. `main.rs` supplies
+  `DockerClient::connect_to`; the test suite supplies its own.
+- **`ControlPlane::new` keeps its signature**, registering the `oci` it is
+  given as node 1 (`local`, seeded by migration `0020`). That is what makes
+  an existing install upgrade with no configuration change.
+- **`local_oci()` vs `oci_for(node)`.** Infrastructure that belongs to the
+  *control plane* — Traefik, the shared network, the ACME volume — is
+  addressed as local and only local. Everything that acts on an environment
+  goes through `oci_for(env.node_id)`, which errors rather than falling back:
+  dispatching a `remove` meant for `eu-1` at this daemon's Docker would
+  delete whatever happens to share the name.
+- **`reload_fleet()` runs before `reconcile_startup_state()`** in `main.rs`.
+  An environment whose node has no client is left strictly alone, so doing it
+  the other way round would report every remote environment as unreachable
+  and reconcile none of them.
+- **The health probe writes `nodes` and nothing else.** It never un-drains a
+  node (a drain is an operator's intent), never reconnects a working client,
+  and a node that answers again comes back on its own with no restart.
+- **`oxid node drain --evacuate`** moves branches by redeploying each at
+  **the commit it is running**, through the ordinary zero-downtime path.
+  Setting the node `draining` first is what makes each redeploy *leave*:
+  placement refuses a draining node even to a branch already on it.
+  Evacuating an `active` node would move nothing and rebuild everything.
+
+Explicitly out of scope, and each for a reason: image distribution (each node
+builds its own; a branch that moves rebuilds, which is slow but correct and
+needs no registry), a highly-available control plane, live migration of a
+running container, autoscaling, and per-node secret keys.
+
 ## Database
 
 One SQLite file, WAL, opened as a pool (`OXID_DB_MAX_CONNECTIONS`, default 8). Three things are load-bearing and easy to undo:
+
+- **A node cannot be removed while anything still references it.** Not even a `destroyed` environment: `audit_events` cascades from `environments`, so deleting the row to free the node would take that branch's entire audit trail with it, as a side effect of an unrelated command. Removing a node is the last step of a sequence an operator drives (drain, evacuate, delete the finished projects), never a way to make records go away.
 
 - **`open_in_memory` keeps exactly one connection.** Every connection to `:memory:` gets its own empty database, so a pool there hands each caller a different, migration-less copy — tests fail in ways that look like data loss.
 - **`rotate_master_key` uses `BEGIN IMMEDIATE`.** Exclusion from concurrent secret writes used to come free from a single-connection pool; a deferred transaction takes the write lock only at its first write, leaving a window where a secret written under the *old* key would survive the swap and become undecryptable.
@@ -321,9 +420,9 @@ Every catalog is guarded by tests that fail on a missing key or a placeholder a 
 ## Public documentation site
 
 `docs/` is the GitHub Pages site: a landing page plus `docs/docs/*.html`
-(install, guide, stacks, CLI, daemon, API, dashboard, security). Hand-written
-HTML, no generator — the sidebar is duplicated per page, so a nav change means
-editing every one of them.
+(install, guide, stacks, CLI, daemon, API, dashboard, fleet, security).
+Hand-written HTML, no generator — the sidebar is duplicated per page, so a nav
+change means editing every one of them.
 
 It is the surface a user meets before the code, so it goes stale in a way the
 repo's own Markdown does not: `install.html` documents what `install.sh`

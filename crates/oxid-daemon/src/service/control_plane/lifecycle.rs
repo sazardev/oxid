@@ -95,7 +95,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // `stop` costs a process restart on wake that `unpause` would not,
         // which is the honest price of a suspension the router layer can
         // actually observe.
-        self.oci
+        self.oci_for(env.node_id)?
             .stop(&resolved_container_name(&project, &env))
             .await?;
         if self.docker_network.is_none() {
@@ -254,12 +254,12 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // straight into the visitor's browser, with every retry reproducing
         // it identically. Waking something already awake is a success, not
         // an error.
-        match self.oci.container_status(&name).await? {
+        match self.oci_for(env.node_id)?.container_status(&name).await? {
             ContainerStatus::Running => {
                 tracing::debug!(%environment_id, "wake: container already running");
             }
-            ContainerStatus::Paused => self.oci.unpause(&name).await?,
-            ContainerStatus::Stopped => self.oci.start(&name).await?,
+            ContainerStatus::Paused => self.oci_for(env.node_id)?.unpause(&name).await?,
+            ContainerStatus::Stopped => self.oci_for(env.node_id)?.start(&name).await?,
             ContainerStatus::Missing => {
                 return Err(CpError::NotFound(crate::i18n::tf(
                     "deploy.containerGone",
@@ -277,7 +277,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // lookup failure just leaves it as it was.
         if env.host_port.is_none() && self.docker_network.is_none() {
             env.host_port = self
-                .oci
+                .oci_for(env.node_id)?
                 .published_port(&name, project.config.port)
                 .await
                 .unwrap_or(None);
@@ -297,7 +297,11 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                 .await?;
             env.public_port = Some(public_port);
             self.proxy
-                .set_target(env.project_id, &env.branch.name, port)
+                .set_target(
+                    env.project_id,
+                    &env.branch.name,
+                    self.proxy_target(&env, port)?,
+                )
                 .await;
         }
 
@@ -375,18 +379,18 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // (the image build never produced one), and an operator may have
         // removed one by hand — refusing to tear down the record in either
         // case would leave a row nothing could ever clean up.
-        match self.oci.stop(&name).await {
+        match self.oci_for(env.node_id)?.stop(&name).await {
             Ok(()) | Err(OciError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        match self.oci.remove(&name).await {
+        match self.oci_for(env.node_id)?.remove(&name).await {
             Ok(()) | Err(OciError::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
         // Best-effort: an image that never finished building (a deploy that
         // failed at the `build` step) simply won't exist yet.
         match self
-            .oci
+            .oci_for(env.node_id)?
             .remove_image(&image_name(&project, &env.branch.name))
             .await
         {
@@ -507,7 +511,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
-            .oci
+            .oci_for(env.node_id)?
             .logs(&resolved_container_name(&project, &env))
             .await?)
     }
@@ -523,7 +527,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
             .ok_or_else(|| CpError::NotFound(format!("project `{}`", env.project_id)))?;
         Ok(self
-            .oci
+            .oci_for(env.node_id)?
             .stream_logs(&resolved_container_name(&project, &env))
             .await?)
     }

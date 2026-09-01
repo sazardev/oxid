@@ -90,9 +90,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
         {
             DeployOutcome::Deployed(env, _) => Ok(env),
-            DeployOutcome::Queued { .. } => {
-                unreachable!("admission control is off, so this never queues")
-            }
+            // Reachable now, and it was not before: with a fleet a deploy
+            // can have nowhere to go for reasons that have nothing to do
+            // with memory — every node draining, or none of them
+            // answering. A panic here would take the daemon down over a
+            // drain somebody started on purpose.
+            DeployOutcome::Queued { .. } => Err(CpError::NoNodeAvailable(
+                crate::i18n::t("deploy.noNode").to_owned(),
+            )),
         }
     }
 
@@ -114,9 +119,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
         {
             DeployOutcome::Deployed(env, _) => Ok(env),
-            DeployOutcome::Queued { .. } => {
-                unreachable!("admission control is off, so this never queues")
-            }
+            // Reachable now, and it was not before: with a fleet a deploy
+            // can have nowhere to go for reasons that have nothing to do
+            // with memory — every node draining, or none of them
+            // answering. A panic here would take the daemon down over a
+            // drain somebody started on purpose.
+            DeployOutcome::Queued { .. } => Err(CpError::NoNodeAvailable(
+                crate::i18n::t("deploy.noNode").to_owned(),
+            )),
         }
     }
 
@@ -859,17 +869,39 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         // A rollback replaces an environment the host is already carrying,
         // so gating it on free capacity would refuse the one deploy whose
         // whole purpose is getting back to a working state.
+        // A redeploy prefers the node it is already on: images are not
+        // distributed, so a branch that moves rebuilds from scratch.
+        let affinity = previous.as_ref().map(|prev| prev.node_id);
         let admitted = if admission == AdmissionMode::Bypass {
-            Ok(Admission::Fits)
+            // A rollback replaces an environment the fleet is already
+            // carrying, so gating it on free capacity would refuse the one
+            // deploy whose whole purpose is getting back to a working state.
+            // It still has to land *somewhere*, and where it already is, is
+            // the answer that needs no rebuild.
+            Ok(Admission::Fits(affinity.unwrap_or(env.node_id)))
         } else {
-            // Serialized node-wide, but only around the check itself — it is
-            // one query, and two concurrent deploys must not each see the
-            // same free memory and both take it.
-            let _admission_guard = self.lifecycle_lock.acquire(LockKey::Admission).await;
-            self.check_admission(&project, Some(env.id)).await
+            // Serialized per node, but only around the decision itself —
+            // two concurrent deploys must not each see the same free memory
+            // and both take it. Keyed on the node the branch is coming
+            // *from*, or the local node for a first deploy: the destination
+            // is what this is about to work out, so it cannot key on it.
+            let _admission_guard = self
+                .lifecycle_lock
+                .acquire(LockKey::Admission(affinity.unwrap_or(env.node_id)))
+                .await;
+            self.place_deploy(&project, Some(env.id), affinity).await
         };
         match admitted {
-            Ok(Admission::Fits) => {}
+            Ok(Admission::Fits(node_id)) => {
+                if env.node_id != node_id {
+                    env.node_id = node_id;
+                    // Persisted before the build, for the same reason the row
+                    // exists before the build at all: a failure from here on
+                    // must leave a record that says where it was trying to
+                    // happen.
+                    EnvironmentStore::update(&self.store, &env).await?;
+                }
+            }
             // Doesn't fit right now, but could later. Drop the row created
             // above: nothing outside this lock has seen it, and leaving a
             // `Building` row behind for a deploy that hasn't started would
@@ -1019,7 +1051,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             dockerfile,
             image: image.clone(),
         };
-        let build_report = match self.oci.build(&build).await {
+        let build_report = match self.oci_for(env.node_id)?.build(&build).await {
             Ok(report) => report,
             Err(err) => {
                 let err = CpError::from(err);
@@ -1185,9 +1217,14 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             .await?
         {
             DeployOutcome::Deployed(env, report) => Ok((env, report)),
-            DeployOutcome::Queued { .. } => {
-                unreachable!("admission control is off, so this never queues")
-            }
+            // Reachable now, and it was not before: with a fleet a deploy
+            // can have nowhere to go for reasons that have nothing to do
+            // with memory — every node draining, or none of them
+            // answering. A panic here would take the daemon down over a
+            // drain somebody started on purpose.
+            DeployOutcome::Queued { .. } => Err(CpError::NoNodeAvailable(
+                crate::i18n::t("deploy.noNode").to_owned(),
+            )),
         }
     }
 }

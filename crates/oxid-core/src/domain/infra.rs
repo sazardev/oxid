@@ -152,6 +152,37 @@ pub struct TraefikSpec {
     /// Automatic certificates, or `None` for plain HTTP.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+    /// Where Traefik polls this daemon for the routers it cannot discover
+    /// from the Docker socket — every environment on another node, and
+    /// every environment whose container is stopped.
+    ///
+    /// `None` leaves Traefik on the Docker label provider alone, which is
+    /// exactly what a single-node install has always had. **Both providers
+    /// run together**, deliberately: an existing install must keep routing
+    /// by labels for as long as nothing new has been written, and a
+    /// migration that quietly removed working behaviour would be the wrong
+    /// kind of upgrade.
+    #[serde(default)]
+    pub http_provider: Option<HttpProvider>,
+}
+
+/// Traefik's HTTP provider, pointed at this daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpProvider {
+    /// Absolute URL of `GET /api/v1/traefik/config`, reachable from inside
+    /// the shared Docker network.
+    pub endpoint: String,
+    /// The `Authorization` header value Traefik sends. The document names
+    /// every branch on this daemon and how to reach it, so the endpoint is
+    /// authenticated like any other.
+    ///
+    /// It ends up on Traefik's command line, and therefore in
+    /// `docker inspect` on the control plane — the same exposure a
+    /// container's injected environment variables already have, and worth
+    /// saying out loud rather than leaving to be discovered.
+    pub authorization: String,
+    /// How often Traefik re-polls, as a Go duration (`5s`).
+    pub poll_interval: String,
 }
 
 /// How ACME proves the operator controls the domain.
@@ -245,6 +276,10 @@ impl TraefikSpec {
             // Traefik.
             https_port: None,
             acme: None,
+            // Labels only, exactly as before the fleet existed. Turned on
+            // by the daemon when it has a token to hand Traefik — see
+            // `ControlPlane::traefik_spec`.
+            http_provider: None,
         }
     }
 
