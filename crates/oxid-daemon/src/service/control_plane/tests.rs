@@ -74,6 +74,11 @@ struct FakeOci {
     host_capacity: Arc<Mutex<HostCapacity>>,
     /// When set, `host_capacity` fails — a node that has stopped answering.
     host_capacity_error: Arc<Mutex<bool>>,
+    /// When set, `host_capacity` never answers — a *partitioned* node, which
+    /// is a different thing from a refusing one and the harder of the two:
+    /// there is no RST, so the caller waits out the kernel unless something
+    /// gives it a deadline.
+    host_capacity_hangs: Arc<Mutex<bool>>,
     /// Docker networks `ensure_network`/`network_exists` believe exist.
     network_exists: Arc<Mutex<std::collections::HashSet<String>>>,
     /// Whether `ensure_traefik` believes its container is already up.
@@ -240,6 +245,13 @@ impl ContainerPort for FakeOci {
             .unwrap_or(ContainerStatus::Running))
     }
     async fn host_capacity(&self) -> Result<HostCapacity, OciError> {
+        if *self.host_capacity_hangs.lock().unwrap() {
+            // Far longer than any deadline. Under `start_paused` the runtime
+            // advances virtual time the moment everything is idle, so this
+            // costs the test nothing while still being unbounded in the
+            // sense that matters.
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        }
         if *self.host_capacity_error.lock().unwrap() {
             return Err(OciError::Failure("connection refused".to_owned()));
         }
@@ -2159,6 +2171,99 @@ async fn a_branch_that_cannot_be_rebuilt_stays_and_is_reported() {
     assert!(
         results[0].1.is_some(),
         "a branch that could not move must say so, not be counted as moved"
+    );
+}
+
+/// A partitioned node must not hold up a deploy aimed at a healthy one.
+///
+/// This is a liveness bug, not a correctness one, and it took a real
+/// blackhole to find: with `iptables -j DROP` on a registered node's port, a
+/// deploy to a perfectly healthy node took **121 seconds**, because the
+/// capacity query walked the fleet one node at a time with no deadline and a
+/// partitioned machine sends no RST. Correctness held the whole time —
+/// nothing was written, nothing was destroyed — which is exactly why no test
+/// caught it. Measured again after the fix: 7 seconds.
+#[tokio::test]
+async fn a_partitioned_node_does_not_stall_a_deploy_to_a_healthy_one() {
+    let repo = repo_dir_with_config();
+    let local = FakeOci::default();
+    let remote = FakeOci::default();
+    // Milliseconds instead of seconds, so the assertion is about the shape
+    // of the behaviour rather than about how long the test is willing to sit
+    // there. Production keeps the real deadline.
+    let cp = cp_with_distinct_nodes(cp(local.clone()).await, remote.clone())
+        .with_status_deadline(std::time::Duration::from_millis(50));
+    let project = cp.register_project(repo.path(), None).await.unwrap();
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+
+    // eu-1 stops answering *without refusing* — the partition case.
+    *remote.host_capacity_hangs.lock().unwrap() = true;
+
+    let started = std::time::Instant::now();
+    let placement = cp
+        .place_deploy(&project, None, None)
+        .await
+        .expect("a partitioned node must not fail the placement");
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(placement, super::types::Admission::Fits(id) if id == oxid_core::NodeId::LOCAL),
+        "the deploy must land on the node that answered, not wait for the one that did not: {placement:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "a silent node cost {waited:?}; the whole fleet is asked at once, so \
+         one deadline is the ceiling"
+    );
+    // And nothing was written about it: a node's recorded state belongs to
+    // the health probe, not to whichever deploy happened to notice first.
+    assert_eq!(
+        cp.store.get_node(eu1.node.id).await.unwrap().unwrap().state,
+        oxid_core::NodeState::Active
+    );
+}
+
+/// The same silence must not hold up the scheduler either. `probe_nodes`
+/// runs ahead of the GC sweep, the deploy-queue drain and the forge
+/// notifications, so a node that never answers used to delay all of them —
+/// measured at 126 seconds before the fleet was asked concurrently.
+#[tokio::test]
+async fn a_partitioned_node_does_not_stall_the_scheduler_tick() {
+    let local = FakeOci::default();
+    let remote = FakeOci::default();
+    let cp = cp_with_distinct_nodes(cp(local.clone()).await, remote.clone())
+        .with_status_deadline(std::time::Duration::from_millis(50));
+    let eu1 = cp
+        .add_node("eu-1", "tcp://10.0.0.4:2376", None, None, None)
+        .await
+        .unwrap();
+    *remote.host_capacity_hangs.lock().unwrap() = true;
+
+    let started = std::time::Instant::now();
+    cp.probe_nodes().await.unwrap();
+    let waited = started.elapsed();
+
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "the probe took {waited:?} for one silent node"
+    );
+    assert_eq!(
+        cp.store.get_node(eu1.node.id).await.unwrap().unwrap().state,
+        oxid_core::NodeState::Down,
+        "silence past the deadline is what `down` means"
+    );
+    assert_eq!(
+        cp.store
+            .get_node(oxid_core::NodeId::LOCAL)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        oxid_core::NodeState::Active,
+        "and it says nothing about the node that did answer"
     );
 }
 

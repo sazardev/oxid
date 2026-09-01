@@ -25,9 +25,33 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use oxid_core::{Node, NodeEndpoint, NodeId};
+
+/// How long a *status* query to a node may take before the caller gives up
+/// on that node for the decision it is making.
+///
+/// Separate from, and far shorter than, the connection's own timeout, which
+/// has to accommodate an image pull and a build. These are `docker info` and
+/// `container status` — questions a live machine answers immediately.
+///
+/// It exists because a partitioned node **blackholes** rather than refusing:
+/// there is no RST, so the connection sits until the kernel gives up.
+/// Measured with `iptables -j DROP` on a registered node's port: a deploy
+/// aimed at a perfectly healthy node took **121 seconds**, and the health
+/// probe needed **126 seconds** to notice, because both walked the fleet one
+/// node at a time with no deadline. Correctness held throughout — no
+/// environment was touched — but a single dead machine froze every deploy in
+/// the fleet, which is its own kind of outage.
+///
+/// Five seconds is generous for a query a healthy node answers in
+/// milliseconds, and short enough that a dead one costs a pause rather than
+/// an outage. A node that misses it is skipped *for that decision only*;
+/// nothing is written, because a node's recorded state belongs to the health
+/// probe alone.
+pub const STATUS_DEADLINE: Duration = Duration::from_secs(5);
 
 /// One node and the Docker client that reaches it.
 #[derive(Debug)]

@@ -105,6 +105,9 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
         let mut errors = Vec::new();
         let mut projects: std::collections::HashMap<ProjectId, Project> =
             std::collections::HashMap::new();
+        // Nodes that have already failed to answer during this pass.
+        let mut unreachable: std::collections::HashSet<oxid_core::NodeId> =
+            std::collections::HashSet::new();
 
         for mut env in self.store.list_all_environments().await? {
             // A `Building` row cannot still be building: nothing survived
@@ -174,14 +177,43 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     continue;
                 }
             };
+            // A node already found unreachable this pass is not asked again.
+            //
+            // Without this, a partitioned node cost one connection timeout
+            // *per environment on it* — and reconciliation runs before the
+            // daemon serves its first request, so a machine holding twenty
+            // branches could keep the whole control plane from starting.
+            // The environments are reported and left alone either way; this
+            // only stops paying for the same silence twenty times.
+            if unreachable.contains(&env.node_id) {
+                errors.push((env.id, format!("node `{}` is unreachable", env.node_id)));
+                continue;
+            }
             let oci = &handle.oci;
-            let status = match oci.container_status(&name).await {
-                Ok(status) => status,
-                Err(e) => {
-                    errors.push((env.id, e.to_string()));
-                    continue;
-                }
-            };
+            let status =
+                match tokio::time::timeout(self.status_deadline, oci.container_status(&name))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(OciError::Failure(format!(
+                            "node `{}` did not answer within {}s",
+                            handle.node.name,
+                            self.status_deadline.as_secs()
+                        )))
+                    }) {
+                    Ok(status) => status,
+                    Err(e) => {
+                        // A *connection* failure condemns the node for this
+                        // pass; a 404 does not, and the difference is exactly
+                        // the invariant below — `Missing` marks a row
+                        // `Destroyed`, so it must only ever come from a node
+                        // that actually answered.
+                        if !matches!(e, OciError::NotFound(_)) {
+                            unreachable.insert(env.node_id);
+                        }
+                        errors.push((env.id, e.to_string()));
+                        continue;
+                    }
+                };
 
             // Same opportunistic backfill as `wake_env`: an environment
             // deployed before dynamic port assignment existed never got its

@@ -52,6 +52,7 @@ Daemon env (`crates/oxid-daemon/src/main.rs`):
 - `OXID_RATE_LIMIT_PER_SECOND` + `OXID_RATE_LIMIT_BURST` (both required) — per-client-IP bucket on protected routes
 - `OXID_BACKUP_INTERVAL_SECS` (+ `OXID_BACKUP_KEEP`, default 7) — periodic `VACUUM INTO` snapshots to `{data}/backups/`, off by default
 - `OXID_ALLOW_INSECURE_NODES=1` — lets a remote node register with no TLS material. Default refuses: a Docker socket over TCP is root on that box for anyone who can route to it
+- `OXID_NODE_STATUS_TIMEOUT_SECS` default `5` — deadline per node status query. A partition blackholes (no RST), so without it one dead node froze every deploy for 121s; the fleet is now asked concurrently and bounded
 - `OXID_TRAEFIK_POLL_INTERVAL` default `5s` — Traefik's re-poll of `/api/v1/traefik/config`. Not the wake latency (a sleeping branch keeps its router), only the delay before a *new* branch is routable
 
 CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. `oxid login/logout/connect/server/whoami` wrap the context config (`cli/config.rs`); `login` reads the token from stdin and verifies it against `/api/v1/me` before saving, `logout` clears the credential but keeps the address. Run: `cargo run -p oxid-daemon` / `cargo run -p oxid-cli -- <subcommand>` (e.g. `ps`, `up`, `logs -f`). Docker required for daemon (build/run/pause), not for `cargo test` (pure `oxid-core` tests are instant; `oxid-daemon` integration tests use in-memory SQLite unless `#[ignore]` Docker tests).

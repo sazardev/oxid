@@ -196,6 +196,16 @@ pub struct ControlPlane<G: GitPort, O: ContainerPort> {
     /// `None`; under Traefik, Traefik itself is already the stable-address
     /// proxy in front of every container.
     proxy: crate::service::proxy::ProxyRegistry,
+    /// How long a status query to a node may take before this daemon gives
+    /// up on it for the decision in hand — see
+    /// [`crate::service::fleet::STATUS_DEADLINE`], which is the default and
+    /// carries the reasoning.
+    ///
+    /// A field rather than the constant everywhere so the test suite can
+    /// shorten it, exactly as [`Self::with_readiness_check`] exists so a
+    /// fake `ContainerPort` need not own a real socket. A high-latency link
+    /// is the other reason it might legitimately move.
+    status_deadline: std::time::Duration,
     /// Whether a redeploy's new instance must actually accept TCP
     /// connections before cutover (direct-publish mode only). Always `true`
     /// in production; test doubles disable it via
@@ -252,6 +262,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
             default_cpu_limit_millicores: None,
             reserved_memory_mb: None,
             proxy: crate::service::proxy::ProxyRegistry::default(),
+            status_deadline: crate::service::fleet::STATUS_DEADLINE,
             readiness_check: true,
         }
     }
@@ -265,6 +276,17 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     #[must_use]
     pub fn with_readiness_check(mut self, enabled: bool) -> Self {
         self.readiness_check = enabled;
+        self
+    }
+
+    /// Shortens (or lengthens) the deadline on a status query to a node.
+    ///
+    /// Production keeps the default. Tests set it to milliseconds so that
+    /// "a silent node is skipped rather than waited on" can be asserted
+    /// without the test itself waiting.
+    #[must_use]
+    pub const fn with_status_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.status_deadline = deadline;
         self
     }
 

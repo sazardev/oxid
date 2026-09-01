@@ -145,3 +145,47 @@ cache; `OXID_DB_MAX_CONNECTIONS` moves it.
 `SQLITE_BUSY` and no errors in the daemon log. Writes still serialize — that is
 SQLite, not a setting — but WAL keeps them from blocking readers, and
 `busy_timeout` absorbs the contention rather than failing a request over it.
+
+## Fleet: a node that is slow, and a node that is gone
+
+Measured against a **real second `dockerd --tlsverify`** — its own process,
+data-root and container namespace — with the control plane reaching it over
+mTLS. Latency injected with `tc netem`, partition with `iptables -j DROP`
+(a drop, not a reject: a partitioned machine sends no RST, which is what
+makes it the hard case).
+
+### Latency
+
+| Added RTT to the node | Deploy (build + run + ready) |
+|---|---|
+| none | 3.1 s |
+| 200 ms | 9.5 s |
+| 400 ms | 17.7 s |
+
+All three deploys succeeded, all landed on the remote node, and none of them
+made a healthy node look dead. Latency costs throughput and nothing else —
+the deploy is a conversation of many small round trips, so it scales roughly
+with RTT.
+
+`OXID_NODE_STATUS_TIMEOUT_SECS` (default 5 s) is the headroom before a slow
+node starts being *treated* as a dead one. 400 ms RTT already spends a
+noticeable share of it, so a worse link should raise it.
+
+### Partition
+
+This is where the interesting number was, and it was a defect rather than a
+property. Blackholing a registered node's port:
+
+| | before | after |
+|---|---|---|
+| Deploy aimed at a **healthy** node | 121 s | **7 s** |
+| Health probe noticing the dead node | 126 s | **7 s** |
+| Environments on the dead node | untouched | untouched |
+
+Correctness held the whole time in both columns — nothing was moved, marked
+destroyed or rebuilt — which is exactly why no test had caught it. The cost
+was liveness: the fleet was walked one node at a time with no deadline, so a
+machine that answers with silence held up every deploy for as long as the
+kernel was willing to wait. The fleet is now asked concurrently and each
+answer is bounded; a dead node costs one deadline, not one timeout per node
+and, at startup, not one timeout per *environment* on it.

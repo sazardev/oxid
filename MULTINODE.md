@@ -661,11 +661,58 @@ habla la API de Docker sobre esa conexión. Verificado extremo a extremo:
 - matar el endpoint marca el nodo `down`, **deja su entorno intacto**
   (`running`, en el nodo 2) y el siguiente deploy va al nodo vivo.
 
-Lo que **no** cubre, y conviene decirlo: un `dockerd` remoto de verdad con
-`--tlsverify` (aquí el servidor TLS es un intermediario, no el propio
-daemon), la latencia de red y la partición parcial. Para esos dos últimos,
-`tc netem` da lo que falta; para el primero, hace falta root y un segundo
-`data-root`.
+**Después se hizo también con un `dockerd --tlsverify` de verdad**: segundo
+proceso, su propio `data-root`, su propio `exec-root`, su propio bridge, sólo
+en loopback. Oxid lo registró por mTLS, rechazó la CA equivocada, construyó
+la imagen y arrancó el contenedor **en ese daemon** (verificado: el
+contenedor existe en el #2 y no en el #1), y lo evacuó de vuelta sin corte.
+Límite de fidelidad que conviene anotar: Docker 29 usa el *image store* de
+containerd, y ambos daemons hablan con el containerd del sistema, así que
+comparten capas de imagen. Los procesos y los contenedores son
+independientes; el almacén de imágenes no. En dos máquinas de verdad la
+construcción sería desde cero — más lenta, igual de correcta.
+
+### Latencia y partición: aquí estaba el fallo
+
+Latencia inyectada con `tc netem`, partición con `iptables -j DROP` (descarte,
+no rechazo: una máquina particionada no manda RST, y eso es lo que la hace el
+caso difícil).
+
+| RTT añadido | Deploy |
+|---|---|
+| ninguno | 3,1 s |
+| 200 ms | 9,5 s |
+| 400 ms | 17,7 s |
+
+La latencia cuesta rendimiento y nada más: los tres despliegues correctos, en
+el nodo remoto, sin marcar caído a nadie sano.
+
+La partición fue otra cosa. **Un deploy dirigido a un nodo sano tardaba 121
+segundos** porque otro nodo estaba particionado, y el sondeo tardaba 126 en
+darse cuenta. La corrección aguantó entera —ningún entorno movido, marcado ni
+reconstruido—, que es exactamente por qué ningún test lo veía: era un fallo
+de *liveness*, no de correctness. La causa: la flota se recorría nodo a nodo
+sin plazo, así que una máquina que responde con silencio bloqueaba a todas
+las demás.
+
+Arreglado en tres sitios, y el tercero era el peor:
+
+- `node_capacities` pregunta a **todos los nodos a la vez**, con plazo.
+- `probe_nodes` igual — y además iba por delante de la GC, del drenaje de la
+  cola y de las notificaciones al forge, así que los retenía a todos.
+- `reconcile_startup_state` pagaba un timeout **por entorno**, no por nodo, y
+  corre *antes* de servir la primera petición: una máquina con veinte ramas
+  podía impedir que el control plane arrancase. Ahora un nodo que ya falló en
+  esa pasada no se vuelve a preguntar.
+
+Medido de nuevo: **121 s → 7 s** el deploy, **126 s → 7 s** el sondeo. Dos
+tests lo fijan, con un `ContainerPort` falso que *no responde* (que no es lo
+mismo que uno que falla) y un plazo inyectado en milisegundos —
+`with_status_deadline`, el mismo patrón que `with_readiness_check` ya usaba
+para que un doble de test no necesite un socket real.
+
+Lo que sigue **sin** cubrir: una partición asimétrica (un sentido pasa y el
+otro no) y la pérdida de paquetes intermitente.
 
 ---
 

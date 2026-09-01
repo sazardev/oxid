@@ -265,6 +265,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|&mb| mb > 0);
     cp = cp.with_admission_control(reserved_memory_mb);
 
+    if let Some(deadline) = node_status_timeout() {
+        cp = cp.with_status_deadline(deadline);
+    }
+
     // Connect to every registered node before reconciling. An environment
     // whose node has no client is deliberately left untouched, so doing this
     // the other way round would report every remote environment as
@@ -341,6 +345,23 @@ where
         auto_token,
         bootstrap_access: oxid_daemon::api::BootstrapAccess::from_env(),
     })
+}
+
+/// How long a status query to a fleet node may take before this daemon
+/// gives up on it for the decision in hand (`OXID_NODE_STATUS_TIMEOUT_SECS`).
+///
+/// The default (5s) is generous for a query a healthy node answers in
+/// milliseconds. It exists as a knob because latency eats into it: measured
+/// against a node behind `tc netem`, a deploy took 3.1s at no added latency,
+/// 9.5s at 200ms RTT and 17.7s at 400ms — all correct, none falsely marked
+/// down, but a link worse than that wants more headroom before a slow node
+/// starts looking like a dead one.
+fn node_status_timeout() -> Option<std::time::Duration> {
+    std::env::var("OXID_NODE_STATUS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(std::time::Duration::from_secs)
 }
 
 /// How often Traefik re-polls this daemon's router table

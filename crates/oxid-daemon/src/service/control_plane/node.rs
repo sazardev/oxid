@@ -19,8 +19,8 @@ use std::sync::Arc;
 use super::ControlPlane;
 use super::error::CpError;
 use oxid_core::{
-    ContainerPort, EnvironmentStore, GitPort, Node, NodeEndpoint, NodeId, NodeState, NodeTls,
-    OciError,
+    ContainerPort, EnvironmentStore, GitPort, HostCapacity, Node, NodeEndpoint, NodeId, NodeState,
+    NodeTls, OciError,
 };
 
 /// Builds a Docker client for a node.
@@ -367,62 +367,106 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// # Errors
     /// Returns [`CpError`] only if the node table cannot be read.
     pub async fn probe_nodes(&self) -> Result<(), CpError> {
-        for node in self.store.list_nodes().await? {
-            // A node registered in the table but not in this process — a
-            // daemon started while it was unreachable. Retrying the
-            // connection here is what lets it rejoin without a restart.
-            let handle = match self.fleet.get(node.id) {
-                Some(handle) => handle,
-                None => {
-                    let Some(connect) = self.node_connector.as_ref() else {
-                        continue;
-                    };
-                    match connect(&node) {
-                        Ok(oci) => {
-                            tracing::info!(node = %node.name, "node reconnected");
-                            self.fleet.register(node.clone(), Arc::new(oci));
-                            self.fleet.get(node.id).expect("just registered")
-                        }
-                        Err(e) => {
-                            self.mark_node_down(&node, &e.to_string()).await;
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            match handle.oci.host_capacity().await {
-                Ok(capacity) => {
-                    // A drain survives a successful probe. Anything else
-                    // becomes active, which is how a node that was `down`
-                    // comes back on its own.
-                    let state = if node.state == NodeState::Draining {
-                        NodeState::Draining
-                    } else {
-                        NodeState::Active
-                    };
-                    if node.state == NodeState::Down {
-                        tracing::info!(node = %node.name, "node is answering again");
-                    }
-                    if let Err(e) = self
-                        .store
-                        .record_node_health(node.id, capacity, state)
+        // Asked all at once, each with a deadline, and only then acted on.
+        //
+        // Sequential and unbounded, this held the *whole scheduler tick*
+        // hostage: the GC sweep, the deploy-queue drain and the forge
+        // notifications all run behind it, and a partitioned node —
+        // blackholing rather than refusing — took 126 seconds to be noticed.
+        // The fleet now costs one round trip, and a dead node costs the
+        // deadline rather than the kernel's patience.
+        let nodes = self.store.list_nodes().await?;
+        let answers = futures_util::future::join_all(nodes.iter().map(|node| async move {
+            let handle = self.fleet.get(node.id);
+            match &handle {
+                Some(handle) => (
+                    tokio::time::timeout(self.status_deadline, handle.oci.host_capacity())
                         .await
-                    {
-                        tracing::warn!(node = %node.name, error = %e, "could not record node health");
-                        continue;
-                    }
-                    let mut refreshed = node;
-                    refreshed.capacity = capacity;
-                    refreshed.state = state;
-                    refreshed.last_seen_at =
-                        Some(oxid_core::OffsetDateTime::now_utc().unix_timestamp());
-                    self.fleet.refresh(refreshed);
-                }
-                Err(e) => self.mark_node_down(&node, &e.to_string()).await,
+                        .map_err(|_| {
+                            OciError::Failure(format!(
+                                "node did not answer within {}s",
+                                self.status_deadline.as_secs()
+                            ))
+                        })
+                        .and_then(|inner| inner),
+                    false,
+                ),
+                // Registered in the table but not in this process — a daemon
+                // started while it was unreachable. The reconnect is left to
+                // the sequential pass below, since it mutates the registry.
+                None => (Err(OciError::NotFound("no client".to_owned())), true),
             }
+        }))
+        .await;
+
+        for (node, (answer, needs_client)) in nodes.into_iter().zip(answers) {
+            self.apply_probe(node, answer, needs_client).await;
         }
         Ok(())
+    }
+
+    /// Records one node's probe result. Split out so the network half can
+    /// run for the whole fleet at once while the bookkeeping stays ordered.
+    async fn apply_probe(
+        &self,
+        node: Node,
+        answer: Result<HostCapacity, OciError>,
+        needs_client: bool,
+    ) {
+        let answer = if needs_client {
+            // Retrying the connection here is what lets a node registered
+            // while this process could not reach it rejoin without a
+            // restart.
+            let Some(connect) = self.node_connector.as_ref() else {
+                return;
+            };
+            match connect(&node) {
+                Ok(oci) => {
+                    tracing::info!(node = %node.name, "node reconnected");
+                    self.fleet.register(node.clone(), Arc::new(oci));
+                    let handle = self.fleet.get(node.id).expect("just registered");
+                    tokio::time::timeout(self.status_deadline, handle.oci.host_capacity())
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(OciError::Failure("node did not answer in time".to_owned()))
+                        })
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            answer
+        };
+
+        match answer {
+            Ok(capacity) => {
+                // A drain survives a successful probe. Anything else
+                // becomes active, which is how a node that was `down`
+                // comes back on its own.
+                let state = if node.state == NodeState::Draining {
+                    NodeState::Draining
+                } else {
+                    NodeState::Active
+                };
+                if node.state == NodeState::Down {
+                    tracing::info!(node = %node.name, "node is answering again");
+                }
+                if let Err(e) = self
+                    .store
+                    .record_node_health(node.id, capacity, state)
+                    .await
+                {
+                    tracing::warn!(node = %node.name, error = %e, "could not record node health");
+                    return;
+                }
+                let mut refreshed = node;
+                refreshed.capacity = capacity;
+                refreshed.state = state;
+                refreshed.last_seen_at =
+                    Some(oxid_core::OffsetDateTime::now_utc().unix_timestamp());
+                self.fleet.refresh(refreshed);
+            }
+            Err(e) => self.mark_node_down(&node, &e.to_string()).await,
+        }
     }
 
     /// Records a node as unreachable — and nothing else. Idempotent and

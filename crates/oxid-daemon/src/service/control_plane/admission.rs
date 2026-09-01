@@ -74,22 +74,34 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
     /// number is a deploy admitted against memory something else has since
     /// taken.
     ///
-    /// A node that will not answer is marked unreachable and skipped, never
-    /// failed on. One node being down must not stop the fleet deploying —
-    /// and it must not mark anything either: `state` belongs to the probe,
-    /// and a single timed-out query is not evidence a machine is gone.
+    /// **Every node is asked at once, and each is given a deadline.** Both
+    /// halves are load-bearing, and neither was there first. Walking the
+    /// fleet one node at a time with no deadline meant a partitioned node —
+    /// which blackholes rather than refusing, so the connection waits out
+    /// the kernel — stalled a deploy aimed at a *healthy* node for 121
+    /// seconds, measured. Concurrency makes the whole fleet cost one round
+    /// trip; the deadline makes a dead node cost five seconds instead of
+    /// two minutes.
+    ///
+    /// A node that will not answer in time is marked unreachable and
+    /// skipped, never failed on, and **nothing about it is written**: one
+    /// node being down must not stop the fleet deploying, and a single
+    /// timed-out query is not evidence a machine is gone. `state` belongs to
+    /// the probe.
     async fn node_capacities(&self, exclude: Option<EnvironmentId>) -> Vec<NodeCapacity> {
         let fallback_mb = self.default_memory_limit_mb.unwrap_or(0);
-        let mut out = Vec::new();
-        for handle in self.fleet.handles() {
+        let probes = self.fleet.handles().into_iter().map(|handle| async move {
             let committed_mb = self
                 .store
                 .committed_memory_mb(fallback_mb, exclude, handle.node.id)
                 .await
                 .unwrap_or(0);
 
-            let (usable_mb, reachable) = match handle.oci.host_capacity().await {
-                Ok(host) => {
+            let answered =
+                tokio::time::timeout(self.status_deadline, handle.oci.host_capacity()).await;
+
+            let (usable_mb, reachable) = match answered {
+                Ok(Ok(host)) => {
                     let total_mb = host.total_memory_bytes / 1_048_576;
                     // Per-node reservation first, daemon-wide second: an
                     // operator who has said how much this particular machine
@@ -102,7 +114,7 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                         .unwrap_or(0);
                     (total_mb.saturating_sub(reserved_mb), true)
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(
                         node = %handle.node.name,
                         error = %e,
@@ -110,17 +122,26 @@ impl<G: GitPort, O: ContainerPort> ControlPlane<G, O> {
                     );
                     (0, false)
                 }
+                Err(_) => {
+                    tracing::warn!(
+                        node = %handle.node.name,
+                        timeout_secs = self.status_deadline.as_secs(),
+                        "node did not answer a capacity query in time; excluded from \
+                         placement for this deploy only"
+                    );
+                    (0, false)
+                }
             };
 
-            out.push(NodeCapacity {
+            NodeCapacity {
                 id: handle.node.id,
                 state: handle.node.state,
                 usable_mb,
                 committed_mb,
                 reachable: reachable && handle.node.state != NodeState::Down,
-            });
-        }
-        out
+            }
+        });
+        futures_util::future::join_all(probes).await
     }
 
     /// Picks a node for a deploy, or says why none will do.
