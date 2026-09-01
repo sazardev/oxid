@@ -6,6 +6,22 @@ is the breaking position.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
+The minor moves rather than the patch because this release changes contracts,
+which is what the minor position means on a `0.x` line: `ContainerSpec` swaps
+`network: Option<String>` for a `networks` list and an explicit
+`publish_port`, `ContainerPort` gains `remove_network`, and
+`SqliteStore::committed_memory_mb` takes the node it is counting for. An
+operator upgrading a single-node install needs to change nothing; anyone
+depending on `oxid-core` as a library does.
+
+Two behaviours also change without breaking an API. `OXID_DEPLOY_CONCURRENCY`
+left unset is now derived from the fleet rather than fixed at 4 — identical
+on one node, higher on several. And a node this daemon cannot reach no longer
+has its environments rewritten under any circumstances, where previously an
+unreachable node answering "no such container" could mark them destroyed.
+
 ### Added
 
 - **Oxid runs on more than one machine.** `oxid node add eu-1 tcp://…:2376`
