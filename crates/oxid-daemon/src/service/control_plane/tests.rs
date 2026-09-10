@@ -1,10 +1,10 @@
 use super::*;
 use crate::adapter::store::SqliteStore;
 use oxid_core::{
-    AuditFilter, Branch, BranchName, BuildReport, BuildSpec, ContainerPort, ContainerSpec,
-    ContainerStatus, EnvVarScope, Environment, EnvironmentState, EnvironmentStore, GitError,
-    GitPort, HostCapacity, LogStream, OciError, OffsetDateTime, PoolError, PoolKind, ProjectId,
-    ProjectStore, RepoUrl, StateTransition,
+    AuditFilter, BranchName, BuildReport, BuildSpec, ContainerPort, ContainerSpec, ContainerStatus,
+    EnvVarScope, Environment, EnvironmentState, EnvironmentStore, GitError, GitPort, HostCapacity,
+    LogStream, OciError, OffsetDateTime, PoolError, PoolKind, ProjectId, ProjectStore, RepoUrl,
+    StateTransition,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

@@ -1,5 +1,4 @@
 #![allow(
-    unused_imports,
     clippy::pedantic,
     clippy::nursery,
     clippy::too_many_lines,

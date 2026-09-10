@@ -1,35 +1,20 @@
 #![allow(
-    unused_imports,
     clippy::too_many_lines,
     clippy::too_many_arguments,
     clippy::pedantic,
     clippy::nursery,
     clippy::empty_line_after_doc_comments
 )]
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use super::ControlPlane;
 use super::error::CpError;
-use super::helpers::{
-    hash_token, image_name, lowest_free_index, resolved_container_name, sanitize_identifier,
-    sanitize_label, state_err,
-};
-use super::types::{Admission, DeployOutcome, GcSummary, InfraStatus, NodeStats};
-use crate::adapter::config;
-use crate::adapter::postgres_pool::PostgresPool;
-use crate::adapter::store::{ApiTokenSummary, SqliteStore};
-use crate::request_context::current_request_id;
+use super::helpers::{image_name, resolved_container_name, state_err};
+use super::types::GcSummary;
 use oxid_core::services::gc::{self, GcAction};
-use oxid_core::services::subdomain::subdomain_for;
-use oxid_core::services::var_resolution::{VarSources, set_secret};
 use oxid_core::{
-    AuditEvent, AuditFilter, AuditStore, Branch, BranchName, BuildSpec, CommitRef, ContainerPort,
-    ContainerSpec, ContainerStatus, Dependency, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, EnvironmentStore, GitPort, HostCapacity, LogStream, OciError, OffsetDateTime,
-    PoolError, PoolKind, Project, ProjectId, ProjectStore, RepoUrl, RepositoryError, SecretStore,
-    SecretValue, SelfWiringStatus, StateTransition, TraefikSpec, Ttl,
+    AuditEvent, AuditStore, ContainerPort, ContainerStatus, Environment, EnvironmentId,
+    EnvironmentState, EnvironmentStore, GitPort, OciError, OffsetDateTime, Project, ProjectId,
+    ProjectStore, StateTransition,
 };
 
 /// Concurrent container-status queries during startup reconciliation.

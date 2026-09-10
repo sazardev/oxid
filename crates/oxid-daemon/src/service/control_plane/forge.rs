@@ -13,7 +13,7 @@ use oxid_core::services::forge::{
     CommentContext, ForgeKind, PreviewState, RetryDecision, api_base_for, comment_marker,
     render_comment, retry_decision,
 };
-use oxid_core::{ContainerPort, ForgePort, ForgeRequest, GitPort, ProjectId};
+use oxid_core::{ContainerPort, ForgePort, ForgeRequest, GitPort};
 
 use super::ControlPlane;
 use super::error::CpError;
@@ -244,9 +244,6 @@ pub struct ProjectForge {
     /// The write-scoped credential, decrypted.
     pub token: String,
 }
-
-#[allow(unused_imports)]
-use ProjectId as _EnsureProjectIdUsed;
 
 #[cfg(test)]
 mod tests {

@@ -19,8 +19,7 @@ use std::sync::Arc;
 use super::ControlPlane;
 use super::error::CpError;
 use oxid_core::{
-    ContainerPort, EnvironmentStore, GitPort, HostCapacity, Node, NodeEndpoint, NodeId, NodeState,
-    NodeTls, OciError,
+    ContainerPort, GitPort, HostCapacity, Node, NodeEndpoint, NodeId, NodeState, NodeTls, OciError,
 };
 
 /// Builds a Docker client for a node.

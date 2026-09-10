@@ -1,5 +1,4 @@
 #![allow(
-    unused_imports,
     clippy::too_many_lines,
     clippy::too_many_arguments,
     clippy::pedantic,
@@ -10,8 +9,8 @@
 use std::path::Path;
 
 use oxid_core::{
-    BranchName, ContainerPort, Environment, EnvironmentState, EnvironmentStore, GitPort, Project,
-    ProjectId, ProjectStore, RepoUrl, RepositoryError, Ttl,
+    ContainerPort, Environment, EnvironmentState, EnvironmentStore, GitPort, Project, ProjectId,
+    ProjectStore, RepoUrl, RepositoryError, Ttl,
 };
 
 use crate::adapter::config;

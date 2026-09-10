@@ -4,7 +4,7 @@
 //! wires [`SqliteStore`], a [`GitPort`] and a [`ContainerPort`] together to
 //! expose the operations the interfaces (CLI, HTTP API) call.
 
-#![allow(unused_imports, clippy::pedantic, clippy::nursery)]
+#![allow(clippy::pedantic, clippy::nursery)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
