@@ -57,6 +57,12 @@ struct BranchProxy {
     /// the wrong machine's right port — which is not a connection failure
     /// but somebody else's application answering.
     target: Arc<ArcSwapOption<Target>>,
+    /// The accept loop's task handle, so [`ProxyRegistry::remove`] can stop
+    /// it. Without this the task outlives the registry entry: the listener
+    /// stays bound (and the task leaks) for the life of the process, so a
+    /// branch destroyed and later redeployed could never rebind its
+    /// persisted `public_port`, and every destroyed branch leaked a socket.
+    accept_loop: tokio::task::JoinHandle<()>,
 }
 
 /// In-memory registry of every branch's stable proxy. Not itself
@@ -110,12 +116,13 @@ impl ProxyRegistry {
         };
         let public_port = listener.local_addr().map_err(ProxyError)?.port();
         let target = Arc::new(ArcSwapOption::empty());
-        spawn_accept_loop(listener, Arc::clone(&target));
+        let accept_loop = spawn_accept_loop(listener, Arc::clone(&target));
         proxies.insert(
             key,
             BranchProxy {
                 public_port,
                 target,
+                accept_loop,
             },
         );
         Ok(public_port)
@@ -156,15 +163,27 @@ impl ProxyRegistry {
 
     /// Drops a branch's proxy entirely, freeing its public port. Used when
     /// an environment is permanently destroyed.
+    ///
+    /// Waits for the listener task to actually stop before returning, so
+    /// the port is free the moment this resolves — a redeploy that rebinds
+    /// the persisted `public_port` right after does not race it.
     pub async fn remove(&self, project_id: ProjectId, branch: &BranchName) {
-        self.proxies
+        let removed = self
+            .proxies
             .lock()
             .await
             .remove(&(project_id, branch.to_string()));
+        if let Some(proxy) = removed {
+            proxy.accept_loop.abort();
+            let _ = proxy.accept_loop.await;
+        }
     }
 }
 
-fn spawn_accept_loop(listener: TcpListener, target: Arc<ArcSwapOption<Target>>) {
+fn spawn_accept_loop(
+    listener: TcpListener,
+    target: Arc<ArcSwapOption<Target>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let Ok((mut inbound, _)) = listener.accept().await else {
@@ -186,7 +205,7 @@ fn spawn_accept_loop(listener: TcpListener, target: Arc<ArcSwapOption<Target>>) 
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
             });
         }
-    });
+    })
 }
 
 /// Polls a freshly-started container's published port until it accepts TCP
@@ -212,5 +231,234 @@ pub async fn wait_until_ready(target: &Target, timeout: Duration) -> bool {
             return false;
         }
         sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn branch_named(name: &str) -> BranchName {
+        BranchName::parse(name).expect("test branch name is valid")
+    }
+
+    /// A loopback TCP echo server, standing in for a deployed container.
+    async fn echo_server() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 || socket.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// A redeploy must keep the branch's address stable — the promise
+    /// direct-publish mode exists to make.
+    #[tokio::test]
+    async fn a_branch_keeps_the_same_public_port_across_calls() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+
+        let first = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+        let second = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+
+        assert_eq!(first, second, "a redeploy must not move the public port");
+    }
+
+    /// The daemon restart path: the environment row remembers its port and
+    /// the registry is asked for exactly that one.
+    #[tokio::test]
+    async fn a_remembered_port_is_rebound_when_it_is_still_free() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let preferred = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let got = registry
+            .ensure(ProjectId(1), &branch, Some(preferred))
+            .await
+            .unwrap();
+
+        assert_eq!(got, preferred);
+    }
+
+    /// If something else grabbed the remembered port while the daemon was
+    /// down, that is not worth failing a deploy over — a fresh port is fine.
+    #[tokio::test]
+    async fn a_remembered_port_that_is_taken_falls_back_instead_of_failing() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let occupied = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let taken = occupied.local_addr().unwrap().port();
+
+        let got = registry
+            .ensure(ProjectId(1), &branch, Some(taken))
+            .await
+            .unwrap();
+
+        assert_ne!(got, taken);
+    }
+
+    /// End to end: bytes written to the public port come back from whatever
+    /// the target points at.
+    #[tokio::test]
+    async fn traffic_flows_to_the_branchs_current_target() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let (upstream_port, upstream) = echo_server().await;
+        let public_port = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+        registry
+            .set_target(
+                ProjectId(1),
+                &branch,
+                Target {
+                    host: "127.0.0.1".to_owned(),
+                    port: upstream_port,
+                },
+            )
+            .await;
+
+        let exchange = async {
+            let mut client = TcpStream::connect(("127.0.0.1", public_port))
+                .await
+                .unwrap();
+            client.write_all(b"ping").await.unwrap();
+            let mut echoed = [0u8; 4];
+            client.read_exact(&mut echoed).await.unwrap();
+            echoed
+        };
+        let echoed = tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .expect("the proxy never answered");
+
+        assert_eq!(&echoed, b"ping");
+        upstream.abort();
+    }
+
+    /// The zero-downtime cutover: the public port stays put and only the
+    /// target changes.
+    #[tokio::test]
+    async fn a_cutover_swaps_the_target_without_changing_the_port() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let public_port = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+        let first = Target {
+            host: "127.0.0.1".to_owned(),
+            port: 1111,
+        };
+        let second = Target {
+            host: "10.0.0.7".to_owned(),
+            port: 2222,
+        };
+
+        registry
+            .set_target(ProjectId(1), &branch, first.clone())
+            .await;
+        assert_eq!(registry.target(ProjectId(1), &branch).await, Some(first));
+        assert_eq!(
+            registry.ensure(ProjectId(1), &branch, None).await.unwrap(),
+            public_port
+        );
+
+        registry
+            .set_target(ProjectId(1), &branch, second.clone())
+            .await;
+        assert_eq!(registry.target(ProjectId(1), &branch).await, Some(second));
+        assert_eq!(
+            registry.ensure(ProjectId(1), &branch, None).await.unwrap(),
+            public_port
+        );
+    }
+
+    /// A sleeping branch fails fast instead of hanging new clients: the
+    /// connection is accepted and closed.
+    #[tokio::test]
+    async fn mark_unavailable_closes_new_connections_instead_of_hanging() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let (upstream_port, upstream) = echo_server().await;
+        let public_port = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+        registry
+            .set_target(
+                ProjectId(1),
+                &branch,
+                Target {
+                    host: "127.0.0.1".to_owned(),
+                    port: upstream_port,
+                },
+            )
+            .await;
+
+        registry.mark_unavailable(ProjectId(1), &branch).await;
+        assert_eq!(registry.target(ProjectId(1), &branch).await, None);
+
+        let mut client = TcpStream::connect(("127.0.0.1", public_port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("a branch with no upstream must not hang the client");
+        assert_eq!(read.unwrap(), 0, "expected an immediate EOF");
+        upstream.abort();
+    }
+
+    /// `remove` is what a destroyed environment calls, and its whole point
+    /// over `mark_unavailable` is that the port is free again afterwards.
+    #[tokio::test]
+    async fn removing_a_branch_frees_its_public_port() {
+        let registry = ProxyRegistry::default();
+        let branch = branch_named("feature-login");
+        let port = registry.ensure(ProjectId(1), &branch, None).await.unwrap();
+
+        registry.remove(ProjectId(1), &branch).await;
+        assert_eq!(registry.target(ProjectId(1), &branch).await, None);
+
+        TcpListener::bind(("0.0.0.0", port))
+            .await
+            .expect("remove() must stop the listener, not just drop the map entry");
+    }
+
+    /// Keyed by (project, branch): two branches never share a port or a
+    /// target, and neither do two projects' branches with the same name.
+    #[tokio::test]
+    async fn proxies_are_scoped_by_project_and_branch() {
+        let registry = ProxyRegistry::default();
+        let one = branch_named("one");
+        let two = branch_named("two");
+
+        let local_one = registry.ensure(ProjectId(1), &one, None).await.unwrap();
+        let local_two = registry.ensure(ProjectId(1), &two, None).await.unwrap();
+        let other_one = registry.ensure(ProjectId(2), &one, None).await.unwrap();
+        assert_ne!(local_one, local_two);
+        assert_ne!(local_one, other_one);
+        assert_ne!(local_two, other_one);
+
+        registry
+            .set_target(
+                ProjectId(1),
+                &one,
+                Target {
+                    host: "127.0.0.1".to_owned(),
+                    port: 1,
+                },
+            )
+            .await;
+        assert_eq!(registry.target(ProjectId(1), &two).await, None);
+        assert_eq!(registry.target(ProjectId(2), &one).await, None);
     }
 }
