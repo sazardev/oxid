@@ -6,6 +6,69 @@ is the breaking position.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-10
+
+A hardening release from a test-and-audit pass over the daemon and its
+suite: no public Rust API changed, an existing install needs no
+configuration change, and the workspace gained 28 tests (582 total, plus the
+10 Docker/Postgres integration ones). Three responses do move, and are worth
+knowing before upgrading: an unknown path under `/api/` is now a JSON `404`
+instead of the dashboard shell, a configured rate limit now covers the
+webhook endpoints, and `500` responses carry a `request_id` while the detail
+moves to the daemon log.
+
+### Fixed
+
+- **A destroyed branch leaked its proxy listener.** `ProxyRegistry::remove`
+  promised to free the branch's stable public port but only dropped the map
+  entry: the accept loop kept the bound listener for the life of the
+  process, so the socket was never released and a later redeploy could not
+  rebind the environment's persisted `public_port`. `remove` now aborts and
+  awaits the task before returning. Eight tests pin the contract — the port
+  surviving redeploys, remembered-port reuse and its fallback when taken,
+  live traffic through the proxy, cutover without moving the port,
+  fail-fast with no upstream, per-project/per-branch scoping, and the port
+  actually being rebindable afterwards.
+- **A typo in the API looked like a success.** Unknown paths under `/api/`
+  answered `200` with the dashboard's HTML, so a client checking the status
+  code could not tell a misspelled endpoint from a working one. They now
+  answer the same JSON `404` shape as every other API failure; dashboard
+  deep links under `/ui/` still get the SPA shell.
+- **Two Docker integration tests left their images behind.** Every run
+  built `oxid-test/exec-exit-code` and `oxid-test/dynamic-port` and never
+  removed them, so a developer's daemon accumulated them. Both now delete
+  what they build.
+
+### Security
+
+- **Webhooks obey the configured rate limit.** They are unauthenticated by
+  design — the HMAC is the auth — so a flood of bad signatures was
+  otherwise free CPU. They now share the
+  `OXID_RATE_LIMIT_PER_SECOND`/`OXID_RATE_LIMIT_BURST` bucket. `/wake` and
+  `/heartbeat` deliberately stay outside every bucket: Traefik's `errors`
+  middleware hits them on every request to a live app, and throttling them
+  would throttle real users behind the proxy's IP.
+- **Internal errors no longer cross the API boundary.** Storage, Git,
+  Docker and pool failures answered `500` with their raw message — SQL text,
+  filesystem paths, Docker output. They now log the detail server-side and
+  answer `"internal server error"` plus a `request_id`, matching what the
+  panic handler already did. `POST /api/v1/rotate-key` keeps its detailed
+  `500` on purpose: that message carries the new master key so an operator
+  can recover instead of losing every secret.
+
+### Changed
+
+- The daemon's startup parsers (`OXID_RATE_LIMIT_*`,
+  `OXID_NODE_STATUS_TIMEOUT_SECS`, `OXID_TRAEFIK_POLL_INTERVAL`, the ACME
+  block, `OXID_BACKUP_*`, `OXID_FORGE_TIMEOUT_SECS`) now have pure, tested
+  halves, and `OXID_MASTER_KEY` goes through a tested `Cipher::from_hex`.
+  No runtime behaviour changes; these were untestable inline `std::env`
+  reads before.
+- The split god-files no longer carry a full import prelude and a copy of
+  the router's module doc: ~415 dead imports and 15 duplicated module docs
+  are gone, along with `#![allow(unused_imports)]`, so `clippy -D warnings`
+  sees those modules again.
+
 ## [0.5.0] - 2026-09-01
 
 The minor moves rather than the patch because this release changes contracts,
