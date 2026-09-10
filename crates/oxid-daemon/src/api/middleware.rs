@@ -1,47 +1,26 @@
 #![allow(
-    unused_imports,
     clippy::pedantic,
     clippy::nursery,
     clippy::too_many_lines,
     clippy::empty_line_after_doc_comments,
     clippy::duplicate_mod
 )]
-//! `HTTP` API and webhook surface (SPEC.md §5: the shared internal API).
-//!
-//! The CLI, TUI, dashboard and desktop app all consume this router.
 
 use std::any::Any;
-use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 
-use axum::body::Bytes;
-use axum::extract::{ConnectInfo, Extension, Path, Query, Request, State};
+use axum::Json;
+use axum::extract::{ConnectInfo, Extension, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
-use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use oxid_core::services::access::{Capability, Grant};
-use oxid_core::{
-    AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
-    Ttl,
-};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::Sha256;
-use tower_governor::GovernorLayer;
+use oxid_core::{ContainerPort, GitPort};
+use serde_json::json;
 use tower_governor::errors::GovernorError;
-use tower_governor::governor::GovernorConfigBuilder;
-use tower_governor::key_extractor::{GlobalKeyExtractor, KeyExtractor};
-use tower_http::catch_panic::CatchPanicLayer;
+use tower_governor::key_extractor::KeyExtractor;
 
 use crate::request_context::current_request_id;
-use crate::{ControlPlane, CpError, DeployOutcome};
 
 /// Header carrying the per-request correlation id (see
 use super::ApiState;
@@ -308,6 +287,20 @@ impl KeyExtractor for ClientIpKeyExtractor {
             .get::<ConnectInfo<SocketAddr>>()
             .map(|connect_info| connect_info.ip())
             .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_accepts_only_identical_bytes() {
+        assert!(constant_time_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokeN"));
+        assert!(!constant_time_eq(b"secret-token", b"secret-tokens"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
 

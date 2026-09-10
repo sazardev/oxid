@@ -192,21 +192,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(DEFAULT_GC_INTERVAL_SECS);
 
     let cipher = match std::env::var("OXID_MASTER_KEY") {
-        Ok(raw) => {
-            let bytes = hex::decode(&raw).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid OXID_MASTER_KEY: {e}"),
-                )
-            })?;
-            let key: [u8; 32] = bytes.try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "OXID_MASTER_KEY must be 64 hex characters (32 bytes)",
-                )
-            })?;
-            Cipher::from_key(key)
-        }
+        Ok(raw) => Cipher::from_hex(&raw).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid OXID_MASTER_KEY: {e}"),
+            )
+        })?,
         Err(_) => Cipher::load_or_create(&PathBuf::from(&data_dir).join("secret.key"))?,
     };
 
@@ -357,9 +348,17 @@ where
 /// down, but a link worse than that wants more headroom before a slow node
 /// starts looking like a dead one.
 fn node_status_timeout() -> Option<std::time::Duration> {
-    std::env::var("OXID_NODE_STATUS_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    parse_node_status_timeout(
+        std::env::var("OXID_NODE_STATUS_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure half of [`node_status_timeout`]; whitespace is tolerated, `0` and
+/// garbage both mean "use the default".
+fn parse_node_status_timeout(raw: Option<&str>) -> Option<std::time::Duration> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
         .map(std::time::Duration::from_secs)
 }
@@ -373,10 +372,15 @@ fn node_status_timeout() -> Option<std::time::Duration> {
 /// is routable, and shortening it buys a few seconds on a first deploy at
 /// the cost of a poll per second forever.
 fn traefik_poll_interval() -> String {
-    std::env::var("OXID_TRAEFIK_POLL_INTERVAL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "5s".to_owned())
+    parse_traefik_poll_interval(std::env::var("OXID_TRAEFIK_POLL_INTERVAL").ok().as_deref())
+}
+
+/// Pure half of [`traefik_poll_interval`]: blank or unset keeps the 5s
+/// default, which is Traefik's own.
+fn parse_traefik_poll_interval(raw: Option<&str>) -> String {
+    raw.filter(|v| !v.trim().is_empty())
+        .unwrap_or("5s")
+        .to_owned()
 }
 
 /// Binds `addr` and serves `app` — plain HTTP, or HTTPS if
@@ -529,12 +533,18 @@ fn lower_oom_score() {
 /// Reads `OXID_RATE_LIMIT_PER_SECOND`/`OXID_RATE_LIMIT_BURST`. `None`
 /// (rate limiting disabled) unless both are set and parse.
 fn rate_limit_from_env() -> Option<(u64, u32)> {
-    let per_second = std::env::var("OXID_RATE_LIMIT_PER_SECOND")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())?;
-    let burst = std::env::var("OXID_RATE_LIMIT_BURST")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())?;
+    parse_rate_limit(
+        std::env::var("OXID_RATE_LIMIT_PER_SECOND").ok().as_deref(),
+        std::env::var("OXID_RATE_LIMIT_BURST").ok().as_deref(),
+    )
+}
+
+/// Pure half of [`rate_limit_from_env`], so the parsing rules are testable
+/// without mutating process-wide environment variables. Both values are
+/// required: one alone leaves the limit off rather than guessing the other.
+fn parse_rate_limit(per_second: Option<&str>, burst: Option<&str>) -> Option<(u64, u32)> {
+    let per_second = per_second?.parse::<u64>().ok()?;
+    let burst = burst?.parse::<u32>().ok()?;
     Some((per_second, burst))
 }
 
@@ -573,7 +583,50 @@ fn bind_is_loopback(addr: &str) -> bool {
 fn acme_from_env(
     traefik_http_port: u16,
 ) -> Result<Option<(AcmeConfig, u16)>, Box<dyn std::error::Error>> {
-    let Ok(email) = std::env::var("OXID_ACME_EMAIL") else {
+    let email = std::env::var("OXID_ACME_EMAIL").ok();
+    let dns_provider = std::env::var("OXID_ACME_DNS_PROVIDER").ok();
+    let dns_env = std::env::var("OXID_ACME_DNS_ENV").ok();
+    let ca = std::env::var("OXID_ACME_CA").ok();
+    let storage = std::env::var("OXID_ACME_STORAGE").ok();
+    let http_redirect = std::env::var("OXID_ACME_HTTP_REDIRECT").ok();
+    let https_port = std::env::var("OXID_TRAEFIK_HTTPS_PORT").ok();
+    acme_config_from(
+        AcmeEnv {
+            email: email.as_deref(),
+            dns_provider: dns_provider.as_deref(),
+            dns_env: dns_env.as_deref(),
+            ca: ca.as_deref(),
+            storage: storage.as_deref(),
+            http_redirect: http_redirect.as_deref(),
+            https_port: https_port.as_deref(),
+        },
+        traefik_http_port,
+    )
+}
+
+/// The raw values [`acme_from_env`] reads, as borrowed strings so
+/// [`acme_config_from`] is testable without touching the process
+/// environment.
+#[derive(Clone, Copy)]
+struct AcmeEnv<'a> {
+    email: Option<&'a str>,
+    dns_provider: Option<&'a str>,
+    dns_env: Option<&'a str>,
+    ca: Option<&'a str>,
+    storage: Option<&'a str>,
+    http_redirect: Option<&'a str>,
+    https_port: Option<&'a str>,
+}
+
+/// Pure half of [`acme_from_env`]: turns the values into a validated
+/// `AcmeConfig`. An unset `email` means ACME is simply not configured; a set
+/// one is validated so a challenge that could never work is a startup error
+/// rather than a self-signed certificate later.
+fn acme_config_from(
+    env: AcmeEnv<'_>,
+    traefik_http_port: u16,
+) -> Result<Option<(AcmeConfig, u16)>, Box<dyn std::error::Error>> {
+    let Some(email) = env.email else {
         return Ok(None);
     };
 
@@ -581,10 +634,11 @@ fn acme_from_env(
     // wildcard covers every branch that will ever exist, it needs no inbound
     // reachability, and it sidesteps the per-branch certificate that runs
     // into Let's Encrypt's rate limit on a repository with many branches.
-    let challenge = match std::env::var("OXID_ACME_DNS_PROVIDER") {
-        Ok(provider) if !provider.trim().is_empty() => AcmeChallenge::Dns01 {
-            provider,
-            env_keys: std::env::var("OXID_ACME_DNS_ENV")
+    let challenge = match env.dns_provider {
+        Some(provider) if !provider.trim().is_empty() => AcmeChallenge::Dns01 {
+            provider: provider.to_owned(),
+            env_keys: env
+                .dns_env
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim)
@@ -596,25 +650,24 @@ fn acme_from_env(
     };
 
     let acme = AcmeConfig {
-        email,
+        email: email.to_owned(),
         challenge,
         // `staging` is an alias rather than a URL because the full one is
         // long, easy to typo, and getting it wrong means burning production
         // rate limits — which is the one mistake this flag exists to avoid.
-        ca_directory: match std::env::var("OXID_ACME_CA").ok().as_deref() {
+        ca_directory: match env.ca {
             None | Some("production") => None,
             Some("staging") => {
                 Some("https://acme-staging-v02.api.letsencrypt.org/directory".to_owned())
             }
             Some(url) => Some(url.to_owned()),
         },
-        storage_volume: std::env::var("OXID_ACME_STORAGE")
-            .unwrap_or_else(|_| "oxid-acme".to_owned()),
+        storage_volume: env.storage.unwrap_or("oxid-acme").to_owned(),
         resolver_name: "oxid".to_owned(),
-        http_redirect: std::env::var("OXID_ACME_HTTP_REDIRECT").as_deref() != Ok("0"),
+        http_redirect: env.http_redirect != Some("0"),
     };
-    let https_port = std::env::var("OXID_TRAEFIK_HTTPS_PORT")
-        .ok()
+    let https_port = env
+        .https_port
         .and_then(|v| v.parse::<u16>().ok())
         .filter(|&p| p > 0)
         .unwrap_or(443);
@@ -728,20 +781,12 @@ fn restrict_to_owner(_path: &std::path::Path) -> std::io::Result<()> {
 ///    get told once, loudly, instead of discovering it via a full disk of
 ///    never-destroyed environments.
 fn enforce_startup_security_posture(addr: &str, api_token: Option<&String>) {
+    let allow_open = std::env::var("OXID_ALLOW_OPEN_API").as_deref() == Ok("1");
+    if let Err(message) = open_api_verdict(addr, api_token.is_some(), allow_open) {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
     if api_token.is_none() {
-        if !bind_is_loopback(addr) && std::env::var("OXID_ALLOW_OPEN_API").as_deref() != Ok("1") {
-            eprintln!(
-                "refusing to start: OXID_ADDR ({addr}) is not a loopback address and \
-                 OXID_API_TOKEN is not set, so anyone who can reach this daemon could deploy,\n\
-                 destroy environments and read secret names.\n\n\
-                 Fix one of three ways:\n  \
-                 1. set OXID_API_TOKEN to a long random value (recommended; pass it to the CLI \
-                 as --token/OXID_TOKEN),\n  \
-                 2. bind OXID_ADDR to 127.0.0.1 (or localhost) and put your own proxy in front,\n  \
-                 3. set OXID_ALLOW_OPEN_API=1 to explicitly run an unauthenticated API anyway."
-            );
-            std::process::exit(1);
-        }
         tracing::warn!(
             "OXID_API_TOKEN is not set: the control API is open to anyone who can reach it"
         );
@@ -755,6 +800,25 @@ fn enforce_startup_security_posture(addr: &str, api_token: Option<&String>) {
              destroyed). Traefik mode is the supported production topology: see `oxid infra setup`."
         );
     }
+}
+
+/// Pure half of the open-API gate: `Err(message)` is the refusal to print
+/// and die on. Refuses when the daemon has no token, binds beyond loopback,
+/// and the operator has not explicitly accepted the risk.
+fn open_api_verdict(addr: &str, has_token: bool, allow_open: bool) -> Result<(), String> {
+    if has_token || allow_open || bind_is_loopback(addr) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to start: OXID_ADDR ({addr}) is not a loopback address and \
+         OXID_API_TOKEN is not set, so anyone who can reach this daemon could deploy,\n\
+         destroy environments and read secret names.\n\n\
+         Fix one of three ways:\n  \
+         1. set OXID_API_TOKEN to a long random value (recommended; pass it to the CLI \
+         as --token/OXID_TOKEN),\n  \
+         2. bind OXID_ADDR to 127.0.0.1 (or localhost) and put your own proxy in front,\n  \
+         3. set OXID_ALLOW_OPEN_API=1 to explicitly run an unauthenticated API anyway."
+    ))
 }
 
 /// Loads `OXID_TLS_CERT`/`OXID_TLS_KEY` into a rustls server config when
@@ -919,7 +983,11 @@ fn swap_in_restored_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_staged_restore, bind_is_loopback, credential, generate_hex_secret};
+    use super::{
+        AcmeChallenge, AcmeEnv, acme_config_from, apply_staged_restore, bind_is_loopback,
+        credential, generate_hex_secret, open_api_verdict, parse_node_status_timeout,
+        parse_rate_limit, parse_traefik_poll_interval,
+    };
 
     /// A data directory holding a database with `marker` in it, plus a
     /// `secret.key`. The marker is how a test tells which database
@@ -1170,5 +1238,120 @@ mod tests {
         std::fs::write(&path, "abc123\n").unwrap();
         let resolved = credential(None, true, &path, "API token").unwrap().unwrap();
         assert_eq!(resolved, "abc123");
+    }
+
+    #[test]
+    fn rate_limit_needs_both_values_and_parses_them() {
+        assert_eq!(parse_rate_limit(Some("10"), Some("20")), Some((10, 20)));
+        assert_eq!(parse_rate_limit(Some("10"), None), None);
+        assert_eq!(parse_rate_limit(None, Some("20")), None);
+        assert_eq!(parse_rate_limit(Some("ten"), Some("20")), None);
+        assert_eq!(parse_rate_limit(Some("10"), Some("-1")), None);
+    }
+
+    #[test]
+    fn node_status_timeout_tolerates_whitespace_and_rejects_zero() {
+        assert_eq!(
+            parse_node_status_timeout(Some(" 7 ")),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(parse_node_status_timeout(Some("0")), None);
+        assert_eq!(parse_node_status_timeout(Some("soon")), None);
+        assert_eq!(parse_node_status_timeout(None), None);
+    }
+
+    #[test]
+    fn traefik_poll_interval_defaults_when_blank() {
+        assert_eq!(parse_traefik_poll_interval(None), "5s");
+        assert_eq!(parse_traefik_poll_interval(Some("   ")), "5s");
+        assert_eq!(parse_traefik_poll_interval(Some("1s")), "1s");
+    }
+
+    fn acme_env(email: Option<&str>) -> AcmeEnv<'_> {
+        AcmeEnv {
+            email,
+            dns_provider: None,
+            dns_env: None,
+            ca: None,
+            storage: None,
+            http_redirect: None,
+            https_port: None,
+        }
+    }
+
+    #[test]
+    fn acme_without_an_email_is_not_configured() {
+        assert!(
+            acme_config_from(acme_env(None), 80).unwrap().is_none(),
+            "no email means no ACME, whatever else is set"
+        );
+    }
+
+    #[test]
+    fn acme_defaults_to_http01_on_a_generous_https_port() {
+        let (acme, https_port) = acme_config_from(acme_env(Some("ops@example.com")), 80)
+            .unwrap()
+            .unwrap();
+        assert_eq!(acme.email, "ops@example.com");
+        assert!(matches!(acme.challenge, AcmeChallenge::Http01));
+        assert_eq!(https_port, 443);
+        assert!(acme.http_redirect);
+    }
+
+    #[test]
+    fn acme_dns01_parses_its_credential_list() {
+        let mut env = acme_env(Some("ops@example.com"));
+        env.dns_provider = Some("cloudflare");
+        env.dns_env = Some(" CF_DNS_API_TOKEN , ,CF_ZONE_ID ");
+        let (acme, _) = acme_config_from(env, 80).unwrap().unwrap();
+        match acme.challenge {
+            AcmeChallenge::Dns01 { provider, env_keys } => {
+                assert_eq!(provider, "cloudflare");
+                assert_eq!(env_keys, vec!["CF_DNS_API_TOKEN", "CF_ZONE_ID"]);
+            }
+            AcmeChallenge::Http01 => panic!("a named provider must select DNS-01"),
+        }
+    }
+
+    #[test]
+    fn acme_staging_is_an_alias_for_the_staging_directory() {
+        let mut env = acme_env(Some("ops@example.com"));
+        env.ca = Some("staging");
+        let (acme, _) = acme_config_from(env, 80).unwrap().unwrap();
+        assert_eq!(
+            acme.ca_directory.as_deref(),
+            Some("https://acme-staging-v02.api.letsencrypt.org/directory")
+        );
+
+        let mut env = acme_env(Some("ops@example.com"));
+        env.ca = Some("production");
+        assert!(
+            acme_config_from(env, 80)
+                .unwrap()
+                .unwrap()
+                .0
+                .ca_directory
+                .is_none(),
+            "`production` means Let's Encrypt's default directory"
+        );
+    }
+
+    #[test]
+    fn acme_http01_on_the_wrong_port_is_refused_at_startup() {
+        let err = acme_config_from(acme_env(Some("ops@example.com")), 8080).unwrap_err();
+        assert!(err.to_string().contains("80"), "{err}");
+    }
+
+    #[test]
+    fn open_api_gate_refuses_only_what_it_should() {
+        assert!(open_api_verdict("0.0.0.0:8080", false, false).is_err());
+        assert!(
+            open_api_verdict("no-such-host.invalid:8080", false, false).is_err(),
+            "an unresolvable bind fails closed"
+        );
+        assert!(open_api_verdict("0.0.0.0:8080", true, false).is_ok());
+        assert!(open_api_verdict("0.0.0.0:8080", false, true).is_ok());
+        assert!(open_api_verdict("127.0.0.1:8080", false, false).is_ok());
+        assert!(open_api_verdict("localhost:8080", false, false).is_ok());
     }
 }

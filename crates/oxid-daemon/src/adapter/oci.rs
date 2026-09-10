@@ -1402,6 +1402,9 @@ mod tests {
         );
 
         client.remove(name).await.unwrap();
+        // Leave nothing behind: a CI runner is ephemeral, but a developer's
+        // daemon is not, and this image exists only for this test.
+        let _ = client.remove_image(&spec.image).await;
     }
 
     /// Regression test for the exact real-world complaint that motivated
@@ -1457,6 +1460,7 @@ mod tests {
 
         client.remove(name_a).await.unwrap();
         client.remove(name_b).await.unwrap();
+        let _ = client.remove_image(&image).await;
     }
 
     #[test]

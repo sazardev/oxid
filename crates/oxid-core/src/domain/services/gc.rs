@@ -238,4 +238,54 @@ mod tests {
         let e = env(now, now - Duration::days(8));
         assert_eq!(evaluate(&e, &p, now), GcAction::Destroy);
     }
+
+    /// `Building` is in flight: a GC tick racing a deploy must leave it
+    /// alone, even at a timestamp that would otherwise be destroyed. This is
+    /// also what keeps `evaluate`'s `unreachable!()` arm unreachable.
+    #[test]
+    fn a_building_environment_is_never_touched_by_gc() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let p = project(30, 7);
+        let e = Environment::new(
+            EnvironmentId(1),
+            ProjectId(1),
+            Branch::new(BranchName::parse("feature-a").unwrap(), SHA).unwrap(),
+            EnvironmentState::Building,
+            "feature-a.app.local.dev",
+            now,
+        )
+        .unwrap()
+        .touch_or_panic(now - Duration::days(30));
+        assert_eq!(evaluate(&e, &p, now), GcAction::Keep);
+    }
+
+    /// A failed build has no container to pause; it stays visible (so
+    /// `oxid status` can show the failure) until `destroy_after` sweeps it
+    /// up like anything else.
+    #[test]
+    fn a_failed_build_is_kept_until_destroy_after() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let p = project(30, 7);
+        let failed_build = |accessed| {
+            Environment::new(
+                EnvironmentId(1),
+                ProjectId(1),
+                Branch::new(BranchName::parse("feature-a").unwrap(), SHA).unwrap(),
+                EnvironmentState::BuildFailed,
+                "feature-a.app.local.dev",
+                now,
+            )
+            .unwrap()
+            .touch_or_panic(accessed)
+        };
+        assert_eq!(
+            evaluate(&failed_build(now - Duration::minutes(5)), &p, now),
+            GcAction::Keep,
+            "the failure must stay visible for `oxid status`"
+        );
+        assert_eq!(
+            evaluate(&failed_build(now - Duration::days(8)), &p, now),
+            GcAction::Destroy
+        );
+    }
 }

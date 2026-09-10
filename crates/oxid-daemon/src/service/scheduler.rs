@@ -80,9 +80,26 @@ where
 
 /// Per-request timeout for git-host calls (`OXID_FORGE_TIMEOUT_SECS`).
 fn forge_timeout_secs() -> u64 {
-    std::env::var("OXID_FORGE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    parse_forge_timeout(std::env::var("OXID_FORGE_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Pure half of [`forge_timeout_secs`]: `0`, garbage and unset all mean the
+/// 20s default.
+fn parse_forge_timeout(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.parse().ok())
         .filter(|&s| s > 0)
         .unwrap_or(20)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forge_timeout_defaults_and_ignores_zero() {
+        assert_eq!(parse_forge_timeout(None), 20);
+        assert_eq!(parse_forge_timeout(Some("0")), 20);
+        assert_eq!(parse_forge_timeout(Some("nope")), 20);
+        assert_eq!(parse_forge_timeout(Some("45")), 45);
+    }
 }

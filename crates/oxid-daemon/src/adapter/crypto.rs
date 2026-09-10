@@ -20,6 +20,10 @@ pub enum CryptoError {
     /// Encryption or decryption of a value failed.
     #[error("crypto failure: {0}")]
     Operation(String),
+    /// A caller-supplied master key (e.g. `OXID_MASTER_KEY`) was not 32
+    /// bytes of hex.
+    #[error("invalid master key: {0}")]
+    InvalidKey(String),
 }
 
 /// A 256-bit master key wrapped around AES-256-GCM.
@@ -33,6 +37,21 @@ impl Cipher {
     #[must_use]
     pub fn from_key(key: [u8; 32]) -> Self {
         Self { key }
+    }
+
+    /// Parses a 64-character hex master key, the format `OXID_MASTER_KEY`
+    /// takes (SPEC.md §4.4).
+    ///
+    /// # Errors
+    /// Returns [`CryptoError::InvalidKey`] if `raw` is not valid hex or does
+    /// not decode to exactly 32 bytes.
+    pub fn from_hex(raw: &str) -> Result<Self, CryptoError> {
+        let bytes =
+            hex::decode(raw).map_err(|e| CryptoError::InvalidKey(format!("not valid hex: {e}")))?;
+        let key: [u8; 32] = bytes.try_into().map_err(|_| {
+            CryptoError::InvalidKey("must be 64 hex characters (32 bytes)".to_owned())
+        })?;
+        Ok(Self { key })
     }
 
     /// Generates a fresh random key (first-run initialisation).
@@ -180,5 +199,32 @@ mod tests {
         Cipher::load_or_create(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secret.key must be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn from_hex_accepts_a_full_length_hex_key() {
+        let cipher = Cipher::from_hex(&"07".repeat(32)).unwrap();
+        let encoded = cipher.encrypt("value").unwrap();
+        assert_eq!(
+            Cipher::from_key([7u8; 32]).decrypt(&encoded).unwrap(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn from_hex_rejects_a_key_that_is_not_32_bytes() {
+        for raw in ["07".repeat(31), "07".repeat(33), String::new()] {
+            let err = Cipher::from_hex(&raw).unwrap_err().to_string();
+            assert!(
+                err.contains("64 hex characters"),
+                "wrong-length key must name the requirement, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_hex_rejects_non_hex_characters() {
+        let err = Cipher::from_hex(&"zz".repeat(32)).unwrap_err().to_string();
+        assert!(err.contains("hex"), "{err}");
     }
 }

@@ -51,22 +51,32 @@ const SNAPSHOT_SUFFIX: &str = ".sqlite";
 /// refusing to start the daemon over a typo'd env var.
 #[must_use]
 pub fn config_from_env(data_dir: &Path) -> Option<BackupConfig> {
-    let interval_secs: u64 = std::env::var("OXID_BACKUP_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    backup_config_from(
+        std::env::var("OXID_BACKUP_INTERVAL_SECS").ok().as_deref(),
+        std::env::var("OXID_BACKUP_KEEP").ok().as_deref(),
+        data_dir.join("backups"),
+    )
+}
+
+/// Pure half of [`config_from_env`], so the parsing rules are testable
+/// without mutating process-wide environment variables.
+fn backup_config_from(
+    interval_secs: Option<&str>,
+    keep: Option<&str>,
+    dir: PathBuf,
+) -> Option<BackupConfig> {
+    let interval_secs: u64 = interval_secs.and_then(|v| v.parse().ok()).unwrap_or(0);
     if interval_secs == 0 {
         return None;
     }
-    let keep: usize = std::env::var("OXID_BACKUP_KEEP")
-        .ok()
+    let keep: usize = keep
         .and_then(|v| v.parse().ok())
         .filter(|&k| k >= 1)
         .unwrap_or(7);
     Some(BackupConfig {
         interval: Duration::from_secs(interval_secs.max(1)),
         keep,
-        dir: data_dir.join("backups"),
+        dir,
     })
 }
 
@@ -260,5 +270,36 @@ mod tests {
             .replace_year(2027)
             .unwrap();
         assert!(snapshot_name(september) < snapshot_name(october));
+    }
+
+    #[test]
+    fn backup_config_needs_a_positive_interval() {
+        assert!(backup_config_from(None, None, PathBuf::from("/d")).is_none());
+        assert!(backup_config_from(Some("0"), None, PathBuf::from("/d")).is_none());
+        assert!(backup_config_from(Some("nope"), None, PathBuf::from("/d")).is_none());
+    }
+
+    #[test]
+    fn backup_config_defaults_keep_to_seven_and_floors_it_at_one() {
+        let config = backup_config_from(Some("30"), None, PathBuf::from("/data/backups")).unwrap();
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.keep, 7);
+        assert_eq!(config.dir, PathBuf::from("/data/backups"));
+
+        assert_eq!(
+            backup_config_from(Some("1"), Some("3"), PathBuf::from("/d"))
+                .unwrap()
+                .keep,
+            3
+        );
+        for zeroed in ["0", "x"] {
+            assert_eq!(
+                backup_config_from(Some("1"), Some(zeroed), PathBuf::from("/d"))
+                    .unwrap()
+                    .keep,
+                7,
+                "keep `{zeroed}` must fall back to the default"
+            );
+        }
     }
 }
