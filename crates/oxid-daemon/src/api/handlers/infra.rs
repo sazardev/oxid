@@ -1,47 +1,22 @@
 #![allow(
-    unused_imports,
     clippy::pedantic,
     clippy::nursery,
     clippy::too_many_lines,
     clippy::empty_line_after_doc_comments,
     clippy::duplicate_mod
 )]
-//! `HTTP` API and webhook surface (SPEC.md §5: the shared internal API).
-//!
-//! The CLI, TUI, dashboard and desktop app all consume this router.
-
-use std::any::Any;
-use std::convert::Infallible;
-use std::path::PathBuf;
 
 use crate::api::ApiState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::middleware::AuthedAs;
 use crate::api::middleware::authorize;
-use crate::api::types::{
-    AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
-    SecretDeleteQuery, SecretListQuery,
-};
-use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{self as axum_middleware, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
-use axum::{Json, Router};
-use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
+use axum::Json;
+use axum::extract::{Extension, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use oxid_core::services::access::Capability;
-use oxid_core::{
-    AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
-    Ttl,
-};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use oxid_core::{ContainerPort, GitPort};
 use sha2::Sha256;
-use tower_governor::GovernorLayer;
 
 pub async fn stats<
     G: GitPort + Clone + Send + Sync + 'static,
@@ -76,8 +51,7 @@ pub async fn traefik_config<
     authorize(&authed, Capability::ManageNode, None)?;
 
     let config = state.cp.traefik_dynamic_config().await?;
-    let body = serde_json::to_string(&config)
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let body = serde_json::to_string(&config).map_err(ApiError::internal)?;
 
     let etag = format!(
         "\"{:x}\"",

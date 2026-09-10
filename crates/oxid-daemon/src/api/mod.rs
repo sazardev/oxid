@@ -1,44 +1,28 @@
 #![allow(
-    unused_imports,
     clippy::pedantic,
     clippy::nursery,
     clippy::too_many_lines,
     clippy::empty_line_after_doc_comments,
     clippy::duplicate_mod
 )]
+
 //! `HTTP` API and webhook surface (SPEC.md §5: the shared internal API).
 //!
 //! The CLI, TUI, dashboard and desktop app all consume this router.
 
-use std::any::Any;
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::middleware::{self as axum_middleware, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::Router;
+use axum::middleware::{self as axum_middleware};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
-use axum::{Json, Router};
-use futures_util::StreamExt;
-use hmac::{Hmac, Mac};
-use oxid_core::{
-    AuditFilter, BranchName, ContainerPort, EnvVarScope, Environment, EnvironmentId,
-    EnvironmentState, GitPort, PoolError, Project, ProjectId, RepositoryError, StateTransition,
-    Ttl,
-};
-use serde::Deserialize;
-use serde_json::{Value, json};
-use sha2::Sha256;
+use oxid_core::{BranchName, ContainerPort, GitPort};
 use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
 
-use crate::request_context::current_request_id;
-use crate::{ControlPlane, CpError, DeployOutcome};
+use crate::ControlPlane;
 
 /// Header carrying the per-request correlation id (see
 /// [`request_id_middleware`]) — generated when a client doesn't supply one,
@@ -63,10 +47,7 @@ pub use dashboard::{
     dashboard_style, health,
 };
 pub use error::{ApiError, ApiResult};
-use middleware::AuthedAs;
-use middleware::{
-    ClientIpKeyExtractor, handle_panic, operator_name, request_id_middleware, require_bearer_token,
-};
+use middleware::{ClientIpKeyExtractor, handle_panic, request_id_middleware, require_bearer_token};
 pub use types::{
     AuditQuery, DeployBody, ListEnvironmentsQuery, RegisterBody, RollbackBody, SecretBody,
     SecretDeleteQuery, SecretListQuery,
@@ -178,9 +159,12 @@ impl BootstrapAccess {
     }
 }
 
-/// Builds the API router. Every route except `/health`, `/webhooks/github`,
-/// `/wake` and `/heartbeat` requires `state.api_token` when it's configured
-/// (see [`require_bearer_token`]).
+/// Builds the API router. Every control-plane route under `/api/v1` requires
+/// `state.api_token` when it's configured (see [`require_bearer_token`]),
+/// with a small public surface kept reachable on purpose: `/health`, the
+/// four webhook endpoints (each verifying its own HMAC/token), the
+/// Traefik-facing `/wake` and `/heartbeat`, and the pre-auth onboarding pair
+/// `/setup/status` + `/setup/token` (itself gated by [`BootstrapAccess`]).
 ///
 /// # Panics
 /// Panics if `state.rate_limit` is `Some` with a rate-limit configuration
@@ -326,6 +310,31 @@ pub fn router<
         .route("/api/v1/setup/token", get(handlers::setup::bootstrap_token))
         .with_state(state.clone());
 
+    // The four Git-host webhook endpoints, grouped so a configured rate
+    // limit can cover them: they are unauthenticated by design (the HMAC
+    // *is* the auth) and a flood of bad signatures is otherwise free CPU.
+    // `/wake` and `/heartbeat` deliberately stay outside every bucket — see
+    // `rate_limit_blocks_a_burst_past_its_configured_size`: Traefik's
+    // `errors` middleware hits them on every request to a live app, so
+    // throttling them would throttle real users behind the proxy's IP.
+    let mut webhooks = Router::new()
+        .route(
+            "/api/v1/webhooks/github",
+            post(handlers::webhook::github_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gitlab",
+            post(handlers::webhook::gitlab_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gitea",
+            post(handlers::webhook::gitea_webhook),
+        )
+        .route(
+            "/api/v1/webhooks/gogs",
+            post(handlers::webhook::gogs_webhook),
+        );
+
     if let Some((per_second, burst)) = rate_limit {
         // `tower_governor`'s `per_second(n)` is a false friend: despite the
         // name, it sets the replenish *period* to `n` seconds per token
@@ -345,6 +354,9 @@ pub fn router<
                 .expect("valid rate limit config")
         };
         protected = protected.layer(GovernorLayer::new(bucket()));
+        // Webhooks share the same configured limit: same trust level (none
+        // by construction) and the same flood cost.
+        webhooks = webhooks.layer(GovernorLayer::new(bucket()));
         // The pre-auth onboarding routes get a bucket of their own. They
         // used to sit outside the limiter entirely, which left the two
         // endpoints an unauthenticated caller can reach *by design* — one
@@ -382,30 +394,17 @@ pub fn router<
             get(handlers::lifecycle::heartbeat_by_host)
                 .post(handlers::lifecycle::heartbeat_by_host),
         )
-        .route(
-            "/api/v1/webhooks/github",
-            post(handlers::webhook::github_webhook),
-        )
-        .route(
-            "/api/v1/webhooks/gitlab",
-            post(handlers::webhook::gitlab_webhook),
-        )
-        .route(
-            "/api/v1/webhooks/gitea",
-            post(handlers::webhook::gitea_webhook),
-        )
-        .route(
-            "/api/v1/webhooks/gogs",
-            post(handlers::webhook::gogs_webhook),
-        )
+        .merge(webhooks)
         .merge(protected)
         // Any GET that doesn't match an API route or a static asset above is
         // a client-side dashboard route (`/ui/projects/1`,
         // `/ui/environments/5?tab=logs`, ...) — the SPA shell handles
         // routing itself from `location.pathname`/`location.search`, so a
         // hard refresh or a shared deep link on any of those paths still
-        // has to return `index.html`, not a 404.
-        .fallback(get(dashboard_index))
+        // has to return `index.html`, not a 404. Paths under `/api/` are not
+        // client routes, though: a typo there is a client mistake and gets
+        // the same JSON 404 shape as every other API failure.
+        .fallback(dashboard_fallback)
         // `CatchPanicLayer` first (innermost — applied to every route,
         // including the fallback) so a handler panic never becomes a raw
         // dropped connection; `request_id_middleware` wraps *that*
@@ -424,6 +423,49 @@ pub fn router<
 
 pub(crate) fn parse_branch(raw: &str) -> ApiResult<BranchName> {
     BranchName::parse(raw).map_err(|e| ApiError::from_validation(e.to_string()))
+}
+
+/// Fallback for any path no route matched: the SPA shell for dashboard deep
+/// links, a JSON 404 for `/api/` ones (an API client must be able to tell a
+/// typo from a success; a `200 text/html` does the opposite).
+async fn dashboard_fallback(uri: axum::http::Uri) -> Response {
+    if uri.path().starts_with("/api/") {
+        ApiError::not_found(format!("route `{}`", uri.path())).into_response()
+    } else {
+        dashboard_index().await.into_response()
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_access_tests {
+    use super::BootstrapAccess;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// The pre-auth token endpoint's gate. The case worth pinning is the
+    /// fail-closed one: an unknown peer address must never read as "local",
+    /// or a containerized daemon would hand out the master token to anyone
+    /// who can reach the port.
+    #[test]
+    fn bootstrap_access_permits_exactly_what_it_says() {
+        let loopback_v4 = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let loopback_v6 = Some(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let remote = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+
+        assert!(!BootstrapAccess::Off.permits(loopback_v4));
+        assert!(!BootstrapAccess::Off.permits(remote));
+
+        assert!(BootstrapAccess::Any.permits(loopback_v4));
+        assert!(BootstrapAccess::Any.permits(remote));
+        assert!(BootstrapAccess::Any.permits(None));
+
+        assert!(BootstrapAccess::Loopback.permits(loopback_v4));
+        assert!(BootstrapAccess::Loopback.permits(loopback_v6));
+        assert!(!BootstrapAccess::Loopback.permits(remote));
+        assert!(
+            !BootstrapAccess::Loopback.permits(None),
+            "an unknown peer must not be treated as local"
+        );
+    }
 }
 
 #[cfg(test)]

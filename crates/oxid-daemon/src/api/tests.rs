@@ -2,8 +2,13 @@ use super::*;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::http::Request;
-use oxid_core::{BuildReport, BuildSpec, ContainerSpec, GitError, OciError, RepoUrl};
+use axum::http::{Request, StatusCode};
+use hmac::Mac;
+use oxid_core::{
+    BuildReport, BuildSpec, ContainerSpec, Environment, GitError, OciError, Project, ProjectId,
+    RepoUrl,
+};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use crate::adapter::crypto::Cipher;
@@ -664,6 +669,21 @@ async fn spa_deep_links_fall_back_to_the_dashboard_shell() {
         let text = String::from_utf8(body).unwrap();
         assert!(text.contains("OXID"), "{path}: {text:.200}");
     }
+}
+
+#[tokio::test]
+async fn unknown_api_routes_are_a_json_404_not_the_dashboard() {
+    let (app, _) = test_app().await;
+    let (status, body) = json_request(&app, "GET", "/api/v1/does-not-exist", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("/api/v1/does-not-exist"),
+        "{value}"
+    );
 }
 
 #[tokio::test]
@@ -1894,11 +1914,28 @@ async fn rate_limit_blocks_a_burst_past_its_configured_size() {
     assert_eq!(statuses[1], StatusCode::OK);
     assert_eq!(statuses[2], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
 
-    // Public routes (no auth gate) are never rate-limited by this —
-    // Traefik's forwardAuth heartbeat hits `/heartbeat` on every single
-    // request to a live app and must never be throttled.
+    // Webhooks are unauthenticated by design, so a bad-signature flood is
+    // otherwise free CPU: they share the bucket. A missing signature is a
+    // 401; the third immediate request is where the limiter cuts in.
+    let mut webhook_statuses = Vec::new();
+    for _ in 0..3 {
+        let (status, _) = json_request(&app, "POST", "/api/v1/webhooks/github", json!({})).await;
+        webhook_statuses.push(status);
+    }
+    assert_eq!(webhook_statuses[0], StatusCode::UNAUTHORIZED);
+    assert_eq!(webhook_statuses[1], StatusCode::UNAUTHORIZED);
+    assert_eq!(webhook_statuses[2], StatusCode::TOO_MANY_REQUESTS);
+
+    // `/wake` and `/heartbeat` are deliberately never rate-limited:
+    // Traefik's `errors` middleware hits them on every single request to a
+    // live app, and throttling that would throttle real users behind the
+    // proxy's IP.
     for _ in 0..5 {
         let (status, _) = request_with_host(&app, "POST", "/api/v1/wake", "nobody").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    for _ in 0..5 {
+        let (status, _) = request_with_host(&app, "GET", "/api/v1/heartbeat", "nobody").await;
         assert_eq!(status, StatusCode::OK);
     }
 }
