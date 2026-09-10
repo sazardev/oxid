@@ -249,8 +249,8 @@ Run the test suite and linter before sending a PR:
 
 ```bash
 cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 Building the workspace also wires up git hooks that run these (plus a

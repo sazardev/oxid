@@ -389,8 +389,8 @@ just "where did we leave off and why."
     `handlers/`, plus `middleware.rs`, `dashboard.rs`, `error.rs`,
     `types.rs`). Docs referencing the old god-file paths were updated in
     the same sweep.
-- Full test/clippy/fmt pass green (257 tests: 42 CLI + 44 core + 171
-  daemon, 8 `#[ignore]`d Docker-integration ones excluded).
+- Full test/clippy/fmt pass green (554 tests: 48 CLI + 180 core + 326
+  daemon, 10 `#[ignore]`d Docker/Postgres-integration ones excluded).
 
 ## Known gaps (by design, not bugs — see ROADMAP.md P4)
 

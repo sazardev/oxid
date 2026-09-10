@@ -46,7 +46,7 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace
 
-  # The 8 `#[ignore]`d tests: everything that talks to a real Docker daemon
+  # The 10 `#[ignore]`d tests: everything that talks to a real Docker daemon
   # or a real Postgres. They were written, and then never run anywhere —
   # `cargo test --workspace` above skips them by definition, so the layer
   # that drives containers was the one layer with no CI at all. The first

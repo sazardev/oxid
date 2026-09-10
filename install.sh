@@ -366,11 +366,11 @@ EOF
   HOST_ADDR="$(reachable_host)"
   configure_cli "http://127.0.0.1:8080" "${API_TOKEN}"
 
-  # The URLs say `127.0.0.1` because that is where this stack actually
-  # listens: the compose file publishes `127.0.0.1:8080:8080`, so nothing
-  # off this host can reach the control API. Printing the LAN address would
-  # be friendlier and wrong — the commands would not work, and the webhook
-  # URL would be one a Git host can never deliver to.
+  # `configure_cli` points the local CLI at loopback; the printed URLs use
+  # the host's reachable address because the compose file publishes
+  # `8080:8080`, so other machines (and a Git host) can reach the daemon.
+  # The API is token-authenticated, and `OXID_BOOTSTRAP_TOKEN_ACCESS=off`
+  # (set in the compose file) keeps the pre-auth setup endpoint closed.
   cat <<EOF
 
 [+] Oxid is up. Everything below is ready to use — nothing else to run.

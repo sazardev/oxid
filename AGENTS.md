@@ -24,7 +24,7 @@ Toolchain pinned in `rust-toolchain.toml` — `stable` + `clippy` + `rustfmt`. N
 
 - `resolver = "3"`, `edition = "2024"`, 3 members: `oxid-core`, `oxid-daemon`, `oxid-cli` (`Cargo.toml:1-4`).
 - Entrypoints: `crates/oxid-core/src/lib.rs` (pure domain), `crates/oxid-daemon/src/main.rs` (binary `oxidd`), `crates/oxid-cli/src/main.rs` (binary `oxid`).
-- Migrations: `crates/oxid-daemon/migrations/*.sql` (plain SQL, 20 files) — run at startup via `sqlx` (`crates/oxid-daemon/src/main.rs`).
+- Migrations: `crates/oxid-daemon/migrations/*.sql` (plain SQL, 22 files) — run at startup via `sqlx` (`crates/oxid-daemon/src/main.rs`).
 - Release profile: `opt-level=3 lto=true codegen-units=1 strip=true panic=abort` (`Cargo.toml:53-58`) — `unsafe` forbidden workspace-wide (`Cargo.toml:40`).
 
 ## Architecture (hexagonal, SPEC.md §2)
@@ -67,7 +67,7 @@ CLI: `OXID_API` default `http://127.0.0.1:8080`, `OXID_API_TOKEN` bearer. `oxid 
 
 ## Docs — read before assuming
 
-`IDEA.md` / `SPEC.md` / `DESIGN.md` are vision; `ROADMAP.md` is the granular gap code-vs-docs (50 tasks, `✅/Parcial/No existe`, wiring notes for Traefik `OXID_DOCKER_NETWORK` + `/api/v1/wake` + `/heartbeat`). Check it before building a feature they describe. `MEMORY.md` is working state, `CONTRIBUTING.md#guardrails` is hook/CI rationale. OpenCode agent squad: `.opencode/agents/*.md` (20 agents), catalog: `.opencode/AGENTS.md`.
+`IDEA.md` / `SPEC.md` / `DESIGN.md` are vision; `ROADMAP.md` is the granular gap code-vs-docs (57 tasks, `✅/Parcial/No existe`, wiring notes for Traefik `OXID_DOCKER_NETWORK` + `/api/v1/wake` + `/heartbeat`). Check it before building a feature they describe. `MEMORY.md` is working state, `CONTRIBUTING.md#guardrails` is hook/CI rationale. OpenCode agent squad: `.opencode/agents/*.md` (20 agents), catalog: `.opencode/AGENTS.md`.
 
 ## Multi-node (`MULTINODE.md`, all four stages delivered)
 

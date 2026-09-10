@@ -63,6 +63,7 @@ Hexagonal / ports-and-adapters, split across three crates:
   - `service/proxy.rs` — built-in per-branch TCP reverse proxy (stable `public_port`, zero-downtime redeploys); it dials a `Target { host, port }`, where the host is the node's address, so the same proxy bridges a stable local port to a container on another machine.
   - `service/fleet.rs` — `Fleet<O>`, the registry of nodes this daemon holds a Docker client for. `ControlPlane` holds one instead of a single `oci`.
   - `service/scheduler.rs` — periodic tokio task driving the node health probe, then scale-to-zero GC + deploy-queue retry.
+  - `service/refresh_coalescer.rs` — collapses concurrent `git fetch`es for the same project into one. Sharing is decided by who is already *waiting* when a caller asks, never by the age of the last result, so it's coalescing rather than caching and carries no staleness window.
   - `api/` — `axum` HTTP surface: router in `mod.rs`, one handler file per resource under `handlers/`, `middleware.rs` (auth + rate-limit + request-id), `dashboard.rs` (embedded SPA).
 - **`oxid-cli`** — thin `clap`-based HTTP client (binary `oxid`) that talks to the daemon's REST API; holds no business logic itself (multi-context config in `cli/config.rs`).
 
@@ -383,6 +384,64 @@ Workspace globs are deliberately not parsed: "has a `package.json`" reaches
 the same answer without a glob language, and `adapter::config::read_repo_manifest`
 already bounds the walk to the root plus one level inside `apps/`,
 `packages/`, `services/` and `libs/`.
+
+## Multi-service environments (Compose)
+
+A repository with a `docker-compose.yml` used to deploy only the first
+service with a `build:` key and drop the rest in silence, so an
+`api`+`worker`+`db` stack ran the api alone and failed at runtime on a
+connection nobody had said would be missing. `oxid_core::services::compose_plan`
+(pure, no I/O) now reads every service and decides what to do with each one —
+build it, fold it into the shared pool, or run it as written — and an
+environment is the result: several containers, one branch URL.
+
+- **The scalar columns on `environments` still describe the primary** — the
+  one service the branch URL points at. Sidecars live in
+  `environment_services` (migration `0021`), consulted only by the four
+  paths that must know each container exists: deploy, teardown, GC, wake.
+  Every other reader — the API type, the dashboard, the CLI, all nine call
+  sites of `resolved_container_name` — is untouched and still correct. An
+  environment with no service rows predates the migration and means "one
+  service", which was already true; rows are never SQL-deleted on teardown,
+  they transition to `Destroy`, matching how leases are already handled.
+- **A `postgres:`/`redis:`/… service is folded into the shared pool**, not
+  booted per branch — not multiplexing a database per environment is the
+  entire product (`SPEC.md` §3.1). Matching is on the image repository plus
+  an explicit list, so `my-postgres-exporter` doesn't get mistaken for a
+  database. Multiplexing only fires where this daemon actually has
+  somewhere to multiplex to (e.g. `OXID_POSTGRES_URL` set); with no pool
+  configured, the same image is deployed as written rather than failing —
+  an optimisation that turns a working deploy into an error is a bug.
+- **The connection string is read from the compose file, not guessed.** A
+  `DATABASE_URL: postgres://app@db:5432/app` line already names the
+  variable and the host; matching is on the host position of a URL
+  (`@db:`, `//db/`) so `DB_POOL_SIZE=10` is never mistaken for one. With no
+  such hint, the conventional variable name the ecosystem reads is used. An
+  explicit `oxid.toml [dependencies]` entry always wins over what compose
+  implies — a file someone wrote must not stop meaning what it says.
+- **Sidecars start first, the primary last**, so nothing can reach the
+  thing serving the URL before what it depends on exists. `on_start` runs
+  on the primary only — it's the project's migration/seed step, and running
+  it per container would run migrations once per container. On failure,
+  teardown, redeploy cutover, or suspension, every container plus the
+  shared network comes down together, read from the rows the deploy wrote
+  rather than re-derived (a sidecar's name depends on its compose service
+  name, which the file may since have changed).
+- **Each container resolves its siblings by compose service name** (`db`,
+  `mq`, …), never by the container name, because the container name changes
+  on every redeploy. `publish_port` (which container gets the host-facing
+  port) is stated by the plan, not inferred from `networks.is_empty()` —
+  that inference stopped meaning anything once every container had to share
+  one network and exactly one still had to stay reachable from the host.
+- **A single-service repository never touches any of this** — the plan has
+  one runnable service, no network is created, and the deploy takes the
+  same path it always has.
+- `oxid logs <branch>` still means the primary; `oxid logs <branch> --service worker`
+  means a sidecar, backed by `GET /api/v1/environments/{id}/services`
+  (also what feeds the dashboard's log-source selector, which only appears
+  when there's a choice to make). Asking for a service that doesn't exist
+  names the ones that do rather than returning a log that reads like a
+  silent app.
 
 ## Dashboard
 
